@@ -36,7 +36,7 @@ client = do
     -- * ping/pong
     -- * handler flow control
 
-    forkIO $ forever $ do
+    _ <- forkIO $ forever $ do
         openClientStream conn $ \stream -> do
             let eos = HTTP2.setEndStream . HTTP2.setEndHeader
             let payload = HTTP2.HeadersFrame Nothing query
