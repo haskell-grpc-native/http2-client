@@ -16,6 +16,7 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Network.HTTP2.Client
+                     , Network.HTTP2.Client.RawConnection
   build-depends:       base >= 4.7 && < 5
                      , bytestring
                      , connection
