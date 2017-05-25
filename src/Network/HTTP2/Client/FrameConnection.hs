@@ -7,7 +7,7 @@ module Network.HTTP2.Client.FrameConnection (
     , newHttp2FrameConnection
     -- * Interact at the Frame level.
     , Http2FrameClientStream
-    , openFrameClientStream
+    , makeFrameClientStream
     , send
     , next
     , closeConnection
@@ -24,7 +24,7 @@ import qualified Network.TLS as TLS
 import           Network.HTTP2.Client.RawConnection
 
 data Http2FrameConnection = Http2FrameConnection {
-    _openFrameClientStream :: HTTP2.StreamId -> forall a. (Http2FrameClientStream -> IO a) -> IO a
+    _makeFrameClientStream :: HTTP2.StreamId -> Http2FrameClientStream
   -- ^ Starts a new client stream.
   , _serverStream     :: Http2ServerStream
   -- ^ Receives frames from a server.
@@ -36,14 +36,11 @@ data Http2FrameConnection = Http2FrameConnection {
 closeConnection :: Http2FrameConnection -> IO ()
 closeConnection = _closeConnection
 
--- | Opens a client stream and give it to a handler.
---
--- StreamId should be observed in increasing order at the server side.
--- This module does not ensure this invariant holds.
-openFrameClientStream :: Http2FrameConnection
+-- | Creates a client stream.
+makeFrameClientStream :: Http2FrameConnection
                       -> HTTP2.StreamId
-                      -> (forall a. (Http2FrameClientStream -> IO a) -> IO a)
-openFrameClientStream = _openFrameClientStream
+                      -> Http2FrameClientStream
+makeFrameClientStream = _makeFrameClientStream
 
 data Http2FrameClientStream = Http2FrameClientStream {
     _sendFrame :: (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
@@ -83,10 +80,10 @@ newHttp2FrameConnection host port params = do
             bracket (takeMVar writerMutex) (putMVar writerMutex) (const io)
 
     -- Define handlers.
-    let withClientStream streamID doWork = do
+    let makeClientStream streamID = 
             let putFrame modifyFF frame = writeProtect . _sendRaw http2conn $
                     HTTP2.encodeFrame (encodeInfo modifyFF streamID) frame
-            doWork $ Http2FrameClientStream putFrame
+             in Http2FrameClientStream putFrame
 
         nextServerFrameChunk = Http2ServerStream $ do
             (fTy, fh@FrameHeader{..}) <- HTTP2.decodeFrameHeader <$> _nextRaw http2conn 9
@@ -99,4 +96,4 @@ newHttp2FrameConnection host port params = do
 
         gtfo = _close http2conn
 
-    return $ Http2FrameConnection withClientStream nextServerFrameChunk gtfo
+    return $ Http2FrameConnection makeClientStream nextServerFrameChunk gtfo

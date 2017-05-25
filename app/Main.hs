@@ -28,10 +28,13 @@ client = do
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
     encoder <- newHpackEncoder cli
 
-    forever $ do
-        withStream cli encoder $ \stream -> do
-            _headersFrame stream headersPairs
-            _waitFrame stream >>= print
+    let go = forever $ do
+            withStream cli encoder $ \stream ->
+                let first = _headersFrame stream headersPairs
+                    second = _waitFrame stream >>= print
+                in (first, second)
+    forkIO go
+    go
   where
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
