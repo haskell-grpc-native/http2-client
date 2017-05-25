@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
-import Network.HTTP2.Client (newHttp2Connection, openClientStream, send, next)
+import Network.HTTP2.Client (newHttp2FrameConnection, openClientStream, send, next)
 
 import           Control.Monad (forever)
 import           Control.Concurrent (forkIO)
@@ -17,14 +17,14 @@ main = client
 
 client :: IO ()
 client = do
-    conn <- newHttp2Connection "127.0.0.1" 3000 tlsParams
+    conn <- newHttp2FrameConnection "127.0.0.1" 3000 tlsParams
     let headersPairs    = [ (":method", "GET")
                           , (":scheme", "https")
                           , (":path", "/hello")
                           , (":authority", "example.org")
                           , ("accept", "text/plain")
                           ]
-    dt <- HTTP2.newDynamicTableForEncoding 1024
+    dt <- HTTP2.newDynamicTableForEncoding HTTP2.defaultDynamicTableSize
     query <- HTTP2.encodeHeader (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True }) 1024 dt headersPairs
 
     -- TODO-bare:
