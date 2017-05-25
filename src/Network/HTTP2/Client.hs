@@ -40,19 +40,19 @@ data Http2ClientStream = Http2ClientStream {
   , _waitFrame    :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
 
-data Http2ClientStreamState =
-    Reserved
-  | Ongoing
-
 newHttp2Client host port tlsParams = do
+    -- network connection
     conn <- newHttp2FrameConnection "127.0.0.1" 3000 tlsParams
-    serverFrames <- newChan
-    _ <- forkIO $ forever (next conn >>= writeChan serverFrames)
 
+    -- prepare client streams
     clientStreamCounter <- newIORef 0
     let incr n = let m = succ n in (m, m)
         nextInt = atomicModifyIORef' clientStreamCounter incr
         nextClientStreamId = (\k -> 2 * k + 1) <$> nextInt
+
+    -- prepare server streams
+    serverFrames <- newChan
+    _ <- forkIO $ forever (next conn >>= writeChan serverFrames)
 
     let newEncoder = do
             let strategy = (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True })
@@ -64,8 +64,9 @@ newHttp2Client host port tlsParams = do
             serverStreamFrames <- dupChan serverFrames
             sid <- nextClientStreamId
 
-            -- TODO: filter on frame-ID
-            let _waitFrame = readChan serverStreamFrames
+            let _waitFrame = do
+                     pair@(fHead, _) <- readChan serverStreamFrames
+                     if streamId fHead /= sid then _waitFrame else return pair
 
             -- TODO: ensure strictly increasing frame number when sending 1st frame
             openFrameClientStream conn sid $ \frameStream -> do
