@@ -24,7 +24,7 @@ import qualified Network.TLS as TLS
 import           Network.HTTP2.Client.RawConnection
 
 data Http2FrameConnection = Http2FrameConnection {
-    _openFrameClientStream :: forall a. (Http2FrameClientStream -> IO a) -> IO a
+    _openFrameClientStream :: HTTP2.StreamId -> forall a. (Http2FrameClientStream -> IO a) -> IO a
   -- ^ Starts a new client stream.
   , _serverStream     :: Http2ServerStream
   -- ^ Receives frames from a server.
@@ -37,7 +37,11 @@ closeConnection :: Http2FrameConnection -> IO ()
 closeConnection = _closeConnection
 
 -- | Opens a client stream and give it to a handler.
+--
+-- StreamId should be observed in increasing order at the server side.
+-- This module does not ensure this invariant holds.
 openFrameClientStream :: Http2FrameConnection
+                      -> HTTP2.StreamId
                       -> (forall a. (Http2FrameClientStream -> IO a) -> IO a)
 openFrameClientStream = _openFrameClientStream
 
@@ -70,22 +74,16 @@ newHttp2FrameConnection host port params = do
     -- Spawns an HTTP2 connection.
     http2conn <- newRawHttp2Connection host port params
 
-    -- Prepare a local mutable state, this state should never escape the
+    -- Prepare a local mutex, this mutex should never escape the
     -- function's scope. Else it might lead to bugs (e.g.,
     -- https://ro-che.info/articles/2014-07-30-bracket ) 
-    clientStreamCounter <- newIORef 0
     writerMutex <- newMVar () 
-
-    let incr n = let m = succ n in (m, m)
-        nextInt = atomicModifyIORef' clientStreamCounter incr
-        nextClientStreamId = (\k -> 2 * k + 1) <$> nextInt
 
     let writeProtect io =
             bracket (takeMVar writerMutex) (putMVar writerMutex) (const io)
 
     -- Define handlers.
-    let withClientStream doWork = do
-            streamID <- nextClientStreamId
+    let withClientStream streamID doWork = do
             let putFrame modifyFF frame = writeProtect . _sendRaw http2conn $
                     HTTP2.encodeFrame (encodeInfo modifyFF streamID) frame
             doWork $ Http2FrameClientStream putFrame
