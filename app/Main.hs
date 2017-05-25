@@ -2,10 +2,11 @@
 module Main where
 
 import Network.HTTP2.Client (newHttp2FrameConnection, send, next)
-import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, withStream, Http2ClientStream(..))
+import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), windowUpdate)
 
-import           Control.Monad (forever)
-import           Control.Concurrent (forkIO)
+import           Control.Monad (forever, when)
+import           Control.Concurrent (forkIO, threadDelay)
+import           Data.IORef (atomicModifyIORef', atomicModifyIORef, newIORef)
 import           Data.Default.Class (def)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.HPACK as HTTP2
@@ -28,12 +29,31 @@ client = do
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
     encoder <- newHpackEncoder cli
 
+    windowUpdate cli (HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize)
+    credit <- newIORef 0
+
+    let addCredit n = atomicModifyIORef credit (\c -> (c + n,()))
+    forkIO $ forever $ do
+        amount <- atomicModifyIORef' credit (\c -> (0, c))
+        print ("crediting", amount)
+        when (amount > 0) (windowUpdate cli amount)
+        threadDelay 500000
+
     let go = forever $ do
-            withStream cli encoder $ \stream ->
+            startStream cli encoder $ \stream ->
                 let first = _headersFrame stream headersPairs
-                    second = _waitFrame stream >>= print
+                    second = do
+                        pair@(fH,payload) <- _waitFrame stream
+                        print pair
+                        case payload of
+                            (Right (HTTP2.DataFrame _)) ->
+                                addCredit (HTTP2.payloadLength fH)
+                            otherwise                   ->
+                                return ()
+                        if HTTP2.testEndStream (HTTP2.flags fH)
+                        then return()
+                        else second
                 in (first, second)
-    forkIO go
     go
   where
     tlsParams = TLS.ClientParams {

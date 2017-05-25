@@ -11,7 +11,8 @@ module Network.HTTP2.Client (
       Http2Client
     , newHttp2Client
     , newHpackEncoder
-    , withStream
+    , startStream
+    , windowUpdate
     , Http2ClientStream(..)
     , module Network.HTTP2.Client.FrameConnection
     ) where
@@ -33,19 +34,21 @@ newtype HpackEncoder =
 
 data Http2Client = Http2Client {
     _newHpackEncoder  :: IO HpackEncoder
-  , _withStream       :: forall a. HpackEncoder
+  , _startStream      :: forall a. HpackEncoder
                                 -> (Http2ClientStream -> (IO ClientStreamThread, IO a))
                                 -> IO a
+  , _windowUpdate     :: WindowSize -> IO ()
   }
 
 newHpackEncoder = _newHpackEncoder
-withStream = _withStream
+startStream = _startStream
+windowUpdate = _windowUpdate
 
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headersFrame :: HTTP2.HeaderList -> IO ClientStreamThread
-  , _waitFrame    :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
+    _headersFrame      :: HTTP2.HeaderList -> IO ClientStreamThread
+  , _waitFrame         :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
 
 newHttp2Client host port tlsParams = do
@@ -59,9 +62,15 @@ newHttp2Client host port tlsParams = do
             (putMVar clientStreamIdMutex . succ)
             (\k -> h (2 * k + 1)) -- client StreamIds MUST be odd
 
+    let controlStream = makeFrameClientStream conn 0
+
     -- prepare server streams
     serverFrames <- newChan
     _ <- forkIO $ forever (next conn >>= writeChan serverFrames)
+
+    _ <- forkIO $ forever $ do
+            controlFrame <- waitFrame 0 serverFrames
+            print controlFrame
 
     let newEncoder = do
             let strategy = (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True })
@@ -69,23 +78,37 @@ newHttp2Client host port tlsParams = do
             dt <- HTTP2.newDynamicTableForEncoding HTTP2.defaultDynamicTableSize
             return $ HpackEncoder $ HTTP2.encodeHeader strategy bufsize dt
 
-    let withStream encoder doWork = do
+    let startStream encoder getWork = do
             serverStreamFrames <- dupChan serverFrames
             cont <- withClientStreamId $ \sid -> do
                 let frameStream = makeFrameClientStream conn sid
-                let _waitFrame = do
-                         pair@(fHead, _) <- readChan serverStreamFrames
-                         if streamId fHead /= sid then _waitFrame else return pair
+                let _waitFrame = waitFrame sid serverStreamFrames
                 let _headersFrame = headersFrame frameStream encoder
-
-                let (initAction, otherActions) = doWork $ Http2ClientStream{..}
+                let (initAction, otherActions) = getWork $ Http2ClientStream{..}
                 _ <- initAction
                 return otherActions
             cont
-    return $ Http2Client newEncoder withStream
+
+    let winupdate = windowUpdateFrame controlStream
+
+    return $ Http2Client newEncoder startStream winupdate
 
 headersFrame s enc headers = do
     let eos = HTTP2.setEndStream . HTTP2.setEndHeader
     payload <- HTTP2.HeadersFrame Nothing <$> (encodeHeaders enc headers)
     send s eos payload
     return CST
+
+windowUpdateFrame s amount = do
+    let payload = HTTP2.WindowUpdateFrame amount
+    send s id payload
+    return ()
+
+waitFrame sid chan =
+    loop
+  where
+    loop = do
+        pair@(fHead, _) <- readChan chan
+        if streamId fHead /= sid
+        then loop
+        else return pair
