@@ -2,7 +2,7 @@
 module Main where
 
 import Network.HTTP2.Client (newHttp2FrameConnection, send, next)
-import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), windowUpdate)
+import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), creditWindow)
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
@@ -30,16 +30,6 @@ client = do
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
     encoder <- newHpackEncoder cli
 
-    windowUpdate cli (HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize)
-    credit <- newIORef 0
-
-    let addCredit n = atomicModifyIORef credit (\c -> (c + n,()))
-    forkIO $ forever $ do
-        amount <- atomicModifyIORef' credit (\c -> (0, c))
-        print ("crediting", amount)
-        when (amount > 0) (windowUpdate cli amount)
-        threadDelay 500000
-
     let go = forever $ do
             startStream cli encoder $ \stream ->
                 let first = _headersFrame stream headersPairs
@@ -48,7 +38,7 @@ client = do
                         print pair
                         case payload of
                             (Right (HTTP2.DataFrame _)) ->
-                                addCredit (HTTP2.payloadLength fH)
+                                creditWindow cli (HTTP2.payloadLength fH)
                             otherwise                   ->
                                 return ()
                         if HTTP2.testEndStream (HTTP2.flags fH)

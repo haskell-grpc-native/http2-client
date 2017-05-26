@@ -12,16 +12,16 @@ module Network.HTTP2.Client (
     , newHttp2Client
     , newHpackEncoder
     , startStream
-    , windowUpdate
+    , creditWindow
     , Http2ClientStream(..)
     , module Network.HTTP2.Client.FrameConnection
     ) where
 
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
-import           Control.Concurrent (forkIO)
+import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
-import           Control.Monad (forever)
+import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
 import           Data.IORef (newIORef, atomicModifyIORef')
 import           Network.HPACK as HTTP2
@@ -37,18 +37,23 @@ data Http2Client = Http2Client {
   , _startStream      :: forall a. HpackEncoder
                                 -> (Http2ClientStream -> (IO ClientStreamThread, IO a))
                                 -> IO a
-  , _windowUpdate     :: WindowSize -> IO ()
+  , _creditWindow     :: WindowSize -> IO ()
   }
 
 newHpackEncoder = _newHpackEncoder
 startStream = _startStream
-windowUpdate = _windowUpdate
+creditWindow = _creditWindow
 
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
     _headersFrame      :: HTTP2.HeaderList -> IO ClientStreamThread
   , _waitFrame         :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
+  }
+
+data Http2ClientFlowControl = Http2ClientFlowControl {
+    _creditFlowControlWindow :: Int -> IO ()
+  , _updateFlowControlWindow :: IO ()
   }
 
 newHttp2Client host port tlsParams = do
@@ -89,9 +94,16 @@ newHttp2Client host port tlsParams = do
                 return otherActions
             cont
 
-    let winupdate = windowUpdateFrame controlStream
+    -- prepare (primitive as in non-existing) flow control
+    let maxCredit = HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize
+    flowControlCredit <- newIORef maxCredit
+    let addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
+    forkIO $ forever $ do
+        amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
+        when (amount > 0) (windowUpdateFrame controlStream amount)
+        threadDelay 1000000
 
-    return $ Http2Client newEncoder startStream winupdate
+    return $ Http2Client newEncoder startStream addCredit
 
 headersFrame s enc headers = do
     let eos = HTTP2.setEndStream . HTTP2.setEndHeader
