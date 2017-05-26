@@ -32,6 +32,7 @@ executable http2-client-exe
   main-is:             Main.hs
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N
   build-depends:       base
+                     , async
                      , data-default-class
                      , http2
                      , http2-client

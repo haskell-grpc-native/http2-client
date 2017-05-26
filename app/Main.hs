@@ -6,6 +6,7 @@ import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
+import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Data.IORef (atomicModifyIORef', atomicModifyIORef, newIORef)
 import           Data.Default.Class (def)
 import qualified Network.HTTP2 as HTTP2
@@ -54,7 +55,8 @@ client = do
                         then return()
                         else second
                 in (first, second)
-    go
+    waitAnyCancel =<< traverse async [go, go, go]
+    return ()
   where
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
