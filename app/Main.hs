@@ -20,6 +20,7 @@ main = client
 
 client :: IO ()
 client = do
+    let largestWindowSize = HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize
     let headersPairs    = [ (":method", "GET")
                           , (":scheme", "https")
                           , (":path", "/hello")
@@ -28,18 +29,21 @@ client = do
                           ]
 
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
+    _creditFlow (flowControl cli) largestWindowSize
     encoder <- newHpackEncoder cli
+    _ <- forkIO $ do
+            _updateWindow $ flowControl cli
+            threadDelay 1000000
 
     let go = forever $ do
             startStream cli encoder $ \stream ->
                 let init = _headersFrame stream headersPairs
                     handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
-                        print pair
+                        print fH
                         case payload of
                             (Right (HTTP2.DataFrame _)) -> do
                                 _creditFlow (flowControl cli) (HTTP2.payloadLength fH)
-                        --        creditStream (HTTP2.payloadLength fH)
                             otherwise                   ->
                                 return ()
                         if HTTP2.testEndStream (HTTP2.flags fH)

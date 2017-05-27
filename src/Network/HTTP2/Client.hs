@@ -21,7 +21,7 @@ module Network.HTTP2.Client (
 
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
-import           Control.Concurrent (forkIO, threadDelay, killThread)
+import           Control.Concurrent (forkIO)
 import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
@@ -41,7 +41,7 @@ data StreamActions a = StreamActions {
 
 data FlowControl = FlowControl {
     _creditFlow   :: WindowSize -> IO ()
-  -- TODO: , _updateWindow :: IO ()
+  , _updateWindow :: IO ()
   }
 
 type StreamStarter a =
@@ -94,8 +94,7 @@ newHttp2Client host port tlsParams = do
             dt <- HTTP2.newDynamicTableForEncoding HTTP2.defaultDynamicTableSize
             return $ HpackEncoder $ HTTP2.encodeHeader strategy bufsize dt
 
-    (_, creditConn) <- newPeriodicRefreshAllCredit controlStream
-
+    creditConn <- newFlowControl controlStream
     let startStream encoder getWork = do
             serverStreamFrames <- dupChan serverFrames
             cont <- withClientStreamId $ \sid -> do
@@ -105,27 +104,19 @@ newHttp2Client host port tlsParams = do
                 let StreamActions{..} = getWork $ Http2ClientStream{..}
                 -- Perform the 1st action, the stream won't be idle anymore.
                 _ <- _initStream
-                -- Returns a continuation that will spawn a thread to upgrade
-                -- the credit on a stream. We need to make sure the
-                -- congestion-control thread is dead so we bracket the
-                -- caller-specified actions.
-                -- TODO: consider using and linking asyncs instead?
-                let next = bracket (newPeriodicRefreshAllCredit frameStream)
-                                   (killThread . fst)
-                                   (_handleStream . snd)
-                return next
+                streamFlowControl <- newFlowControl controlStream
+                return $ _handleStream streamFlowControl
             cont
 
     return $ Http2Client newEncoder startStream creditConn
 
-newPeriodicRefreshAllCredit stream = do
-    let maxCredit = HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize
-    flowControlCredit <- newIORef maxCredit
-    thread <- forkIO $ forever $ do
-        amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
-        when (amount > 0) (windowUpdateFrame stream amount)
+newFlowControl stream = do
+    flowControlCredit <- newIORef 0
+    let updateWindow = do
+            amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
+            when (amount > 0) (windowUpdateFrame stream amount)
     let addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
-    return (thread, FlowControl addCredit)
+    return $ FlowControl addCredit updateWindow
 
 headersFrame s enc headers = do
     let eos = HTTP2.setEndStream . HTTP2.setEndHeader
