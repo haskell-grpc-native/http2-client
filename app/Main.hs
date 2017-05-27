@@ -2,7 +2,7 @@
 module Main where
 
 import Network.HTTP2.Client (newHttp2FrameConnection, send, next)
-import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), creditWindow)
+import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), creditConnection, StreamActions(..))
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
@@ -32,19 +32,20 @@ client = do
 
     let go = forever $ do
             startStream cli encoder $ \stream ->
-                let first = _headersFrame stream headersPairs
-                    second = do
+                let init = _headersFrame stream headersPairs
+                    handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
                         print pair
                         case payload of
-                            (Right (HTTP2.DataFrame _)) ->
-                                creditWindow cli (HTTP2.payloadLength fH)
+                            (Right (HTTP2.DataFrame _)) -> do
+                                creditConnection cli (HTTP2.payloadLength fH)
+                        --        creditStream (HTTP2.payloadLength fH)
                             otherwise                   ->
                                 return ()
                         if HTTP2.testEndStream (HTTP2.flags fH)
-                        then return()
-                        else second
-                in (first, second)
+                        then return ()
+                        else handler creditStream
+                in StreamActions init handler
     waitAnyCancel =<< traverse async [go, go, go]
     return ()
   where

@@ -6,7 +6,7 @@ module Network.HTTP2.Client.FrameConnection (
       Http2FrameConnection
     , newHttp2FrameConnection
     -- * Interact at the Frame level.
-    , Http2FrameClientStream
+    , Http2FrameClientStream(..)
     , makeFrameClientStream
     , send
     , next
@@ -47,6 +47,7 @@ data Http2FrameClientStream = Http2FrameClientStream {
   -- ^ Sends a frame to the server.
   -- The first argument is a FrameFlags modifier (e.g., to sed the
   -- end-of-stream flag).
+  , _getStreamId :: HTTP2.StreamId -- TODO: hide me
   }
 
 -- | Sends a frame to the server.
@@ -83,7 +84,7 @@ newHttp2FrameConnection host port params = do
     let makeClientStream streamID = 
             let putFrame modifyFF frame = writeProtect . _sendRaw http2conn $
                     HTTP2.encodeFrame (encodeInfo modifyFF streamID) frame
-             in Http2FrameClientStream putFrame
+             in Http2FrameClientStream putFrame streamID
 
         nextServerFrameChunk = Http2ServerStream $ do
             (fTy, fh@FrameHeader{..}) <- HTTP2.decodeFrameHeader <$> _nextRaw http2conn 9
