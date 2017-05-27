@@ -12,9 +12,10 @@ module Network.HTTP2.Client (
     , newHttp2Client
     , newHpackEncoder
     , startStream
-    , creditConnection
+    , flowControl
     , Http2ClientStream(..)
     , StreamActions(..)
+    , FlowControl(..)
     , module Network.HTTP2.Client.FrameConnection
     ) where
 
@@ -35,7 +36,12 @@ newtype HpackEncoder =
 
 data StreamActions a = StreamActions {
     _initStream   :: IO ClientStreamThread
-  , _handleStream :: (WindowSize -> IO ()) -> IO a -- TODO: create a FlowControl object holding continuations to update/send window-updates (maybe protect from sending after closing a stream?)
+  , _handleStream :: FlowControl -> IO a -- TODO: create a FlowControl object holding continuations to update/send window-updates (maybe protect from sending after closing a stream?)
+  }
+
+data FlowControl = FlowControl {
+    _creditFlow   :: WindowSize -> IO ()
+  -- TODO: , _updateWindow :: IO ()
   }
 
 type StreamStarter a =
@@ -46,12 +52,12 @@ type StreamStarter a =
 data Http2Client = Http2Client {
     _newHpackEncoder  :: IO HpackEncoder
   , _startStream      :: forall a. StreamStarter a
-  , _creditConnection :: WindowSize -> IO ()
+  , _flowControl      :: FlowControl
   }
 
 newHpackEncoder = _newHpackEncoder
 startStream = _startStream
-creditConnection = _creditConnection
+flowControl = _flowControl
 
 -- | Proof that a client stream was initialized.
 data ClientStreamThread = CST
@@ -119,7 +125,7 @@ newPeriodicRefreshAllCredit stream = do
         amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
         when (amount > 0) (windowUpdateFrame stream amount)
     let addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
-    return (thread, addCredit)
+    return (thread, FlowControl addCredit)
 
 headersFrame s enc headers = do
     let eos = HTTP2.setEndStream . HTTP2.setEndHeader

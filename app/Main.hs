@@ -2,7 +2,7 @@
 module Main where
 
 import Network.HTTP2.Client (newHttp2FrameConnection, send, next)
-import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), creditConnection, StreamActions(..))
+import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), flowControl, StreamActions(..), FlowControl(..))
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
@@ -38,7 +38,7 @@ client = do
                         print pair
                         case payload of
                             (Right (HTTP2.DataFrame _)) -> do
-                                creditConnection cli (HTTP2.payloadLength fH)
+                                _creditFlow (flowControl cli) (HTTP2.payloadLength fH)
                         --        creditStream (HTTP2.payloadLength fH)
                             otherwise                   ->
                                 return ()
