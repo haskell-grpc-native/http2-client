@@ -2,7 +2,7 @@
 module Main where
 
 import Network.HTTP2.Client (newHttp2FrameConnection, send, next)
-import Network.HTTP2.Client (newHttp2Client, newHpackEncoder, startStream, Http2ClientStream(..), flowControl, StreamActions(..), FlowControl(..))
+import Network.HTTP2.Client (newHttp2Client, Http2Client(..), Http2ClientStream(..), StreamActions(..), FlowControl(..))
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
@@ -29,21 +29,25 @@ client = do
                           ]
 
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
-    _creditFlow (flowControl cli) largestWindowSize
-    encoder <- newHpackEncoder cli
+    _creditFlow (_flowControl cli) largestWindowSize
+    encoder <- _newHpackEncoder cli
     _ <- forkIO $ do
-            _updateWindow $ flowControl cli
+            _updateWindow $ _flowControl cli
             threadDelay 1000000
 
+    _ping cli "pingpong"
+    _ping cli "pingpong"
+    threadDelay 3000000
+
     let go = forever $ do
-            startStream cli encoder $ \stream ->
-                let init = _headersFrame stream headersPairs
+            _startStream cli encoder $ \stream ->
+                let init = _headers stream headersPairs
                     handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
                         print fH
                         case payload of
                             (Right (HTTP2.DataFrame _)) -> do
-                                _creditFlow (flowControl cli) (HTTP2.payloadLength fH)
+                                _creditFlow (_flowControl cli) (HTTP2.payloadLength fH)
                             otherwise                   ->
                                 return ()
                         if HTTP2.testEndStream (HTTP2.flags fH)

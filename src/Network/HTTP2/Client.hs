@@ -8,11 +8,8 @@
 -- TODO: improve on long-standing stream
 -- * allow to reconnect behind the scene when Ids are almost exhausted
 module Network.HTTP2.Client (
-      Http2Client
+      Http2Client(..)
     , newHttp2Client
-    , newHpackEncoder
-    , startStream
-    , flowControl
     , Http2ClientStream(..)
     , StreamActions(..)
     , FlowControl(..)
@@ -25,6 +22,7 @@ import           Control.Concurrent (forkIO)
 import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef')
 import           Network.HPACK as HTTP2
 import           Network.HTTP2 as HTTP2
@@ -50,21 +48,19 @@ type StreamStarter a =
   -> IO a
 
 data Http2Client = Http2Client {
-    _newHpackEncoder  :: IO HpackEncoder
+    _ping             :: ByteString -> IO ()
+  , _newHpackEncoder  :: IO HpackEncoder
   , _startStream      :: forall a. StreamStarter a
   , _flowControl      :: FlowControl
   }
-
-newHpackEncoder = _newHpackEncoder
-startStream = _startStream
-flowControl = _flowControl
 
 -- | Proof that a client stream was initialized.
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headersFrame       :: HTTP2.HeaderList -> IO ClientStreamThread
-  , _waitFrame          :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
+    _headers   :: HTTP2.HeaderList -> IO ClientStreamThread
+  , _rst       :: HTTP2.ErrorCodeId -> IO ()
+  , _waitFrame :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
 
 newHttp2Client host port tlsParams = do
@@ -99,32 +95,57 @@ newHttp2Client host port tlsParams = do
             serverStreamFrames <- dupChan serverFrames
             cont <- withClientStreamId $ \sid -> do
                 let frameStream = makeFrameClientStream conn sid
+
+                -- Prepare handlers.
                 let _waitFrame = waitFrame sid serverStreamFrames
-                let _headersFrame = headersFrame frameStream encoder
+                let _headers   = sendHeadersFrame frameStream encoder
+                let _rst       = sendResetFrame frameStream
+
                 let StreamActions{..} = getWork $ Http2ClientStream{..}
+
                 -- Perform the 1st action, the stream won't be idle anymore.
                 _ <- _initStream
+
+                -- Builds a flow-control context.
                 streamFlowControl <- newFlowControl controlStream
+
+                -- Returns 2nd action.
                 return $ _handleStream streamFlowControl
             cont
 
-    return $ Http2Client newEncoder startStream creditConn
+    let ping = sendPingFrame controlStream
+    return $ Http2Client ping newEncoder startStream creditConn
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
     let updateWindow = do
             amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
-            when (amount > 0) (windowUpdateFrame stream amount)
+            when (amount > 0) (sendWindowUpdateFrame stream amount)
     let addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
     return $ FlowControl addCredit updateWindow
 
-headersFrame s enc headers = do
+-- HELPERS
+
+sendHeadersFrame s enc headers = do
     let eos = HTTP2.setEndStream . HTTP2.setEndHeader
     payload <- HTTP2.HeadersFrame Nothing <$> (encodeHeaders enc headers)
     send s eos payload
     return CST
 
-windowUpdateFrame s amount = do
+sendResetFrame s err = do
+    send s id (HTTP2.RSTStreamFrame err)
+
+sendGTFO s lastStreamId err errStr = do
+    send s id (HTTP2.GoAwayFrame lastStreamId err errStr)
+
+-- | Sends a ping frame.
+--
+-- TODO: error on length(dat) /= 8
+--       error on streamId /= 0
+sendPingFrame s dat =
+    send s id (HTTP2.PingFrame dat)
+
+sendWindowUpdateFrame s amount = do
     let payload = HTTP2.WindowUpdateFrame amount
     send s id payload
     return ()
