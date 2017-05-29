@@ -23,7 +23,7 @@ import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import           Data.IORef (newIORef, atomicModifyIORef', writeIORef, readIORef)
+import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
 import           Network.HPACK as HTTP2
 import           Network.HTTP2 as HTTP2
 
@@ -76,18 +76,20 @@ newHttp2Client host port tlsParams = do
             (\k -> h (2 * k + 1)) -- client StreamIds MUST be odd
 
     let controlStream = makeFrameClientStream conn 0
+    let ackPing = sendPingFrame controlStream HTTP2.setAck
 
     -- prepare server streams
-    lastReceivedStreamId  <- newIORef 0
+    maxReceivedStreamId  <- newIORef 0
     serverFrames <- newChan
-    _ <- forkIO $ forever $ do
-        frame@(fh,_)<- next conn
-        writeIORef lastReceivedStreamId $ streamId fh
-        writeChan serverFrames frame
+    _ <- forkIO $ forever $ next conn >>= writeChan serverFrames
 
     _ <- forkIO $ forever $ do
-            controlFrame <- waitFrame 0 serverFrames
-            print controlFrame
+        controlFrame@(fh, payload) <- waitFrame 0 serverFrames
+        -- Remember highest streamId.
+        atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
+        -- Answer to pings.
+        sequence [ ackPing pingMsg | (Right (PingFrame pingMsg)) <- [payload] ]
+        print controlFrame
 
     let newEncoder = do
             let strategy = (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True })
@@ -118,8 +120,9 @@ newHttp2Client host port tlsParams = do
                 return $ _handleStream streamFlowControl
             cont
 
-    let ping = sendPingFrame controlStream
-    let gtfo err errStr = readIORef lastReceivedStreamId >>= (\sId -> sendGTFOFrame controlStream sId err errStr)
+    let ping = sendPingFrame controlStream id
+    let gtfo err errStr = readIORef maxReceivedStreamId >>= (\sId -> sendGTFOFrame controlStream sId err errStr)
+
     return $ Http2Client ping gtfo newEncoder startStream creditConn
 
 newFlowControl stream = do
@@ -148,8 +151,8 @@ sendGTFOFrame s lastStreamId err errStr = do
 --
 -- TODO: error on length(dat) /= 8
 --       error on streamId /= 0
-sendPingFrame s dat =
-    send s id (HTTP2.PingFrame dat)
+sendPingFrame s flags dat =
+    send s flags (HTTP2.PingFrame dat)
 
 sendWindowUpdateFrame s amount = do
     let payload = HTTP2.WindowUpdateFrame amount
