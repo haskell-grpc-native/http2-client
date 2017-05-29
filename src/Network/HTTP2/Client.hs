@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards  #-}
 {-# LANGUAGE RankNTypes  #-}
+{-# LANGUAGE MonadComprehensions #-}
 
 -- TODO: improve on received frame resources
 -- * bounded channels
@@ -87,8 +88,8 @@ newHttp2Client host port tlsParams = do
         controlFrame@(fh, payload) <- waitFrame 0 serverFrames
         -- Remember highest streamId.
         atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
-        -- Answer to pings.
-        sequence [ ackPing pingMsg | (Right (PingFrame pingMsg)) <- [payload] ]
+        -- Answer to pings (using monad comp).
+        [ ackPing pingMsg | (Right (PingFrame pingMsg)) <- pure payload ]
         print controlFrame
 
     let newEncoder = do
