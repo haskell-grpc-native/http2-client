@@ -23,7 +23,7 @@ import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import           Data.IORef (newIORef, atomicModifyIORef')
+import           Data.IORef (newIORef, atomicModifyIORef', writeIORef, readIORef)
 import           Network.HPACK as HTTP2
 import           Network.HTTP2 as HTTP2
 
@@ -49,6 +49,7 @@ type StreamStarter a =
 
 data Http2Client = Http2Client {
     _ping             :: ByteString -> IO ()
+  , _gtfo             :: ErrorCodeId -> ByteString -> IO ()
   , _newHpackEncoder  :: IO HpackEncoder
   , _startStream      :: forall a. StreamStarter a
   , _flowControl      :: FlowControl
@@ -77,8 +78,12 @@ newHttp2Client host port tlsParams = do
     let controlStream = makeFrameClientStream conn 0
 
     -- prepare server streams
+    lastReceivedStreamId  <- newIORef 0
     serverFrames <- newChan
-    _ <- forkIO $ forever (next conn >>= writeChan serverFrames)
+    _ <- forkIO $ forever $ do
+        frame@(fh,_)<- next conn
+        writeIORef lastReceivedStreamId $ streamId fh
+        writeChan serverFrames frame
 
     _ <- forkIO $ forever $ do
             controlFrame <- waitFrame 0 serverFrames
@@ -114,7 +119,8 @@ newHttp2Client host port tlsParams = do
             cont
 
     let ping = sendPingFrame controlStream
-    return $ Http2Client ping newEncoder startStream creditConn
+    let gtfo err errStr = readIORef lastReceivedStreamId >>= (\sId -> sendGTFOFrame controlStream sId err errStr)
+    return $ Http2Client ping gtfo newEncoder startStream creditConn
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
@@ -135,7 +141,7 @@ sendHeadersFrame s enc headers = do
 sendResetFrame s err = do
     send s id (HTTP2.RSTStreamFrame err)
 
-sendGTFO s lastStreamId err errStr = do
+sendGTFOFrame s lastStreamId err errStr = do
     send s id (HTTP2.GoAwayFrame lastStreamId err errStr)
 
 -- | Sends a ping frame.
