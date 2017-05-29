@@ -82,12 +82,14 @@ newHttp2Client host port tlsParams = do
     -- prepare server streams
     maxReceivedStreamId  <- newIORef 0
     serverFrames <- newChan
-    _ <- forkIO $ forever $ next conn >>= writeChan serverFrames
+    _ <- forkIO $ forever $ do
+        frame@(fh, _) <- waitFrame 0 serverFrames
+        -- Remember highest streamId.
+        atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
+        writeChan serverFrames frame
 
     _ <- forkIO $ forever $ do
         controlFrame@(fh, payload) <- waitFrame 0 serverFrames
-        -- Remember highest streamId.
-        atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
         -- Answer to pings (using monad comp).
         [ ackPing pingMsg | (Right (PingFrame pingMsg)) <- pure payload ]
         print controlFrame
