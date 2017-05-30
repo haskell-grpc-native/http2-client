@@ -92,7 +92,7 @@ newHttp2Client host port tlsParams = do
     maxReceivedStreamId  <- newIORef 0
     serverFrames <- newChan
     _ <- forkIO $ forever $ do
-        frame@(fh, _) <- waitFrame 0 serverFrames
+        frame@(fh, _) <- next conn
         -- Remember highest streamId.
         atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
         writeChan serverFrames frame
