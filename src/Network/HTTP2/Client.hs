@@ -8,6 +8,15 @@
 -- * do not broadcast to every chan but filter upfront with a lookup
 -- TODO: improve on long-standing stream
 -- * allow to reconnect behind the scene when Ids are almost exhausted
+-- TODO: protocol
+-- * outbound flow control
+-- * stream concurrency
+-- * continuations
+-- * promises
+-- * priority frames
+-- * outbound priority control
+-- * be more faithful to the spec when receiving out of stream frames etc.
+-- * double check encoder
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
@@ -60,7 +69,7 @@ data Http2Client = Http2Client {
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headers   :: HTTP2.HeaderList -> IO ClientStreamThread
+    _headers   :: HTTP2.HeaderList -> IO ClientStreamThread --todo: non-empty or break it apart below?
   , _rst       :: HTTP2.ErrorCodeId -> IO ()
   , _waitFrame :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
