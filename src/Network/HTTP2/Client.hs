@@ -70,7 +70,7 @@ data Http2Client = Http2Client {
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headers   :: HTTP2.HeaderList -> IO ClientStreamThread --todo: non-empty or break it apart below?
+    _headers   :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread --todo: non-empty or break it apart below?
   , _rst       :: HTTP2.ErrorCodeId -> IO ()
   , _waitFrame :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
@@ -149,10 +149,15 @@ newFlowControl stream = do
 
 -- HELPERS
 
-sendHeadersFrame s enc headers = do
-    let eos = HTTP2.setEndStream . HTTP2.setEndHeader
+-- TODO: don't set endHeader
+-- TODO: don't set endStream
+--
+-- TODO: we'll also need a higher level construct to break encoded headers into
+-- chunked blocks and send continuation back-to-back while locking access to
+-- other senders because
+sendHeadersFrame s enc headers mod = do
     payload <- HTTP2.HeadersFrame Nothing <$> (encodeHeaders enc headers)
-    send s eos payload
+    send s mod payload
     return CST
 
 sendResetFrame s err = do

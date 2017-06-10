@@ -42,7 +42,7 @@ client = do
 
     let go = forever $ do
             _startStream cli encoder $ \stream ->
-                let init = _headers stream headersPairs
+                let init = _headers stream headersPairs (HTTP2.setEndHeader . HTTP2.setEndStream)
                     handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
                         print fH
