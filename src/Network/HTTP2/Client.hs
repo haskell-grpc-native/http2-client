@@ -59,6 +59,7 @@ type StreamStarter a =
 
 data Http2Client = Http2Client {
     _ping             :: ByteString -> IO ()
+  , _settings         :: HTTP2.SettingsList -> IO ()
   , _gtfo             :: ErrorCodeId -> ByteString -> IO ()
   , _newHpackEncoder  :: IO HpackEncoder
   , _startStream      :: forall a. StreamStarter a
@@ -133,9 +134,10 @@ newHttp2Client host port tlsParams = do
             cont
 
     let ping = sendPingFrame controlStream id
+    let settings = sendSettingsFrame controlStream
     let gtfo err errStr = readIORef maxReceivedStreamId >>= (\sId -> sendGTFOFrame controlStream sId err errStr)
 
-    return $ Http2Client ping gtfo newEncoder startStream creditConn
+    return $ Http2Client ping settings gtfo newEncoder startStream creditConn
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
@@ -162,12 +164,18 @@ sendGTFOFrame s lastStreamId err errStr = do
 -- | Sends a ping frame.
 --
 -- TODO: error on length(dat) /= 8
---       error on streamId /= 0
+-- TOD   error on streamId /= 0
 sendPingFrame s flags dat =
     send s flags (HTTP2.PingFrame dat)
 
 sendWindowUpdateFrame s amount = do
     let payload = HTTP2.WindowUpdateFrame amount
+    send s id payload
+    return ()
+
+-- TODO   error on streamId /= 0
+sendSettingsFrame s setts = do
+    let payload = HTTP2.SettingsFrame setts
     send s id payload
     return ()
 

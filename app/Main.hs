@@ -35,6 +35,7 @@ client = do
             _updateWindow $ _flowControl cli
             threadDelay 1000000
 
+    _settings cli []
     _ping cli "pingpong"
     _ping cli "pingpong"
     threadDelay 3000000
