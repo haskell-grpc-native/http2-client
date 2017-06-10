@@ -70,7 +70,8 @@ data Http2Client = Http2Client {
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headers   :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread --todo: non-empty or break it apart below?
+    _headers   :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+  , _continuation :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _rst       :: HTTP2.ErrorCodeId -> IO ()
   , _waitFrame :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
@@ -117,9 +118,10 @@ newHttp2Client host port tlsParams = do
                 let frameStream = makeFrameClientStream conn sid
 
                 -- Prepare handlers.
-                let _waitFrame = waitFrame sid serverStreamFrames
-                let _headers   = sendHeadersFrame frameStream encoder
-                let _rst       = sendResetFrame frameStream
+                let _waitFrame    = waitFrame sid serverStreamFrames
+                let _headers      = sendHeadersFrame frameStream encoder
+                let _continuation = sendContinuationFrame frameStream encoder
+                let _rst          = sendResetFrame frameStream
 
                 let StreamActions{..} = getWork $ Http2ClientStream{..}
 
@@ -157,6 +159,11 @@ newFlowControl stream = do
 -- other senders because
 sendHeadersFrame s enc headers mod = do
     payload <- HTTP2.HeadersFrame Nothing <$> (encodeHeaders enc headers)
+    send s mod payload
+    return CST
+
+sendContinuationFrame s enc headers mod = do
+    payload <- HTTP2.ContinuationFrame <$> (encodeHeaders enc headers)
     send s mod payload
     return CST
 
