@@ -72,6 +72,7 @@ data ClientStreamThread = CST
 data Http2ClientStream = Http2ClientStream {
     _headers      :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _continuation :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+  , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
   , _waitFrame    :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
   }
@@ -122,6 +123,7 @@ newHttp2Client host port tlsParams = do
                 let _headers      = sendHeadersFrame frameStream encoder
                 let _continuation = sendContinuationFrame frameStream encoder
                 let _rst          = sendResetFrame frameStream
+                let _prio         = sendPriorityFrame frameStream
 
                 let StreamActions{..} = getWork $ Http2ClientStream{..}
 
@@ -188,6 +190,12 @@ sendWindowUpdateFrame s amount = do
 -- TODO   error on streamId /= 0
 sendSettingsFrame s setts = do
     let payload = HTTP2.SettingsFrame setts
+    send s id payload
+    return ()
+
+-- TODO: need a streamId to add a priority on another stream => we need to expose an opaque StreamId
+sendPriorityFrame s p = do
+    let payload = HTTP2.PriorityFrame p
     send s id payload
     return ()
 
