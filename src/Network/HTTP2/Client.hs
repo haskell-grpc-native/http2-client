@@ -3,20 +3,16 @@
 {-# LANGUAGE RankNTypes  #-}
 {-# LANGUAGE MonadComprehensions #-}
 
--- TODO: improve on received frame resources
--- * bounded channels
--- * do not broadcast to every chan but filter upfront with a lookup
--- TODO: improve on long-standing stream
+-- High-level API
 -- * allow to reconnect behind the scene when Ids are almost exhausted
--- TODO: protocol
+-- * split into continuations
+-- System architecture
+-- * bounded channels
 -- * outbound flow control
--- * stream concurrency
--- * continuations
--- * promises
--- * priority frames
--- * outbound priority control
--- * be more faithful to the spec when receiving out of stream frames etc.
--- * double check encoder
+-- * max stream concurrency
+-- * do not broadcast to every chan but filter upfront with a lookup
+-- Low-level API
+-- * dataframes
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
@@ -71,6 +67,7 @@ data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
     _headers      :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+  , _pushPromise  :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _continuation :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
@@ -124,6 +121,7 @@ newHttp2Client host port tlsParams = do
                 let _continuation = sendContinuationFrame frameStream encoder
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
+                let _pushPromise  = sendPushPromiseFrame sid frameStream encoder
 
                 let StreamActions{..} = getWork $ Http2ClientStream{..}
 
@@ -198,6 +196,12 @@ sendPriorityFrame s p = do
     let payload = HTTP2.PriorityFrame p
     send s id payload
     return ()
+
+-- TODO: build in a way that sId is the stream-ID for s
+sendPushPromiseFrame sId s enc headers mod = do
+    payload <- HTTP2.PushPromiseFrame sId <$> (encodeHeaders enc headers)
+    send s mod payload
+    return CST
 
 waitFrame sid chan =
     loop
