@@ -163,19 +163,19 @@ newFlowControl stream = do
 -- other senders because
 sendHeadersFrame s enc headers mod = do
     payload <- HTTP2.HeadersFrame Nothing <$> (encodeHeaders enc headers)
-    send s mod payload
+    sendOne s mod payload
     return CST
 
 sendContinuationFrame s enc headers mod = do
     payload <- HTTP2.ContinuationFrame <$> (encodeHeaders enc headers)
-    send s mod payload
+    sendOne s mod payload
     return CST
 
 sendResetFrame s err = do
-    send s id (HTTP2.RSTStreamFrame err)
+    sendOne s id (HTTP2.RSTStreamFrame err)
 
 sendGTFOFrame s lastStreamId err errStr = do
-    send s id (HTTP2.GoAwayFrame lastStreamId err errStr)
+    sendOne s id (HTTP2.GoAwayFrame lastStreamId err errStr)
 
 rfcError msg = error (msg ++ "draft-ietf-httpbis-http2-17")
 
@@ -185,11 +185,11 @@ sendPingFrame s flags dat
         rfcError "PING frames are not associated with any individual stream."
   | ByteString.length dat /= 8 =
         rfcError "PING frames MUST contain 8 octets"
-  | otherwise                  = send s flags (HTTP2.PingFrame dat)
+  | otherwise                  = sendOne s flags (HTTP2.PingFrame dat)
 
 sendWindowUpdateFrame s amount = do
     let payload = HTTP2.WindowUpdateFrame amount
-    send s id payload
+    sendOne s id payload
     return ()
 
 sendSettingsFrame s setts
@@ -197,19 +197,19 @@ sendSettingsFrame s setts
         rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
   | otherwise                  = do
     let payload = HTTP2.SettingsFrame setts
-    send s id payload
+    sendOne s id payload
     return ()
 
 -- TODO: need a streamId to add a priority on another stream => we need to expose an opaque StreamId
 sendPriorityFrame s p = do
     let payload = HTTP2.PriorityFrame p
-    send s id payload
+    sendOne s id payload
     return ()
 
 -- TODO: build in a way that sId is the stream-ID for s
 sendPushPromiseFrame sId s enc headers mod = do
     payload <- HTTP2.PushPromiseFrame sId <$> (encodeHeaders enc headers)
-    send s mod payload
+    sendOne s mod payload
     return CST
 
 waitFrame sid chan =

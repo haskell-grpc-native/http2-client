@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
-import Network.HTTP2.Client (newHttp2FrameConnection, send, next)
 import Network.HTTP2.Client (newHttp2Client, Http2Client(..), Http2ClientStream(..), StreamActions(..), FlowControl(..))
 
 import           Control.Monad (forever, when)

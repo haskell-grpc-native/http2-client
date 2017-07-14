@@ -8,13 +8,14 @@ module Network.HTTP2.Client.FrameConnection (
     -- * Interact at the Frame level.
     , Http2FrameClientStream(..)
     , makeFrameClientStream
-    , send
+    , sendOne
     , next
     , closeConnection
     ) where
 
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
+import           Control.Monad (void)
 import           Data.IORef (newIORef, atomicModifyIORef')
 import           Network.HTTP2 (FrameHeader(..), FrameFlags, FramePayload, HTTP2Error, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2 as HTTP2
@@ -43,7 +44,7 @@ makeFrameClientStream :: Http2FrameConnection
 makeFrameClientStream = _makeFrameClientStream
 
 data Http2FrameClientStream = Http2FrameClientStream {
-    _sendFrame :: (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
+    _sendFrames :: [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
   -- ^ Sends a frame to the server.
   -- The first argument is a FrameFlags modifier (e.g., to sed the
   -- end-of-stream flag).
@@ -51,9 +52,8 @@ data Http2FrameClientStream = Http2FrameClientStream {
   }
 
 -- | Sends a frame to the server.
-send :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
-send = _sendFrame
-
+sendOne :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
+sendOne client f payload = _sendFrames client [(f,payload)]
 
 data Http2ServerStream = Http2ServerStream {
     _nextHeaderAndFrame :: IO (FrameHeader, Either HTTP2Error FramePayload)
@@ -82,9 +82,10 @@ newHttp2FrameConnection host port params = do
 
     -- Define handlers.
     let makeClientStream streamID = 
-            let putFrame modifyFF frame = writeProtect . _sendRaw http2conn $
+            let putFrame modifyFF frame = _sendRaw http2conn $
                     HTTP2.encodeFrame (encodeInfo modifyFF streamID) frame
-             in Http2FrameClientStream putFrame streamID
+                putFrames xs = writeProtect . void $ traverse (uncurry putFrame) xs
+             in Http2FrameClientStream putFrames streamID
 
         nextServerFrameChunk = Http2ServerStream $ do
             (fTy, fh@FrameHeader{..}) <- HTTP2.decodeFrameHeader <$> _nextRaw http2conn 9
