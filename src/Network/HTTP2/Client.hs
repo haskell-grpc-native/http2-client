@@ -31,7 +31,7 @@ import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
-import           Network.HPACK as HTTP2
+import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
 
 import           Network.HTTP2.Client.FrameConnection
@@ -64,8 +64,8 @@ data Http2Client = Http2Client {
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headers      :: HTTP2.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
-  , _pushPromise  :: HTTP2.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+    _headers      :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+  , _pushPromise  :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
   , _waitFrame    :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
@@ -108,10 +108,10 @@ newHttp2Client host port tlsParams = do
             _                         -> print controlFrame
 
     encoder <- do
-            let strategy = (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True })
+            let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
                 bufsize  = 4096
-            dt <- HTTP2.newDynamicTableForEncoding HTTP2.defaultDynamicTableSize
-            return $ HpackEncoder $ HTTP2.encodeHeader strategy bufsize dt
+            dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
+            return $ HpackEncoder $ HPACK.encodeHeader strategy bufsize dt
 
     creditConn <- newFlowControl controlStream
     let startStream getWork = do
