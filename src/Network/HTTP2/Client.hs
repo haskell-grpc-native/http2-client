@@ -110,7 +110,7 @@ newHttp2Client host port tlsParams = do
 
     -- Thread handling control frames.
     _ <- forkIO $ forever $ do
-        controlFrame@(fh, payload) <- waitFrame 0 serverFrames
+        controlFrame@(fh, payload) <- waitFrameWithStreamId 0 serverFrames
         case payload of
             Right (SettingsFrame settsList) -> do
                 atomicModifyIORef' serverSettings (\setts -> (HTTP2.updateSettings setts settsList, ()))
@@ -128,7 +128,7 @@ newHttp2Client host port tlsParams = do
                 -- Prepare handlers.
                 let _headers      = sendHeaders frameStream hpack
                 let _pushPromise  = sendPushPromise frameStream hpack
-                let _waitFrame    = waitFrame sid serverStreamFrames
+                let _waitFrame    = waitFrameWithStreamId sid serverStreamFrames
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
 
@@ -216,11 +216,13 @@ sendPriorityFrame s p = do
     sendOne s id payload
     return ()
 
-waitFrame sid chan =
+waitFrameWithStreamId sid = waitFrame (\fHead -> streamId fHead /= sid)
+
+waitFrame pred chan =
     loop
   where
     loop = do
         pair@(fHead, _) <- readChan chan
-        if streamId fHead /= sid
+        if pred fHead
         then loop
         else return pair
