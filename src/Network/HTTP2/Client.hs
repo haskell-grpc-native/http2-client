@@ -36,8 +36,10 @@ import           Network.HTTP2 as HTTP2
 
 import           Network.HTTP2.Client.FrameConnection
 
-newtype HpackEncoder =
-    HpackEncoder { encodeHeaders :: HeaderList -> IO HTTP2.HeaderBlockFragment }
+data HpackContext = HpackContext {
+    _encodeHeaders    :: HeaderList -> IO HTTP2.HeaderBlockFragment
+  , _applySettings    :: Int -> IO ()
+  }
 
 data StreamActions a = StreamActions {
     _initStream   :: IO ClientStreamThread
@@ -75,6 +77,15 @@ newHttp2Client host port tlsParams = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
 
+    -- prepare hpack context
+    hpack <- do
+        let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
+        let bufsize  = 4096
+        dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
+        let _encodeHeaders = HPACK.encodeHeader strategy bufsize dt
+        let _applySettings n = HPACK.setLimitForEncoding n dt
+        return HpackContext{..}
+
     -- prepare client streams
     clientStreamIdMutex <- newMVar 0
     let withClientStreamId h = bracket
@@ -101,17 +112,12 @@ newHttp2Client host port tlsParams = do
     _ <- forkIO $ forever $ do
         controlFrame@(fh, payload) <- waitFrame 0 serverFrames
         case payload of
-            Right (SettingsFrame settsList) ->
+            Right (SettingsFrame settsList) -> do
                 atomicModifyIORef' serverSettings (\setts -> (HTTP2.updateSettings setts settsList, ()))
+                maybe (return ()) (_applySettings hpack) (lookup SettingsHeaderTableSize settsList)
             Right (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
                 ackPing pingMsg
             _                         -> print controlFrame
-
-    encoder <- do
-            let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
-                bufsize  = 4096
-            dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
-            return $ HpackEncoder $ HPACK.encodeHeader strategy bufsize dt
 
     creditConn <- newFlowControl controlStream
     let startStream getWork = do
@@ -120,8 +126,8 @@ newHttp2Client host port tlsParams = do
                 let frameStream = makeFrameClientStream conn sid
 
                 -- Prepare handlers.
-                let _headers      = sendHeaders frameStream encoder
-                let _pushPromise  = sendPushPromise frameStream encoder
+                let _headers      = sendHeaders frameStream hpack
+                let _pushPromise  = sendPushPromise frameStream hpack
                 let _waitFrame    = waitFrame sid serverStreamFrames
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
@@ -155,7 +161,7 @@ newFlowControl stream = do
 -- HELPERS
 
 sendHeaders s enc headers blockSplitter mod = do
-    headerBlockFragments <- blockSplitter <$> encodeHeaders enc headers
+    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
     let framers           = (HTTP2.HeadersFrame Nothing) : repeat HTTP2.ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
     let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
@@ -165,7 +171,7 @@ sendHeaders s enc headers blockSplitter mod = do
 
 sendPushPromise s enc headers blockSplitter mod = do
     let sId = _getStreamId s
-    headerBlockFragments <- blockSplitter <$> encodeHeaders enc headers
+    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
     let framers           = (HTTP2.PushPromiseFrame sId) : repeat HTTP2.ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
     let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
