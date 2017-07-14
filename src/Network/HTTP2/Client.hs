@@ -19,6 +19,7 @@ module Network.HTTP2.Client (
     , Http2ClientStream(..)
     , StreamActions(..)
     , FlowControl(..)
+    , dontSplitHeaderBlockFragments
     , module Network.HTTP2.Client.FrameConnection
     ) where
 
@@ -40,7 +41,7 @@ newtype HpackEncoder =
 
 data StreamActions a = StreamActions {
     _initStream   :: IO ClientStreamThread
-  , _handleStream :: FlowControl -> IO a -- TODO: create a FlowControl object holding continuations to update/send window-updates (maybe protect from sending after closing a stream?)
+  , _handleStream :: FlowControl -> IO a
   }
 
 data FlowControl = FlowControl {
@@ -63,9 +64,8 @@ data Http2Client = Http2Client {
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headers      :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
-  , _pushPromise  :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
-  , _continuation :: HTTP2.HeaderList -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+    _headers      :: HTTP2.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+  , _pushPromise  :: HTTP2.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
   , _waitFrame    :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
@@ -120,12 +120,11 @@ newHttp2Client host port tlsParams = do
                 let frameStream = makeFrameClientStream conn sid
 
                 -- Prepare handlers.
+                let _headers      = sendHeaders frameStream encoder
+                let _pushPromise  = sendPushPromise frameStream encoder
                 let _waitFrame    = waitFrame sid serverStreamFrames
-                let _headers      = sendHeadersFrame frameStream encoder
-                let _continuation = sendContinuationFrame frameStream encoder
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
-                let _pushPromise  = sendPushPromiseFrame sid frameStream encoder
 
                 let StreamActions{..} = getWork $ Http2ClientStream{..}
 
@@ -155,18 +154,26 @@ newFlowControl stream = do
 
 -- HELPERS
 
--- TODO: we'll also need a higher level construct to break encoded headers into
--- chunked blocks and send continuation back-to-back while locking access to
--- other senders because
-sendHeadersFrame s enc headers mod = do
-    payload <- HTTP2.HeadersFrame Nothing <$> (encodeHeaders enc headers)
-    sendOne s mod payload
+sendHeaders s enc headers blockSplitter mod = do
+    headerBlockFragments <- blockSplitter <$> encodeHeaders enc headers
+    let framers           = (HTTP2.HeadersFrame Nothing) : repeat HTTP2.ContinuationFrame
+    let frames            = zipWith ($) framers headerBlockFragments
+    let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
+    let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
+    sendBackToBack s arrangedFrames
     return CST
 
-sendContinuationFrame s enc headers mod = do
-    payload <- HTTP2.ContinuationFrame <$> (encodeHeaders enc headers)
-    sendOne s mod payload
+sendPushPromise s enc headers blockSplitter mod = do
+    let sId = _getStreamId s
+    headerBlockFragments <- blockSplitter <$> encodeHeaders enc headers
+    let framers           = (HTTP2.PushPromiseFrame sId) : repeat HTTP2.ContinuationFrame
+    let frames            = zipWith ($) framers headerBlockFragments
+    let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
+    let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
+    sendBackToBack s arrangedFrames
     return CST
+
+dontSplitHeaderBlockFragments x = [x]
 
 sendResetFrame s err = do
     sendOne s id (HTTP2.RSTStreamFrame err)
@@ -202,12 +209,6 @@ sendPriorityFrame s p = do
     let payload = HTTP2.PriorityFrame p
     sendOne s id payload
     return ()
-
--- TODO: build in a way that sId is the stream-ID for s
-sendPushPromiseFrame sId s enc headers mod = do
-    payload <- HTTP2.PushPromiseFrame sId <$> (encodeHeaders enc headers)
-    sendOne s mod payload
-    return CST
 
 waitFrame sid chan =
     loop

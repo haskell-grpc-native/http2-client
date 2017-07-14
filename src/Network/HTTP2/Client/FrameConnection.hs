@@ -9,6 +9,7 @@ module Network.HTTP2.Client.FrameConnection (
     , Http2FrameClientStream(..)
     , makeFrameClientStream
     , sendOne
+    , sendBackToBack
     , next
     , closeConnection
     ) where
@@ -54,6 +55,10 @@ data Http2FrameClientStream = Http2FrameClientStream {
 -- | Sends a frame to the server.
 sendOne :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
 sendOne client f payload = _sendFrames client [(f,payload)]
+
+-- | Sends multiple back-to-back frames to the server.
+sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
+sendBackToBack = _sendFrames
 
 data Http2ServerStream = Http2ServerStream {
     _nextHeaderAndFrame :: IO (FrameHeader, Either HTTP2Error FramePayload)

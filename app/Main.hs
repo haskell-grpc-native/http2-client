@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
-import Network.HTTP2.Client (newHttp2Client, Http2Client(..), Http2ClientStream(..), StreamActions(..), FlowControl(..))
+import Network.HTTP2.Client
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
@@ -40,7 +40,7 @@ client = do
 
     let go = forever $ do
             _startStream cli $ \stream ->
-                let init = _headers stream headersPairs (HTTP2.setEndHeader . HTTP2.setEndStream)
+                let init = _headers stream headersPairs dontSplitHeaderBlockFragments HTTP2.setEndStream
                     handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
                         print fH
