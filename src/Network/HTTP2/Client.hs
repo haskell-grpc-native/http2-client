@@ -76,7 +76,7 @@ data Http2ClientStream = Http2ClientStream {
 
 newHttp2Client host port tlsParams = do
     -- network connection
-    conn <- newHttp2FrameConnection "127.0.0.1" 3000 tlsParams
+    conn <- newHttp2FrameConnection host port tlsParams
 
     -- prepare client streams
     clientStreamIdMutex <- newMVar 0
