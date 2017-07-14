@@ -90,18 +90,25 @@ newHttp2Client host port tlsParams = do
 
     -- prepare server streams
     maxReceivedStreamId  <- newIORef 0
+    serverSettings  <- newIORef HTTP2.defaultSettings
     serverFrames <- newChan
+
+    -- Initial thread receiving server frames.
     _ <- forkIO $ forever $ do
         frame@(fh, _) <- next conn
         -- Remember highest streamId.
         atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
         writeChan serverFrames frame
 
+    -- Thread handling control frames.
     _ <- forkIO $ forever $ do
         controlFrame@(fh, payload) <- waitFrame 0 serverFrames
-        -- Answer to pings (using monad comp).
-        [ ackPing pingMsg | (Right (PingFrame pingMsg)) <- pure payload ]
-        print controlFrame
+        case payload of
+            Right (SettingsFrame settsList) ->
+                atomicModifyIORef' serverSettings (\setts -> (HTTP2.updateSettings setts settsList, ()))
+            Right (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
+                ackPing pingMsg
+            _                         -> print controlFrame
 
     let newEncoder = do
             let strategy = (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True })
@@ -151,9 +158,6 @@ newFlowControl stream = do
 
 -- HELPERS
 
--- TODO: don't set endHeader
--- TODO: don't set endStream
---
 -- TODO: we'll also need a higher level construct to break encoded headers into
 -- chunked blocks and send continuation back-to-back while locking access to
 -- other senders because
@@ -173,20 +177,25 @@ sendResetFrame s err = do
 sendGTFOFrame s lastStreamId err errStr = do
     send s id (HTTP2.GoAwayFrame lastStreamId err errStr)
 
+rfcError msg = error (msg ++ "draft-ietf-httpbis-http2-17")
+
 -- | Sends a ping frame.
---
--- TODO: error on length(dat) /= 8
--- TOD   error on streamId /= 0
-sendPingFrame s flags dat =
-    send s flags (HTTP2.PingFrame dat)
+sendPingFrame s flags dat
+  | _getStreamId s /= 0        =
+        rfcError "PING frames are not associated with any individual stream."
+  | ByteString.length dat /= 8 =
+        rfcError "PING frames MUST contain 8 octets"
+  | otherwise                  = send s flags (HTTP2.PingFrame dat)
 
 sendWindowUpdateFrame s amount = do
     let payload = HTTP2.WindowUpdateFrame amount
     send s id payload
     return ()
 
--- TODO   error on streamId /= 0
-sendSettingsFrame s setts = do
+sendSettingsFrame s setts
+  | _getStreamId s /= 0        =
+        rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
+  | otherwise                  = do
     let payload = HTTP2.SettingsFrame setts
     send s id payload
     return ()
