@@ -49,15 +49,12 @@ data FlowControl = FlowControl {
   }
 
 type StreamStarter a =
-     HpackEncoder
-  -> (Http2ClientStream -> StreamActions a)
-  -> IO a
+     (Http2ClientStream -> StreamActions a) -> IO a
 
 data Http2Client = Http2Client {
     _ping             :: ByteString -> IO ()
   , _settings         :: HTTP2.SettingsList -> IO ()
   , _gtfo             :: ErrorCodeId -> ByteString -> IO ()
-  , _newHpackEncoder  :: IO HpackEncoder
   , _startStream      :: forall a. StreamStarter a
   , _flowControl      :: FlowControl
   }
@@ -110,14 +107,14 @@ newHttp2Client host port tlsParams = do
                 ackPing pingMsg
             _                         -> print controlFrame
 
-    let newEncoder = do
+    encoder <- do
             let strategy = (HTTP2.defaultEncodeStrategy { HTTP2.useHuffman = True })
                 bufsize  = 4096
             dt <- HTTP2.newDynamicTableForEncoding HTTP2.defaultDynamicTableSize
             return $ HpackEncoder $ HTTP2.encodeHeader strategy bufsize dt
 
     creditConn <- newFlowControl controlStream
-    let startStream encoder getWork = do
+    let startStream getWork = do
             serverStreamFrames <- dupChan serverFrames
             cont <- withClientStreamId $ \sid -> do
                 let frameStream = makeFrameClientStream conn sid
@@ -146,7 +143,7 @@ newHttp2Client host port tlsParams = do
     let settings = sendSettingsFrame controlStream
     let gtfo err errStr = readIORef maxReceivedStreamId >>= (\sId -> sendGTFOFrame controlStream sId err errStr)
 
-    return $ Http2Client ping settings gtfo newEncoder startStream creditConn
+    return $ Http2Client ping settings gtfo startStream creditConn
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0

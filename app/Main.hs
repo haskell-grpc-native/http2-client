@@ -29,7 +29,6 @@ client = do
 
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
     _creditFlow (_flowControl cli) largestWindowSize
-    encoder <- _newHpackEncoder cli
     _ <- forkIO $ do
             _updateWindow $ _flowControl cli
             threadDelay 1000000
@@ -40,7 +39,7 @@ client = do
     threadDelay 3000000
 
     let go = forever $ do
-            _startStream cli encoder $ \stream ->
+            _startStream cli $ \stream ->
                 let init = _headers stream headersPairs (HTTP2.setEndHeader . HTTP2.setEndStream)
                     handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
