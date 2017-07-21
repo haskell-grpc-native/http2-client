@@ -124,17 +124,25 @@ newHttp2Client host port tlsParams = do
             _                         -> print controlFrame
 
     -- Thread handling push-promises frames.
+    -- TODO: propagate decoded headers lists
     _ <- forkIO $ forever $ do
         serverStreamFrames <- dupChan serverFrames
         (fh, fp) <- waitFrameWithTypeId [HTTP2.FramePushPromise, HTTP2.FrameHeaders]
                                         serverStreamFrames
-        let (sid, buf) = case fp of
+        let (sid, buf0) = case fp of
                 PushPromiseFrame sid hbf -> (sid, hbf)
                 HeadersFrame _ hbf       -> (HTTP2.streamId fh, hbf)
                 _                        -> error "wrong TypeId"
-        if HTTP2.testEndHeader (HTTP2.flags fh)
-        then decodeHeader hpackDecoder buf >>= print
-        else print fh -- todo: loop increasing the buf if continuations are present
+        let go buffer =
+                if HTTP2.testEndHeader (HTTP2.flags fh)
+                then do
+                    print =<< decodeHeader hpackDecoder buffer
+                else do
+                    (_, ContinuationFrame chbf) <- waitFrameWithTypeId [HTTP2.FrameContinuation]
+                                                                       serverStreamFrames
+                    go (ByteString.append buffer chbf)
+        go buf0
+
 
     creditConn <- newFlowControl controlStream
     let startStream getWork = do
