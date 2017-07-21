@@ -23,7 +23,7 @@ module Network.HTTP2.Client (
     , module Network.HTTP2.Client.FrameConnection
     ) where
 
-import           Control.Exception (bracket)
+import           Control.Exception (bracket, throw)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (forkIO)
 import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
@@ -36,7 +36,7 @@ import           Network.HTTP2 as HTTP2
 
 import           Network.HTTP2.Client.FrameConnection
 
-data HpackContext = HpackContext {
+data HpackEncoderContext = HpackEncoderContext {
     _encodeHeaders    :: HeaderList -> IO HTTP2.HeaderBlockFragment
   , _applySettings    :: Int -> IO ()
   }
@@ -70,26 +70,30 @@ data Http2ClientStream = Http2ClientStream {
   , _pushPromise  :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
-  , _waitFrame    :: IO (HTTP2.FrameHeader, Either HTTP2.HTTP2Error HTTP2.FramePayload)
+  , _waitFrame    :: IO (HTTP2.FrameHeader, HTTP2.FramePayload)
   }
 
 newHttp2Client host port tlsParams = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
 
-    -- prepare hpack context
-    hpack <- do
+    -- prepare hpack contexts
+    hpackEncoder <- do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
         let bufsize  = 4096
         dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
         let _encodeHeaders = HPACK.encodeHeader strategy bufsize dt
         let _applySettings n = HPACK.setLimitForEncoding n dt
-        return HpackContext{..}
+        return HpackEncoderContext{..}
+
+    hpackDecoder <- do
+        let bufsize  = 4096
+        dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
+        return dt
 
     -- prepare client streams
     clientStreamIdMutex <- newMVar 0
-    let withClientStreamId h = bracket
-            (takeMVar clientStreamIdMutex)
+    let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
             (putMVar clientStreamIdMutex . succ)
             (\k -> h (2 * k + 1)) -- client StreamIds MUST be odd
 
@@ -112,12 +116,25 @@ newHttp2Client host port tlsParams = do
     _ <- forkIO $ forever $ do
         controlFrame@(fh, payload) <- waitFrameWithStreamId 0 serverFrames
         case payload of
-            Right (SettingsFrame settsList) -> do
+            (SettingsFrame settsList) -> do
                 atomicModifyIORef' serverSettings (\setts -> (HTTP2.updateSettings setts settsList, ()))
-                maybe (return ()) (_applySettings hpack) (lookup SettingsHeaderTableSize settsList)
-            Right (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
+                maybe (return ()) (_applySettings hpackEncoder) (lookup SettingsHeaderTableSize settsList)
+            (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
                 ackPing pingMsg
             _                         -> print controlFrame
+
+    -- Thread handling push-promises frames.
+    _ <- forkIO $ forever $ do
+        serverStreamFrames <- dupChan serverFrames
+        (fh, fp) <- waitFrameWithTypeId [HTTP2.FramePushPromise, HTTP2.FrameHeaders]
+                                        serverStreamFrames
+        let (sid, buf) = case fp of
+                PushPromiseFrame sid hbf -> (sid, hbf)
+                HeadersFrame _ hbf       -> (HTTP2.streamId fh, hbf)
+                _                        -> error "wrong TypeId"
+        if HTTP2.testEndHeader (HTTP2.flags fh)
+        then decodeHeader hpackDecoder buf >>= print
+        else print fh -- todo: loop increasing the buf if continuations are present
 
     creditConn <- newFlowControl controlStream
     let startStream getWork = do
@@ -126,8 +143,8 @@ newHttp2Client host port tlsParams = do
                 let frameStream = makeFrameClientStream conn sid
 
                 -- Prepare handlers.
-                let _headers      = sendHeaders frameStream hpack
-                let _pushPromise  = sendPushPromise frameStream hpack
+                let _headers      = sendHeaders frameStream hpackEncoder
+                let _pushPromise  = sendPushPromise frameStream hpackEncoder
                 let _waitFrame    = waitFrameWithStreamId sid serverStreamFrames
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
@@ -146,7 +163,9 @@ newHttp2Client host port tlsParams = do
 
     let ping = sendPingFrame controlStream id
     let settings = sendSettingsFrame controlStream
-    let gtfo err errStr = readIORef maxReceivedStreamId >>= (\sId -> sendGTFOFrame controlStream sId err errStr)
+    let gtfo err errStr = do
+            sId <- readIORef maxReceivedStreamId
+            sendGTFOFrame controlStream sId err errStr
 
     return $ Http2Client ping settings gtfo startStream creditConn
 
@@ -216,13 +235,16 @@ sendPriorityFrame s p = do
     sendOne s id payload
     return ()
 
-waitFrameWithStreamId sid = waitFrame (\fHead -> streamId fHead /= sid)
+waitFrameWithStreamId sid = waitFrame (\h _ -> streamId h == sid)
+
+waitFrameWithTypeId tids = waitFrame (\_ p -> HTTP2.framePayloadToFrameTypeId p `elem` tids)
 
 waitFrame pred chan =
     loop
   where
     loop = do
-        pair@(fHead, _) <- readChan chan
-        if pred fHead
-        then loop
-        else return pair
+        (fHead, fPayload) <- readChan chan
+        let dat = either throw id fPayload
+        if pred fHead dat
+        then return (fHead, dat)
+        else loop

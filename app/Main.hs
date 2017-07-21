@@ -43,12 +43,11 @@ client = do
                 let init = _headers stream headersPairs dontSplitHeaderBlockFragments HTTP2.setEndStream
                     handler creditStream = do
                         pair@(fH,payload) <- _waitFrame stream
-                        print fH
                         case payload of
-                            (Right (HTTP2.DataFrame _)) -> do
+                            (HTTP2.DataFrame _) -> do
                                 _creditFlow (_flowControl cli) (HTTP2.payloadLength fH)
                             otherwise                   ->
-                                return ()
+                                print payload
                         if HTTP2.testEndStream (HTTP2.flags fH)
                         then return ()
                         else handler creditStream
