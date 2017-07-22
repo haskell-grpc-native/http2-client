@@ -110,45 +110,19 @@ newHttp2Client host port tlsParams = do
         let bufsize  = 4096
         dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
         return dt
-    _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames serverHeaders hpackDecoder
+    _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames serverHeaders hpackDecoder conn onPushPromise
 
     connectionFlowControl <- newFlowControl controlStream
 
     let startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
-                let frameStream = makeFrameClientStream conn sid
-
-                -- Builds a flow-control context.
-                streamFlowControl <- newFlowControl frameStream
-
-                -- TODO: use filtered/routed chans abstraction here directly
-                frames  <- dupChan serverFrames
-                headers <- dupChan serverHeaders
-
-                -- Prepare handlers.
-                let _headers      = sendHeaders frameStream hpackEncoder
-                let _pushPromise  = sendPushPromise frameStream hpackEncoder
-                let _waitHeaders  = waitHeadersWithStreamId sid headers
-                let _waitData     = do
-                        (fh, fp) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameRSTStream, HTTP2.FrameData] frames
-                        case fp of
-                            DataFrame dat -> do
-                                 _addCredit streamFlowControl (HTTP2.payloadLength fh)
-                                 _addCredit connectionFlowControl (HTTP2.payloadLength fh)
-                                 return (fh, Right dat)
-                            RSTStreamFrame err -> do
-                                 return (fh, Left $ HTTP2.fromErrorCodeId err)
-                let _sendData     = sendDataFrame frameStream
-                let _rst          = sendResetFrame frameStream
-                let _prio         = sendPriorityFrame frameStream
-
-                let StreamActions{..} = getWork $ Http2ClientStream{..}
-
-                -- Perform the 1st action, the stream won't be idle anymore.
-                _ <- _initStream
-
-                -- Returns 2nd action.
-                return $ _handleStream streamFlowControl
+                initializeStream conn
+                                 connectionFlowControl
+                                 serverFrames
+                                 serverHeaders
+                                 hpackEncoder
+                                 sid
+                                 getWork
             cont
 
     let ping = sendPingFrame controlStream id
@@ -158,6 +132,41 @@ newHttp2Client host port tlsParams = do
             sendGTFOFrame controlStream sId err errStr
 
     return $ Http2Client ping settings gtfo startStream connectionFlowControl
+
+initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
+    let frameStream = makeFrameClientStream conn sid
+
+    -- Builds a flow-control context.
+    streamFlowControl <- newFlowControl frameStream
+
+    -- TODO: use filtered/routed chans abstraction here directly
+    frames  <- dupChan serverFrames
+    headers <- dupChan serverHeaders
+
+    -- Prepare handlers.
+    let _headers      = sendHeaders frameStream hpackEncoder
+    let _pushPromise  = sendPushPromise frameStream hpackEncoder
+    let _waitHeaders  = waitHeadersWithStreamId sid headers
+    let _waitData     = do
+            (fh, fp) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameRSTStream, HTTP2.FrameData] frames
+            case fp of
+                DataFrame dat -> do
+                     _addCredit streamFlowControl (HTTP2.payloadLength fh)
+                     _addCredit connectionFlowControl (HTTP2.payloadLength fh)
+                     return (fh, Right dat)
+                RSTStreamFrame err -> do
+                     return (fh, Left $ HTTP2.fromErrorCodeId err)
+    let _sendData     = sendDataFrame frameStream
+    let _rst          = sendResetFrame frameStream
+    let _prio         = sendPriorityFrame frameStream
+
+    let StreamActions{..} = getWork $ Http2ClientStream{..}
+
+    -- Perform the 1st action, the stream won't be idle anymore.
+    _ <- _initStream
+
+    -- Returns 2nd action.
+    return $ _handleStream streamFlowControl
 
 incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
     frame@(fh, _) <- next conn
