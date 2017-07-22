@@ -71,9 +71,8 @@ data Http2ClientStream = Http2ClientStream {
   , _pushPromise  :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
-  , _waitFrame    :: IO (HTTP2.FrameHeader, HTTP2.FramePayload)  -- TODO: too low-level
-  , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, HeaderList)
-  , _waitData     :: IO (HTTP2.FrameHeader, ByteString)
+  , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, Either ErrorCode HeaderList)
+  , _waitData     :: IO (HTTP2.FrameHeader, Either ErrorCode ByteString)
   }
 
 newHttp2Client host port tlsParams = do
@@ -130,22 +129,41 @@ newHttp2Client host port tlsParams = do
     -- Thread handling push-promises and headers frames serializing the buffers.
     _ <- forkIO $ forever $ do
         serverStreamFrames <- dupChan serverFrames
-        (fh, fp) <- waitFrameWithTypeId [HTTP2.FramePushPromise, HTTP2.FrameHeaders]
+        (fh, fp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
+                                        , HTTP2.FramePushPromise
+                                        , HTTP2.FrameHeaders
+                                        ]
                                         serverStreamFrames
-        let (sId, buf0) = case fp of
-                PushPromiseFrame sid hbf -> (sid, hbf)               --TODO: create streams and prepare a callback
-                HeadersFrame _ hbf       -> (HTTP2.streamId fh, hbf) --TODO: handle priority
+        let (sId, pattern) = case fp of
+                PushPromiseFrame sid hbf ->
+                    -- TODO: create streams and prepare a callback
+                    (sid, Right hbf)
+                HeadersFrame _ hbf       -> -- TODO: handle priority
+                    (HTTP2.streamId fh, Right hbf)
+                RSTStreamFrame err       ->
+                    (HTTP2.streamId fh, Left err)
                 _                        -> error "wrong TypeId"
-        let go curFh buffer =
+
+        let go curFh (Right buffer) =
                 if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
                 then do
-                    (nextFh, ContinuationFrame chbf) <- waitFrameWithTypeId [HTTP2.FrameContinuation]
-                                                                       serverStreamFrames
-                    go nextFh (ByteString.append buffer chbf)
+                    (lastFh, lastFp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
+                                                            , HTTP2.FrameContinuation
+                                                            ]
+                                                            serverStreamFrames
+                    case lastFp of
+                        ContinuationFrame chbf ->
+                            go lastFh (Right (ByteString.append buffer chbf))
+                        RSTStreamFrame err     ->
+                            go lastFh (Left err)
                 else do
                     headers <- decodeHeader hpackDecoder buffer
-                    writeChan serverHeaders (curFh, sId, headers)
-        go fh buf0
+                    writeChan serverHeaders (curFh, sId, Right headers)
+
+            go curFh (Left err) =
+                    writeChan serverHeaders (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
+
+        go fh pattern
 
 
     connectionFlowControl <- newFlowControl controlStream
@@ -166,11 +184,14 @@ newHttp2Client host port tlsParams = do
                 let _pushPromise  = sendPushPromise frameStream hpackEncoder
                 let _waitHeaders  = waitHeadersWithStreamId sid headers
                 let _waitData     = do
-                        (fh, DataFrame dat) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameData] frames
-                        _creditFlow streamFlowControl (HTTP2.payloadLength fh)
-                        _creditFlow connectionFlowControl (HTTP2.payloadLength fh)
-                        return (fh, dat)
-                let _waitFrame    = waitFrameWithStreamId sid frames
+                        (fh, fp) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameRSTStream, HTTP2.FrameData] frames
+                        case fp of
+                            DataFrame dat -> do
+                                 _creditFlow streamFlowControl (HTTP2.payloadLength fh)
+                                 _creditFlow connectionFlowControl (HTTP2.payloadLength fh)
+                                 return (fh, Right dat)
+                            RSTStreamFrame err -> do
+                                 return (fh, Left $ HTTP2.fromErrorCodeId err)
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
 
