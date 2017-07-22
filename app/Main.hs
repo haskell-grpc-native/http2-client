@@ -7,23 +7,29 @@ import           Control.Monad (forever, when)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Data.IORef (atomicModifyIORef', atomicModifyIORef, newIORef)
+import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.HPACK as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
-
+import           System.Environment (getArgs)
 
 main :: IO ()
-main = client
+main = getArgs >>= mainArgs
 
-client :: IO ()
-client = do
+mainArgs :: [String] -> IO ()
+mainArgs []                  = client "127.0.0.1" 3000 "/"
+mainArgs (host:[])           = client host 443 "/"
+mainArgs (host:port:[])      = client host (read port) "/"
+mainArgs (host:port:path:[]) = client host (read port) path
+
+client host port path = do
     let largestWindowSize = HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize
     let headersPairs    = [ (":method", "GET")
                           , (":scheme", "https")
-                          , (":path", "/hello")
-                          , (":authority", "example.org")
+                          , (":path", ByteString.pack path)
+                          , (":authority", ByteString.pack host)
                           , ("accept", "text/plain")
                           ]
 
@@ -38,10 +44,11 @@ client = do
                    ]
     _ping conn "pingpong"
 
-    let go = forever $ do
-            _startStream cli $ \stream ->
-                let init = _headers stream headersPairs dontSplitHeaderBlockFragments HTTP2.setEndStream
-                    handler creditStream = do
+    let go = -- forever $ do
+            _startStream conn $ \stream ->
+                let init = _headers stream headersPairs dontSplitHeaderBlockFragments id
+                    handler streamFlowControl = do
+                        _sendData stream HTTP2.setEndStream ""
                         _waitHeaders stream >>= print
                         godata
                         print "stream ended"

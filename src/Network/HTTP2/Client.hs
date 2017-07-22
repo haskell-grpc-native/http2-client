@@ -68,6 +68,7 @@ data Http2ClientStream = Http2ClientStream {
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
   , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, Either ErrorCode HeaderList)
   , _waitData     :: IO (HTTP2.FrameHeader, Either ErrorCode ByteString)
+  , _sendData     :: (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> ByteString -> IO ()
   }
 
 newHttp2Client host port tlsParams = do
@@ -87,10 +88,11 @@ newHttp2Client host port tlsParams = do
     clientStreamIdMutex <- newMVar 0
     let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
             (putMVar clientStreamIdMutex . succ)
-            (\k -> h (2 * k + 1)) -- client StreamIds MUST be odd
+            (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
 
     let controlStream = makeFrameClientStream conn 0
     let ackPing = sendPingFrame controlStream HTTP2.setAck
+    let ackSettings = sendSettingsFrame controlStream HTTP2.setAck []
 
     -- Initial thread receiving server frames.
     maxReceivedStreamId  <- newIORef 0
@@ -99,7 +101,7 @@ newHttp2Client host port tlsParams = do
 
     -- Thread handling control frames.
     serverSettings  <- newIORef HTTP2.defaultSettings
-    _ <- forkIO $ incomingControlFramesLoop serverFrames serverSettings hpackEncoder ackPing
+    _ <- forkIO $ incomingControlFramesLoop serverFrames serverSettings hpackEncoder ackPing ackSettings
 
     -- Thread handling push-promises and headers frames serializing the buffers.
     serverStreamFrames <- dupChan serverFrames
@@ -114,14 +116,14 @@ newHttp2Client host port tlsParams = do
 
     let startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
+                let frameStream = makeFrameClientStream conn sid
+
                 -- Builds a flow-control context.
-                streamFlowControl <- newFlowControl controlStream
+                streamFlowControl <- newFlowControl frameStream
 
                 -- TODO: use filtered/routed chans abstraction here directly
                 frames  <- dupChan serverFrames
                 headers <- dupChan serverHeaders
-
-                let frameStream = makeFrameClientStream conn sid
 
                 -- Prepare handlers.
                 let _headers      = sendHeaders frameStream hpackEncoder
@@ -136,6 +138,7 @@ newHttp2Client host port tlsParams = do
                                  return (fh, Right dat)
                             RSTStreamFrame err -> do
                                  return (fh, Left $ HTTP2.fromErrorCodeId err)
+                let _sendData     = sendDataFrame frameStream
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
 
@@ -149,7 +152,7 @@ newHttp2Client host port tlsParams = do
             cont
 
     let ping = sendPingFrame controlStream id
-    let settings = sendSettingsFrame controlStream
+    let settings = sendSettingsFrame controlStream id
     let gtfo err errStr = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
@@ -162,15 +165,17 @@ incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
     atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
     writeChan frames frame
 
-incomingControlFramesLoop frames settings hpackEncoder ackPing = forever $ do
+incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
-        (SettingsFrame settsList) -> do
+        (SettingsFrame settsList) -> when (not . testAck . flags $ fh) $ do
             atomicModifyIORef' settings (\setts -> (HTTP2.updateSettings setts settsList, ()))
             maybe (return ()) (_applySettings hpackEncoder) (lookup SettingsHeaderTableSize settsList)
+            ackSettings
         (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
             ackPing pingMsg
-        _                         -> print ("unhandled", controlFrame)
+        -- TODO: window updates & co.
+        _                   -> print ("unhandled", controlFrame)
 
 incomingHPACKFramesLoop frames headers hpackDecoder = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
@@ -240,6 +245,9 @@ sendPushPromise s enc headers blockSplitter mod = do
 
 dontSplitHeaderBlockFragments x = [x]
 
+sendDataFrame s mod dat = do
+    sendOne s mod (HTTP2.DataFrame dat)
+
 sendResetFrame s err = do
     sendOne s id (HTTP2.RSTStreamFrame err)
 
@@ -261,12 +269,12 @@ sendWindowUpdateFrame s amount = do
     sendOne s id payload
     return ()
 
-sendSettingsFrame s setts
+sendSettingsFrame s flags setts
   | _getStreamId s /= 0        =
         rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
   | otherwise                  = do
     let payload = HTTP2.SettingsFrame setts
-    sendOne s id payload
+    sendOne s flags payload
     return ()
 
 -- TODO: need a streamId to add a priority on another stream => we need to expose an opaque StreamId
