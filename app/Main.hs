@@ -3,7 +3,7 @@ module Main where
 
 import Network.HTTP2.Client
 
-import           Control.Monad (forever, when)
+import           Control.Monad (forever, when, void)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Data.IORef (atomicModifyIORef', atomicModifyIORef, newIORef)
@@ -33,14 +33,31 @@ client host port path = do
                           , ("accept", "text/plain")
                           ]
 
-    conn <- newHttp2Client host port tlsParams
+    let onPushPromise stream streamFlowControl = void $ forkIO $ do
+            _waitHeaders stream >>= print
+            moredata
+            print "push stream ended"
+            threadDelay 1000000
+            where
+                moredata = do
+                    (fh, x) <- _waitData stream
+                    print (fmap (\bs -> (ByteString.length bs, bs)) x)
+                    when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
+                        _updateWindow $ streamFlowControl
+                        moredata
+
+    conn <- newHttp2Client host port tlsParams onPushPromise
     _addCredit (_flowControl conn) largestWindowSize
     _ <- forkIO $ forever $ do
             threadDelay 1000000
             _updateWindow $ _flowControl conn
 
-    _settings conn [ (HTTP2.SettingsMaxFrameSize, 6000000)
-                   , (HTTP2.SettingsEnablePush, 0)
+    _settings conn [ (HTTP2.SettingsEnablePush, 1)
+                   , (HTTP2.SettingsMaxConcurrentStreams, 20)
+                   , (HTTP2.SettingsInitialWindowSize, 1000000)
+                   , (HTTP2.SettingsMaxFrameSize, 1000000)
+                   , (HTTP2.SettingsHeaderTableSize, 100000)
+                   , (HTTP2.SettingsMaxHeaderBlockSize, 100000)
                    ]
     _ping conn "pingpong"
 
@@ -52,7 +69,6 @@ client host port path = do
                         _waitHeaders stream >>= print
                         godata
                         print "stream ended"
-                        threadDelay 1000000
                           where
                             godata = do
                                 (fh, x) <- _waitData stream
@@ -62,6 +78,7 @@ client host port path = do
                                     godata
                 in StreamActions init handler
     waitAnyCancel =<< traverse async [go]
+    threadDelay 5000000
     _gtfo conn HTTP2.NoError "thx <(=O.O=)>"
     return ()
   where

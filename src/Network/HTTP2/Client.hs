@@ -11,7 +11,7 @@
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
-    , Http2ClientStream(..)
+    , Http2Stream(..)
     , StreamActions(..)
     , FlowControl(..)
     , dontSplitHeaderBlockFragments
@@ -37,7 +37,7 @@ data HpackEncoderContext = HpackEncoderContext {
   }
 
 data StreamActions a = StreamActions {
-    _initStream   :: IO ClientStreamThread
+    _initStream   :: IO StreamThread
   , _handleStream :: FlowControl -> IO a
   }
 
@@ -47,7 +47,7 @@ data FlowControl = FlowControl {
   }
 
 type StreamStarter a =
-     (Http2ClientStream -> StreamActions a) -> IO a
+     (Http2Stream -> StreamActions a) -> IO a
 
 data Http2Client = Http2Client {
     _ping             :: ByteString -> IO ()
@@ -58,12 +58,17 @@ data Http2Client = Http2Client {
   }
 
 -- | Proof that a client stream was initialized.
-data ClientStreamThread = CST
+data StreamThread = CST
 
-data Http2ClientStream = Http2ClientStream {
-    _headers      :: HPACK.HeaderList ->
-  (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
-  , _pushPromise  :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+data Http2Stream = Http2Stream {
+    _headers      :: HPACK.HeaderList
+                  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+                  -> (HTTP2.FrameFlags -> HTTP2.FrameFlags)
+                  -> IO StreamThread
+  , _pushPromise  :: HPACK.HeaderList
+                  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+                  -> (HTTP2.FrameFlags -> HTTP2.FrameFlags)
+                  -> IO StreamThread -- TODO: remove, only servers can send promises
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
   , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, Either ErrorCode HeaderList)
@@ -71,7 +76,7 @@ data Http2ClientStream = Http2ClientStream {
   , _sendData     :: (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> ByteString -> IO ()
   }
 
-newHttp2Client host port tlsParams = do
+newHttp2Client host port tlsParams handlePPStream = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
 
@@ -110,9 +115,16 @@ newHttp2Client host port tlsParams = do
         let bufsize  = 4096
         dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
         return dt
-    _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames serverHeaders hpackDecoder conn onPushPromise
 
     connectionFlowControl <- newFlowControl controlStream
+
+    _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
+                                          serverHeaders
+                                          hpackEncoder
+                                          hpackDecoder
+                                          conn
+                                          connectionFlowControl
+                                          handlePPStream
 
     let startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
@@ -160,13 +172,13 @@ initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEnco
     let _rst          = sendResetFrame frameStream
     let _prio         = sendPriorityFrame frameStream
 
-    let StreamActions{..} = getWork $ Http2ClientStream{..}
+    let streamActions = getWork $ Http2Stream{..}
 
     -- Perform the 1st action, the stream won't be idle anymore.
-    _ <- _initStream
+    _ <- _initStream streamActions
 
     -- Returns 2nd action.
-    return $ _handleStream streamFlowControl
+    return $ _handleStream streamActions streamFlowControl
 
 incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
     frame@(fh, _) <- next conn
@@ -186,20 +198,27 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
         -- TODO: window updates & co.
         _                   -> print ("unhandled", controlFrame)
 
-incomingHPACKFramesLoop frames headers hpackDecoder = forever $ do
+incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connectionFlowControl handlePPStream = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
                                     , HTTP2.FramePushPromise
                                     , HTTP2.FrameHeaders
                                     ]
                                     frames
-    let (sId, pattern) = case fp of
-            PushPromiseFrame sid hbf ->
-                -- TODO: create streams and prepare a callback
-                (sid, Right hbf)
+    (sId, pattern) <- case fp of
+            PushPromiseFrame sid hbf -> do
+                let mkStreamActions stream = StreamActions (return CST) (handlePPStream stream)
+                initializeStream conn
+                                 connectionFlowControl
+                                 frames
+                                 headers
+                                 hpackEncoder
+                                 sid
+                                 mkStreamActions
+                return (sid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
-                (HTTP2.streamId fh, Right hbf)
+                return (HTTP2.streamId fh, Right hbf)
             RSTStreamFrame err       ->
-                (HTTP2.streamId fh, Left err)
+                return (HTTP2.streamId fh, Left err)
             _                        -> error "wrong TypeId"
 
     let go curFh (Right buffer) =
