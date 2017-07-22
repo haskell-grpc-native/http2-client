@@ -3,16 +3,11 @@
 {-# LANGUAGE RankNTypes  #-}
 {-# LANGUAGE MonadComprehensions #-}
 
--- High-level API
--- * allow to reconnect behind the scene when Ids are almost exhausted
--- * split into continuations
 -- System architecture
--- * bounded channels
+-- * callback for push-promises
 -- * outbound flow control
 -- * max stream concurrency
 -- * do not broadcast to every chan but filter upfront with a lookup
--- Low-level API
--- * dataframes
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
@@ -88,11 +83,6 @@ newHttp2Client host port tlsParams = do
         let _applySettings n = HPACK.setLimitForEncoding n dt
         return HpackEncoderContext{..}
 
-    hpackDecoder <- do
-        let bufsize  = 4096
-        dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
-        return dt
-
     -- prepare client streams
     clientStreamIdMutex <- newMVar 0
     let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
@@ -102,69 +92,23 @@ newHttp2Client host port tlsParams = do
     let controlStream = makeFrameClientStream conn 0
     let ackPing = sendPingFrame controlStream HTTP2.setAck
 
-    -- prepare server streams
-    maxReceivedStreamId  <- newIORef 0
-    serverSettings  <- newIORef HTTP2.defaultSettings
-    serverFrames <- newChan
-
     -- Initial thread receiving server frames.
-    _ <- forkIO $ forever $ do
-        frame@(fh, _) <- next conn
-        -- Remember highest streamId.
-        atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
-        writeChan serverFrames frame
+    maxReceivedStreamId  <- newIORef 0
+    serverFrames <- newChan
+    _ <- forkIO $ incomingFramesLoop conn serverFrames maxReceivedStreamId
 
     -- Thread handling control frames.
-    _ <- forkIO $ forever $ do
-        controlFrame@(fh, payload) <- waitFrameWithStreamId 0 serverFrames
-        case payload of
-            (SettingsFrame settsList) -> do
-                atomicModifyIORef' serverSettings (\setts -> (HTTP2.updateSettings setts settsList, ()))
-                maybe (return ()) (_applySettings hpackEncoder) (lookup SettingsHeaderTableSize settsList)
-            (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
-                ackPing pingMsg
-            _                         -> print controlFrame
+    serverSettings  <- newIORef HTTP2.defaultSettings
+    _ <- forkIO $ incomingControlFramesLoop serverFrames serverSettings hpackEncoder ackPing
 
-    serverHeaders <- newChan
     -- Thread handling push-promises and headers frames serializing the buffers.
-    _ <- forkIO $ forever $ do
-        serverStreamFrames <- dupChan serverFrames
-        (fh, fp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
-                                        , HTTP2.FramePushPromise
-                                        , HTTP2.FrameHeaders
-                                        ]
-                                        serverStreamFrames
-        let (sId, pattern) = case fp of
-                PushPromiseFrame sid hbf ->
-                    -- TODO: create streams and prepare a callback
-                    (sid, Right hbf)
-                HeadersFrame _ hbf       -> -- TODO: handle priority
-                    (HTTP2.streamId fh, Right hbf)
-                RSTStreamFrame err       ->
-                    (HTTP2.streamId fh, Left err)
-                _                        -> error "wrong TypeId"
-
-        let go curFh (Right buffer) =
-                if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
-                then do
-                    (lastFh, lastFp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
-                                                            , HTTP2.FrameContinuation
-                                                            ]
-                                                            serverStreamFrames
-                    case lastFp of
-                        ContinuationFrame chbf ->
-                            go lastFh (Right (ByteString.append buffer chbf))
-                        RSTStreamFrame err     ->
-                            go lastFh (Left err)
-                else do
-                    headers <- decodeHeader hpackDecoder buffer
-                    writeChan serverHeaders (curFh, sId, Right headers)
-
-            go curFh (Left err) =
-                    writeChan serverHeaders (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
-
-        go fh pattern
-
+    serverStreamFrames <- dupChan serverFrames
+    serverHeaders <- newChan
+    hpackDecoder <- do
+        let bufsize  = 4096
+        dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
+        return dt
+    _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames serverHeaders hpackDecoder
 
     connectionFlowControl <- newFlowControl controlStream
 
@@ -211,6 +155,59 @@ newHttp2Client host port tlsParams = do
             sendGTFOFrame controlStream sId err errStr
 
     return $ Http2Client ping settings gtfo startStream connectionFlowControl
+
+incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
+    frame@(fh, _) <- next conn
+    -- Remember highest streamId.
+    atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
+    writeChan frames frame
+
+incomingControlFramesLoop frames settings hpackEncoder ackPing = forever $ do
+    controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
+    case payload of
+        (SettingsFrame settsList) -> do
+            atomicModifyIORef' settings (\setts -> (HTTP2.updateSettings setts settsList, ()))
+            maybe (return ()) (_applySettings hpackEncoder) (lookup SettingsHeaderTableSize settsList)
+        (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
+            ackPing pingMsg
+        _                         -> print ("unhandled", controlFrame)
+
+incomingHPACKFramesLoop frames headers hpackDecoder = forever $ do
+    (fh, fp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
+                                    , HTTP2.FramePushPromise
+                                    , HTTP2.FrameHeaders
+                                    ]
+                                    frames
+    let (sId, pattern) = case fp of
+            PushPromiseFrame sid hbf ->
+                -- TODO: create streams and prepare a callback
+                (sid, Right hbf)
+            HeadersFrame _ hbf       -> -- TODO: handle priority
+                (HTTP2.streamId fh, Right hbf)
+            RSTStreamFrame err       ->
+                (HTTP2.streamId fh, Left err)
+            _                        -> error "wrong TypeId"
+
+    let go curFh (Right buffer) =
+            if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
+            then do
+                (lastFh, lastFp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
+                                                        , HTTP2.FrameContinuation
+                                                        ]
+                                                        frames
+                case lastFp of
+                    ContinuationFrame chbf ->
+                        go lastFh (Right (ByteString.append buffer chbf))
+                    RSTStreamFrame err     ->
+                        go lastFh (Left err)
+            else do
+                hdrs <- decodeHeader hpackDecoder buffer
+                writeChan headers (curFh, sId, Right hdrs)
+
+        go curFh (Left err) =
+                writeChan headers (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
+
+    go fh pattern
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
