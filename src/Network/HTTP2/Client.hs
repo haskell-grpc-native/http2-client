@@ -106,7 +106,8 @@ newHttp2Client host port tlsParams handlePPStream = do
 
     -- Thread handling control frames.
     serverSettings  <- newIORef HTTP2.defaultSettings
-    _ <- forkIO $ incomingControlFramesLoop serverFrames serverSettings hpackEncoder ackPing ackSettings
+    controlFrames <- dupChan serverFrames
+    _ <- forkIO $ incomingControlFramesLoop controlFrames serverSettings hpackEncoder ackPing ackSettings
 
     -- Thread handling push-promises and headers frames serializing the buffers.
     serverStreamFrames <- dupChan serverFrames
@@ -207,13 +208,14 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connection
     (sId, pattern) <- case fp of
             PushPromiseFrame sid hbf -> do
                 let mkStreamActions stream = StreamActions (return CST) (handlePPStream stream)
-                initializeStream conn
-                                 connectionFlowControl
-                                 frames
-                                 headers
-                                 hpackEncoder
-                                 sid
-                                 mkStreamActions
+                cont <- initializeStream conn
+                                         connectionFlowControl
+                                         frames
+                                         headers
+                                         hpackEncoder
+                                         sid
+                                         mkStreamActions
+                cont
                 return (sid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
                 return (HTTP2.streamId fh, Right hbf)

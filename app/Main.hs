@@ -30,7 +30,6 @@ client host port path = do
                           , (":scheme", "https")
                           , (":path", ByteString.pack path)
                           , (":authority", ByteString.pack host)
-                          , ("accept", "text/plain")
                           ]
 
     let onPushPromise stream streamFlowControl = void $ forkIO $ do
@@ -41,7 +40,7 @@ client host port path = do
             where
                 moredata = do
                     (fh, x) <- _waitData stream
-                    print (fmap (\bs -> (ByteString.length bs, bs)) x)
+                    print ("(push)", fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
                     when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
                         _updateWindow $ streamFlowControl
                         moredata
@@ -52,13 +51,12 @@ client host port path = do
             threadDelay 1000000
             _updateWindow $ _flowControl conn
 
-    _settings conn [ (HTTP2.SettingsEnablePush, 1)
-                   , (HTTP2.SettingsMaxConcurrentStreams, 20)
-                   , (HTTP2.SettingsInitialWindowSize, 1000000)
-                   , (HTTP2.SettingsMaxFrameSize, 1000000)
-                   , (HTTP2.SettingsHeaderTableSize, 100000)
-                   , (HTTP2.SettingsMaxHeaderBlockSize, 100000)
+    _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
+                   , (HTTP2.SettingsMaxConcurrentStreams, 250)
+                   , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
+                   , (HTTP2.SettingsInitialWindowSize, 1048576)
                    ]
+    threadDelay 200000
     _ping conn "pingpong"
 
     let go = -- forever $ do
@@ -72,7 +70,7 @@ client host port path = do
                           where
                             godata = do
                                 (fh, x) <- _waitData stream
-                                print (fmap (\bs -> (ByteString.length bs, ByteString.take 20 bs)) x)
+                                print ("data", fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
                                 when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
                                     _updateWindow $ streamFlowControl
                                     godata
