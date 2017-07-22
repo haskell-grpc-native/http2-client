@@ -42,15 +42,16 @@ client = do
             _startStream cli $ \stream ->
                 let init = _headers stream headersPairs dontSplitHeaderBlockFragments HTTP2.setEndStream
                     handler creditStream = do
-                        pair@(fH,payload) <- _waitFrame stream
-                        case payload of
-                            (HTTP2.DataFrame _) -> do
-                                _creditFlow (_flowControl cli) (HTTP2.payloadLength fH)
-                            otherwise                   ->
-                                print payload
-                        if HTTP2.testEndStream (HTTP2.flags fH)
-                        then return ()
-                        else handler creditStream
+                        _waitHeaders stream >>= print
+                        godata
+                          where
+                            godata = do
+                                (fh, x) <- _waitData stream
+                                _creditFlow (_flowControl cli) (HTTP2.payloadLength fh)
+                                print x
+                                if HTTP2.testEndStream (HTTP2.flags fh)
+                                then return ()
+                                else godata
                 in StreamActions init handler
     waitAnyCancel =<< traverse async [go, go, go]
     return ()

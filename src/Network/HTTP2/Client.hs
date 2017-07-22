@@ -66,11 +66,14 @@ data Http2Client = Http2Client {
 data ClientStreamThread = CST
 
 data Http2ClientStream = Http2ClientStream {
-    _headers      :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
+    _headers      :: HPACK.HeaderList ->
+  (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _pushPromise  :: HPACK.HeaderList -> (HeaderBlockFragment -> [HeaderBlockFragment]) -> (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> IO ClientStreamThread
   , _prio         :: HTTP2.Priority -> IO ()
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
-  , _waitFrame    :: IO (HTTP2.FrameHeader, HTTP2.FramePayload)
+  , _waitFrame    :: IO (HTTP2.FrameHeader, HTTP2.FramePayload)  -- TODO: too low-level
+  , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, HeaderList)
+  , _waitData     :: IO (HTTP2.FrameHeader, ByteString)
   }
 
 newHttp2Client host port tlsParams = do
@@ -123,37 +126,46 @@ newHttp2Client host port tlsParams = do
                 ackPing pingMsg
             _                         -> print controlFrame
 
-    -- Thread handling push-promises frames.
-    -- TODO: propagate decoded headers lists
+    serverHeaders <- newChan
+    -- Thread handling push-promises and headers frames serializing the buffers.
     _ <- forkIO $ forever $ do
         serverStreamFrames <- dupChan serverFrames
         (fh, fp) <- waitFrameWithTypeId [HTTP2.FramePushPromise, HTTP2.FrameHeaders]
                                         serverStreamFrames
-        let (sid, buf0) = case fp of
-                PushPromiseFrame sid hbf -> (sid, hbf)
-                HeadersFrame _ hbf       -> (HTTP2.streamId fh, hbf)
+        let (sId, buf0) = case fp of
+                PushPromiseFrame sid hbf -> (sid, hbf)               --TODO: create streams and prepare a callback
+                HeadersFrame _ hbf       -> (HTTP2.streamId fh, hbf) --TODO: handle priority
                 _                        -> error "wrong TypeId"
-        let go buffer =
-                if HTTP2.testEndHeader (HTTP2.flags fh)
+        let go curFh buffer =
+                if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
                 then do
-                    print =<< decodeHeader hpackDecoder buffer
-                else do
-                    (_, ContinuationFrame chbf) <- waitFrameWithTypeId [HTTP2.FrameContinuation]
+                    (nextFh, ContinuationFrame chbf) <- waitFrameWithTypeId [HTTP2.FrameContinuation]
                                                                        serverStreamFrames
-                    go (ByteString.append buffer chbf)
-        go buf0
+                    go nextFh (ByteString.append buffer chbf)
+                else do
+                    headers <- decodeHeader hpackDecoder buffer
+                    writeChan serverHeaders (curFh, sId, headers)
+        go fh buf0
 
 
     creditConn <- newFlowControl controlStream
     let startStream getWork = do
-            serverStreamFrames <- dupChan serverFrames
             cont <- withClientStreamId $ \sid -> do
+                -- TODO: use filtered/routed chans abstraction here directly
+                frames  <- dupChan serverFrames
+                headers <- dupChan serverHeaders
+
                 let frameStream = makeFrameClientStream conn sid
 
                 -- Prepare handlers.
                 let _headers      = sendHeaders frameStream hpackEncoder
                 let _pushPromise  = sendPushPromise frameStream hpackEncoder
-                let _waitFrame    = waitFrameWithStreamId sid serverStreamFrames
+                let _waitHeaders  = waitHeadersWithStreamId sid headers
+                let _waitData     = do
+                        (fh, DataFrame dat) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameData] frames
+                        -- TODO: credit flow here
+                        return (fh, dat)
+                let _waitFrame    = waitFrameWithStreamId sid frames
                 let _rst          = sendResetFrame frameStream
                 let _prio         = sendPriorityFrame frameStream
 
@@ -247,6 +259,9 @@ waitFrameWithStreamId sid = waitFrame (\h _ -> streamId h == sid)
 
 waitFrameWithTypeId tids = waitFrame (\_ p -> HTTP2.framePayloadToFrameTypeId p `elem` tids)
 
+waitFrameWithTypeIdForStreamId sid tids =
+    waitFrame (\h p -> streamId h == sid && HTTP2.framePayloadToFrameTypeId p `elem` tids)
+
 waitFrame pred chan =
     loop
   where
@@ -255,4 +270,15 @@ waitFrame pred chan =
         let dat = either throw id fPayload
         if pred fHead dat
         then return (fHead, dat)
+        else loop
+
+waitHeadersWithStreamId sid = waitHeaders (\_ s _ -> s == sid)
+
+waitHeaders pred chan =
+    loop
+  where
+    loop = do
+        tuple@(fH, sId, headers) <- readChan chan
+        if pred fH sId headers
+        then return tuple
         else loop
