@@ -29,9 +29,9 @@ client = do
 
     cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
     _creditFlow (_flowControl cli) largestWindowSize
-    _ <- forkIO $ do
-            _updateWindow $ _flowControl cli
+    _ <- forkIO $ forever $ do
             threadDelay 1000000
+            _updateWindow $ _flowControl cli
 
     _settings cli []
     _ping cli "pingpong"
@@ -47,11 +47,9 @@ client = do
                           where
                             godata = do
                                 (fh, x) <- _waitData stream
-                                _creditFlow (_flowControl cli) (HTTP2.payloadLength fh)
                                 print x
-                                if HTTP2.testEndStream (HTTP2.flags fh)
-                                then return ()
-                                else godata
+                                when (not $ HTTP2.testEndStream (HTTP2.flags fh)) godata
+                                return ()
                 in StreamActions init handler
     waitAnyCancel =<< traverse async [go, go, go]
     return ()

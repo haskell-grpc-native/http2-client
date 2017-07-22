@@ -148,9 +148,13 @@ newHttp2Client host port tlsParams = do
         go fh buf0
 
 
-    creditConn <- newFlowControl controlStream
+    connectionFlowControl <- newFlowControl controlStream
+
     let startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
+                -- Builds a flow-control context.
+                streamFlowControl <- newFlowControl controlStream
+
                 -- TODO: use filtered/routed chans abstraction here directly
                 frames  <- dupChan serverFrames
                 headers <- dupChan serverHeaders
@@ -163,7 +167,8 @@ newHttp2Client host port tlsParams = do
                 let _waitHeaders  = waitHeadersWithStreamId sid headers
                 let _waitData     = do
                         (fh, DataFrame dat) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameData] frames
-                        -- TODO: credit flow here
+                        _creditFlow streamFlowControl (HTTP2.payloadLength fh)
+                        _creditFlow connectionFlowControl (HTTP2.payloadLength fh)
                         return (fh, dat)
                 let _waitFrame    = waitFrameWithStreamId sid frames
                 let _rst          = sendResetFrame frameStream
@@ -173,9 +178,6 @@ newHttp2Client host port tlsParams = do
 
                 -- Perform the 1st action, the stream won't be idle anymore.
                 _ <- _initStream
-
-                -- Builds a flow-control context.
-                streamFlowControl <- newFlowControl controlStream
 
                 -- Returns 2nd action.
                 return $ _handleStream streamFlowControl
@@ -187,7 +189,7 @@ newHttp2Client host port tlsParams = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
 
-    return $ Http2Client ping settings gtfo startStream creditConn
+    return $ Http2Client ping settings gtfo startStream connectionFlowControl
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
