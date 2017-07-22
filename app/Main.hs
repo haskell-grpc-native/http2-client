@@ -34,12 +34,12 @@ client host port path = do
                           ]
 
     conn <- newHttp2Client host port tlsParams
-    -- _addCredit (_flowControl conn) largestWindowSize
+    _addCredit (_flowControl conn) largestWindowSize
     _ <- forkIO $ forever $ do
             threadDelay 1000000
             _updateWindow $ _flowControl conn
 
-    _settings conn [ (HTTP2.SettingsMaxFrameSize, 32768)
+    _settings conn [ (HTTP2.SettingsMaxFrameSize, 6000000)
                    , (HTTP2.SettingsEnablePush, 0)
                    ]
     _ping conn "pingpong"

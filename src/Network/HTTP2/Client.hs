@@ -217,10 +217,15 @@ incomingHPACKFramesLoop frames headers hpackDecoder = forever $ do
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
     let _updateWindow = do
-            amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
+            amount <- atomicModifyIORef' flowControlCredit swapCredit
             when (amount > 0) (sendWindowUpdateFrame stream amount)
     let _addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
+    -- TODO: take into accont SETTINGS_INITIAL_WINDOW_SIZE
     return $ FlowControl _addCredit _updateWindow
+  where
+    swapCredit c
+        | c > 0     = (0, c)
+        | otherwise = (c, 0)
 
 -- HELPERS
 
