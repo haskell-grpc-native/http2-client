@@ -42,7 +42,7 @@ data StreamActions a = StreamActions {
   }
 
 data FlowControl = FlowControl {
-    _creditFlow   :: WindowSize -> IO ()
+    _addCredit   :: WindowSize -> IO ()
   , _updateWindow :: IO ()
   }
 
@@ -131,8 +131,8 @@ newHttp2Client host port tlsParams = do
                         (fh, fp) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameRSTStream, HTTP2.FrameData] frames
                         case fp of
                             DataFrame dat -> do
-                                 _creditFlow streamFlowControl (HTTP2.payloadLength fh)
-                                 _creditFlow connectionFlowControl (HTTP2.payloadLength fh)
+                                 _addCredit streamFlowControl (HTTP2.payloadLength fh)
+                                 _addCredit connectionFlowControl (HTTP2.payloadLength fh)
                                  return (fh, Right dat)
                             RSTStreamFrame err -> do
                                  return (fh, Left $ HTTP2.fromErrorCodeId err)
@@ -211,11 +211,11 @@ incomingHPACKFramesLoop frames headers hpackDecoder = forever $ do
 
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
-    let updateWindow = do
+    let _updateWindow = do
             amount <- atomicModifyIORef' flowControlCredit (\c -> (0, c))
             when (amount > 0) (sendWindowUpdateFrame stream amount)
-    let addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
-    return $ FlowControl addCredit updateWindow
+    let _addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
+    return $ FlowControl _addCredit _updateWindow
 
 -- HELPERS
 

@@ -27,16 +27,16 @@ client = do
                           , ("accept", "text/plain")
                           ]
 
-    cli <- newHttp2Client "127.0.0.1" 3000 tlsParams
-    _creditFlow (_flowControl cli) largestWindowSize
+    conn <- newHttp2Client host port tlsParams
+    -- _addCredit (_flowControl conn) largestWindowSize
     _ <- forkIO $ forever $ do
             threadDelay 1000000
-            _updateWindow $ _flowControl cli
+            _updateWindow $ _flowControl conn
 
-    _settings cli []
-    _ping cli "pingpong"
-    _ping cli "pingpong"
-    threadDelay 3000000
+    _settings conn [ (HTTP2.SettingsMaxFrameSize, 32768)
+                   , (HTTP2.SettingsEnablePush, 0)
+                   ]
+    _ping conn "pingpong"
 
     let go = forever $ do
             _startStream cli $ \stream ->
@@ -44,14 +44,18 @@ client = do
                     handler creditStream = do
                         _waitHeaders stream >>= print
                         godata
+                        print "stream ended"
+                        threadDelay 1000000
                           where
                             godata = do
                                 (fh, x) <- _waitData stream
-                                print x
-                                when (not $ HTTP2.testEndStream (HTTP2.flags fh)) godata
-                                return ()
+                                print (fmap (\bs -> (ByteString.length bs, ByteString.take 20 bs)) x)
+                                when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
+                                    _updateWindow $ streamFlowControl
+                                    godata
                 in StreamActions init handler
-    waitAnyCancel =<< traverse async [go, go, go]
+    waitAnyCancel =<< traverse async [go]
+    _gtfo conn HTTP2.NoError "thx <(=O.O=)>"
     return ()
   where
     tlsParams = TLS.ClientParams {
