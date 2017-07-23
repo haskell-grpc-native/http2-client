@@ -3,11 +3,13 @@
 {-# LANGUAGE RankNTypes  #-}
 {-# LANGUAGE MonadComprehensions #-}
 
--- System architecture
--- * callback for push-promises
+-- TODO:
 -- * outbound flow control
 -- * max stream concurrency
 -- * do not broadcast to every chan but filter upfront with a lookup
+-- * help to verify authority of push promises
+-- * more strict with protocol checks/goaway/errors
+-- * proper exceptions handling/throwing
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
@@ -90,7 +92,7 @@ newHttp2Client host port tlsParams handlePPStream = do
         return HpackEncoderContext{..}
 
     -- prepare client streams
-    clientStreamIdMutex <- newMVar 0
+    clientStreamIdMutex <- newMVar 10
     let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
             (putMVar clientStreamIdMutex . succ)
             (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
@@ -207,7 +209,8 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connection
                                     frames
     (sId, pattern) <- case fp of
             PushPromiseFrame sid hbf -> do
-                let mkStreamActions stream = StreamActions (return CST) (handlePPStream stream)
+                let parentSid = HTTP2.streamId fh
+                let mkStreamActions stream = StreamActions (return CST) (handlePPStream parentSid stream)
                 cont <- initializeStream conn
                                          connectionFlowControl
                                          frames

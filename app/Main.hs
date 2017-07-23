@@ -32,7 +32,7 @@ client host port path = do
                           , (":authority", ByteString.pack host)
                           ]
 
-    let onPushPromise stream streamFlowControl = void $ forkIO $ do
+    let onPushPromise parentStreamId stream streamFlowControl = void $ forkIO $ do
             _waitHeaders stream >>= print
             moredata
             print "push stream ended"
