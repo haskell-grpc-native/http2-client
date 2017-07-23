@@ -74,7 +74,7 @@ client host port path = do
                                 when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
                                     _updateWindow $ streamFlowControl
                                     godata
-                in StreamActions init handler
+                in StreamDefinition init handler
     waitAnyCancel =<< traverse async [go]
     threadDelay 5000000
     _gtfo conn HTTP2.NoError "thx <(=O.O=)>"

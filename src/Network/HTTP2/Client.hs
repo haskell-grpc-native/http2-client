@@ -5,6 +5,7 @@
 
 -- TODO:
 -- * outbound flow control
+-- * chunking based on SETTINGS
 -- * max stream concurrency
 -- * do not broadcast to every chan but filter upfront with a lookup
 -- * help to verify authority of push promises
@@ -13,11 +14,16 @@
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
+    , PushPromiseHandler
     , Http2Stream(..)
-    , StreamActions(..)
+    , StreamThread
+    , _gtfo
+    , StreamDefinition(..)
     , FlowControl(..)
     , dontSplitHeaderBlockFragments
     , module Network.HTTP2.Client.FrameConnection
+    , module Network.Socket
+    , module Network.TLS
     ) where
 
 import           Control.Exception (bracket, throw)
@@ -30,6 +36,8 @@ import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
+import           Network.Socket (HostName, PortNumber)
+import           Network.TLS (ClientParams)
 
 import           Network.HTTP2.Client.FrameConnection
 
@@ -38,46 +46,134 @@ data HpackEncoderContext = HpackEncoderContext {
   , _applySettings    :: Int -> IO ()
   }
 
-data StreamActions a = StreamActions {
-    _initStream   :: IO StreamThread
-  , _handleStream :: FlowControl -> IO a
-  }
-
+-- | Offers credit-based flow-control.
+-- 
+-- Any mutable changes are atomic and hence work as intended in a multithreaded
+-- setup.
+--
+-- The design of the flow-control mechanism is subject to changes.  One
+-- important thing to keep in mind with current implementation is that both the
+-- connection and streams are credited with '_addCredit' as soon as DATA frames
+-- arrive, hence no-need to account for the DATA frames (but you can account
+-- for delay-bandwidth product for instance).
 data FlowControl = FlowControl {
     _addCredit   :: WindowSize -> IO ()
+  -- ^ Add credit (using a hidden mutable reference underneath). This function
+  -- only does accounting, the IO only does mutable changes. See '_updateWindow'.
   , _updateWindow :: IO ()
+  -- ^ Sends a WINDOW_UPDATE frame crediting it with the whole amount credited
+  -- since the last _updateWindow call.
   }
 
+-- | Defines a client stream.
+--
+-- Please red the doc for this record fields and then see 'StreamStarter'.
+data StreamDefinition a = StreamDefinition {
+    _initStream   :: IO StreamThread
+  -- ^ Function to initialize a new client stream. This function runs in a
+  -- exclusive-access section of the code and may prevent other threads to
+  -- initialize new streams. Hence, you should ensure this IO does not wait for
+  -- long periods of time.
+  , _handleStream :: FlowControl -> IO a
+  -- ^ Function to operate with the stream. FlowControl currently is credited
+  -- on your behalf as soon as a DATA frame arrives (and before you handle it
+  -- with '_waitData'). However we do not send WINDOW_UPDATE with
+  -- '_updateWindow'. This design may change in the future to give more leeway
+  -- to library users.
+  }
+
+-- | Type alias for callback-based functions starting new streams.
+--
+-- The callback a user must provide takes an 'Http2Stream' and returns a
+-- 'StreamDefinition'. This construction may seem wrong because a 'StreamDefinition'
+-- contains an initialization and a handler functions. The explanation for this
+-- twistedness is as follows: in HTTP2 stream-ids must be monotonically
+-- increasing, if we want to support multi-threaded clients we need to
+-- serialize access to a critical region of the code when clients send
+-- HEADERS+CONTINUATIONs frames.
+--
+-- Passing the 'Http2Stream' object as part of the callback avoids leaking the
+-- implementation of the critical region, meanwhile, the 'StreamDefinition'
+-- delimits this critical region.
 type StreamStarter a =
-     (Http2Stream -> StreamActions a) -> IO a
+     (Http2Stream -> StreamDefinition a) -> IO a
 
+-- | Record holding functions one can call while in an HTTP2 client session.
 data Http2Client = Http2Client {
-    _ping             :: ByteString -> IO ()
+    _ping             :: ByteString -> IO () --TODO: return a 'waitPingAnswer'
+  -- ^ Send a PING, the payload size must be exactly eight bytes.
   , _settings         :: HTTP2.SettingsList -> IO ()
-  , _gtfo             :: ErrorCodeId -> ByteString -> IO ()
+  -- ^ Sends a SETTINGS.
+  , _goaway           :: ErrorCodeId -> ByteString -> IO ()
+  -- ^ Sends a GOAWAY. 
   , _startStream      :: forall a. StreamStarter a
+  -- ^ Spawns new streams. See 'StreamStarter'.
   , _flowControl      :: FlowControl
+  -- ^ Simple getter for the 'FlowControl' for the whole client connection.
   }
 
--- | Proof that a client stream was initialized.
+-- | Synonym of '_goaway'.
+--
+-- https://github.com/http2/http2-spec/pull/366
+_gtfo :: Http2Client -> ErrorCodeId -> ByteString -> IO ()
+_gtfo = _goaway
+
+-- | Opaque proof that a client stream was initialized.
+--
+-- This type is only useful to force calling '_headers' in '_initStream' and
+-- contains no information.
 data StreamThread = CST
 
+-- | Record holding functions one can call while in an HTTP2 client stream.
 data Http2Stream = Http2Stream {
     _headers      :: HPACK.HeaderList
                   -> (HeaderBlockFragment -> [HeaderBlockFragment])
                   -> (HTTP2.FrameFlags -> HTTP2.FrameFlags)
                   -> IO StreamThread
-  , _pushPromise  :: HPACK.HeaderList
-                  -> (HeaderBlockFragment -> [HeaderBlockFragment])
-                  -> (HTTP2.FrameFlags -> HTTP2.FrameFlags)
-                  -> IO StreamThread -- TODO: remove, only servers can send promises
+  -- ^ Starts the stream with HTTP headers. Flags modifier can use
+  -- 'setEndStream' if no data is required passed the last block of headers.
+  -- Usually, this is the only call needed to build an '_initStream'.
   , _prio         :: HTTP2.Priority -> IO ()
+  -- ^ Changes the PRIORITY of this stream.
   , _rst          :: HTTP2.ErrorCodeId -> IO ()
+  -- ^ Resets this stream with a RST frame. You should not use this stream past this call.
   , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, Either ErrorCode HeaderList)
+  -- ^ Waits for HTTP headers from the server. This function also passes the
+  -- last frame header of the PUSH-PROMISE, HEADERS, or CONTINUATION sequence of frames.
+  -- Waiting more than once per stream will hang as headers are sent only one time.
   , _waitData     :: IO (HTTP2.FrameHeader, Either ErrorCode ByteString)
+  -- ^ Waits for a DATA frame chunk. A user should testEndStream on the frame
+  -- header to know when the server is done with the stream.
   , _sendData     :: (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> ByteString -> IO ()
+  -- ^ Sends a DATA frame chunk. You can use send empty frames with only
+  -- headers modifiers to close streams. This function is oblivious to framing
+  -- and hence does not respect the RFC if sending large blocks (but is the
+  -- only alternative for now).
   }
 
+-- | Handler upon receiving a PUSH_PROMISE from the server.
+--
+-- The functions for 'Http2Stream' are similar to those used in ''. But callers
+-- shall not use '_headers' to initialize the PUSH_PROMISE stream. Rather,
+-- callers should 'waitHeaders' or '_rst' to reject the PUSH_PROMISE.
+--
+-- The StreamId corresponds to the parent stream as PUSH_PROMISEs are tied to a
+-- client-initiated stream. Longer term we may move passing this handler to the
+-- '_startStream' instead of 'newHttp2Client' (as it is for now).
+type PushPromiseHandler a =
+    StreamId -> Http2Stream -> FlowControl -> IO a
+
+-- | Starts a new Http2Client with a remote Host/Port. TLS ClientParams are
+-- mandatory because we only support TLS-protected streams for now.
+newHttp2Client :: HostName
+               -- ^ Host to connect to.
+               -> PortNumber
+               -- ^ Port number to connect to (usually 443 on the web).
+               -> ClientParams
+               -- ^ The TLS client parameters (e.g., to allow some certificates).
+               -> PushPromiseHandler a
+               -- ^ Action to perform when a server sends a PUSH_PROMISE.
+               -> IO Http2Client
 newHttp2Client host port tlsParams handlePPStream = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
@@ -142,11 +238,11 @@ newHttp2Client host port tlsParams handlePPStream = do
 
     let ping = sendPingFrame controlStream id
     let settings = sendSettingsFrame controlStream id
-    let gtfo err errStr = do
+    let goaway err errStr = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
 
-    return $ Http2Client ping settings gtfo startStream connectionFlowControl
+    return $ Http2Client ping settings goaway startStream connectionFlowControl
 
 initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
@@ -160,7 +256,6 @@ initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEnco
 
     -- Prepare handlers.
     let _headers      = sendHeaders frameStream hpackEncoder
-    let _pushPromise  = sendPushPromise frameStream hpackEncoder
     let _waitHeaders  = waitHeadersWithStreamId sid headers
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameRSTStream, HTTP2.FrameData] frames
@@ -210,7 +305,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connection
     (sId, pattern) <- case fp of
             PushPromiseFrame sid hbf -> do
                 let parentSid = HTTP2.streamId fh
-                let mkStreamActions stream = StreamActions (return CST) (handlePPStream parentSid stream)
+                let mkStreamActions stream = StreamDefinition (return CST) (handlePPStream parentSid stream)
                 cont <- initializeStream conn
                                          connectionFlowControl
                                          frames
@@ -281,6 +376,10 @@ sendPushPromise s enc headers blockSplitter mod = do
     sendBackToBack s arrangedFrames
     return CST
 
+-- | Sends all in a single HEADERS frame.
+--
+-- This function is oblivious to any framing (and hence does not respect the
+-- RFC) but is the only alternative proposed by this library at the moment.
 dontSplitHeaderBlockFragments x = [x]
 
 sendDataFrame s mod dat = do
