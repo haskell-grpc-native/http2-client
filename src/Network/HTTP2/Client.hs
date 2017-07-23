@@ -1,7 +1,5 @@
-{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards  #-}
 {-# LANGUAGE RankNTypes  #-}
-{-# LANGUAGE MonadComprehensions #-}
 
 -- TODO:
 -- * outbound flow control
@@ -29,22 +27,18 @@ module Network.HTTP2.Client (
 import           Control.Exception (bracket, throw)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (forkIO)
-import           Control.Concurrent.Chan (newChan, dupChan, readChan, writeChan)
+import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
+import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
+import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
 
 import           Network.HTTP2.Client.FrameConnection
-
-data HpackEncoderContext = HpackEncoderContext {
-    _encodeHeaders    :: HeaderList -> IO HTTP2.HeaderBlockFragment
-  , _applySettings    :: Int -> IO ()
-  }
 
 -- | Offers credit-based flow-control.
 -- 
@@ -102,7 +96,7 @@ type StreamStarter a =
 data Http2Client = Http2Client {
     _ping             :: ByteString -> IO () --TODO: return a 'waitPingAnswer'
   -- ^ Send a PING, the payload size must be exactly eight bytes.
-  , _settings         :: HTTP2.SettingsList -> IO ()
+  , _settings         :: SettingsList -> IO ()
   -- ^ Sends a SETTINGS.
   , _goaway           :: ErrorCodeId -> ByteString -> IO ()
   -- ^ Sends a GOAWAY. 
@@ -128,23 +122,23 @@ data StreamThread = CST
 data Http2Stream = Http2Stream {
     _headers      :: HPACK.HeaderList
                   -> (HeaderBlockFragment -> [HeaderBlockFragment])
-                  -> (HTTP2.FrameFlags -> HTTP2.FrameFlags)
+                  -> (FrameFlags -> FrameFlags)
                   -> IO StreamThread
   -- ^ Starts the stream with HTTP headers. Flags modifier can use
   -- 'setEndStream' if no data is required passed the last block of headers.
   -- Usually, this is the only call needed to build an '_initStream'.
-  , _prio         :: HTTP2.Priority -> IO ()
+  , _prio         :: Priority -> IO ()
   -- ^ Changes the PRIORITY of this stream.
-  , _rst          :: HTTP2.ErrorCodeId -> IO ()
+  , _rst          :: ErrorCodeId -> IO ()
   -- ^ Resets this stream with a RST frame. You should not use this stream past this call.
-  , _waitHeaders  :: IO (HTTP2.FrameHeader, StreamId, Either ErrorCode HeaderList)
+  , _waitHeaders  :: IO (FrameHeader, StreamId, Either ErrorCode HeaderList)
   -- ^ Waits for HTTP headers from the server. This function also passes the
   -- last frame header of the PUSH-PROMISE, HEADERS, or CONTINUATION sequence of frames.
   -- Waiting more than once per stream will hang as headers are sent only one time.
-  , _waitData     :: IO (HTTP2.FrameHeader, Either ErrorCode ByteString)
+  , _waitData     :: IO (FrameHeader, Either ErrorCode ByteString)
   -- ^ Waits for a DATA frame chunk. A user should testEndStream on the frame
   -- header to know when the server is done with the stream.
-  , _sendData     :: (HTTP2.FrameFlags -> HTTP2.FrameFlags) -> ByteString -> IO ()
+  , _sendData     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
   -- ^ Sends a DATA frame chunk. You can use send empty frames with only
   -- headers modifiers to close streams. This function is oblivious to framing
   -- and hence does not respect the RFC if sending large blocks (but is the
@@ -162,6 +156,12 @@ data Http2Stream = Http2Stream {
 -- '_startStream' instead of 'newHttp2Client' (as it is for now).
 type PushPromiseHandler a =
     StreamId -> Http2Stream -> FlowControl -> IO a
+
+-- | Helper to carry around the HPACK encoder for outgoing header blocks..
+data HpackEncoderContext = HpackEncoderContext {
+    _encodeHeaders    :: HeaderList -> IO HeaderBlockFragment
+  , _applySettings    :: Int -> IO ()
+  }
 
 -- | Starts a new Http2Client with a remote Host/Port. TLS ClientParams are
 -- mandatory because we only support TLS-protected streams for now.
@@ -244,6 +244,16 @@ newHttp2Client host port tlsParams handlePPStream = do
 
     return $ Http2Client ping settings goaway startStream connectionFlowControl
 
+initializeStream
+  :: Exception e
+  => Http2FrameConnection
+  -> FlowControl
+  -> Chan (FrameHeader, Either e FramePayload)
+  -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
+  -> HpackEncoderContext
+  -> StreamId
+  -> (Http2Stream -> StreamDefinition a)
+  -> IO (IO a)
 initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
@@ -258,7 +268,7 @@ initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEnco
     let _headers      = sendHeaders frameStream hpackEncoder
     let _waitHeaders  = waitHeadersWithStreamId sid headers
     let _waitData     = do
-            (fh, fp) <- waitFrameWithTypeIdForStreamId sid [HTTP2.FrameRSTStream, HTTP2.FrameData] frames
+            (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
                 DataFrame dat -> do
                      _addCredit streamFlowControl (HTTP2.payloadLength fh)
@@ -278,12 +288,25 @@ initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEnco
     -- Returns 2nd action.
     return $ _handleStream streamActions streamFlowControl
 
+incomingFramesLoop
+  :: Http2FrameConnection
+  -> Chan (FrameHeader, Either HTTP2Error FramePayload)
+  -> IORef StreamId
+  -> IO ()
 incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
     frame@(fh, _) <- next conn
     -- Remember highest streamId.
     atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
     writeChan frames frame
 
+incomingControlFramesLoop
+  :: Exception e
+  => Chan (FrameHeader, Either e FramePayload)
+  -> IORef Settings
+  -> HpackEncoderContext
+  -> (ByteString -> IO ())
+  -> IO ()
+  -> IO ()
 incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
@@ -296,10 +319,20 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
         -- TODO: window updates & co.
         _                   -> print ("unhandled", controlFrame)
 
+incomingHPACKFramesLoop
+  :: Exception e
+  => Chan (FrameHeader, Either e FramePayload)
+  -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
+  -> HpackEncoderContext
+  -> DynamicTable
+  -> Http2FrameConnection
+  -> FlowControl
+  -> (StreamId -> Http2Stream -> FlowControl -> IO a)
+  -> IO ()
 incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connectionFlowControl handlePPStream = forever $ do
-    (fh, fp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
-                                    , HTTP2.FramePushPromise
-                                    , HTTP2.FrameHeaders
+    (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
+                                    , FramePushPromise
+                                    , FrameHeaders
                                     ]
                                     frames
     (sId, pattern) <- case fp of
@@ -324,8 +357,8 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connection
     let go curFh (Right buffer) =
             if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
             then do
-                (lastFh, lastFp) <- waitFrameWithTypeId [ HTTP2.FrameRSTStream
-                                                        , HTTP2.FrameContinuation
+                (lastFh, lastFp) <- waitFrameWithTypeId [ FrameRSTStream
+                                                        , FrameContinuation
                                                         ]
                                                         frames
                 case lastFp of
@@ -342,6 +375,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connection
 
     go fh pattern
 
+newFlowControl :: Http2FrameClientStream -> IO FlowControl
 newFlowControl stream = do
     flowControlCredit <- newIORef 0
     let _updateWindow = do
@@ -355,21 +389,34 @@ newFlowControl stream = do
         | c > 0     = (0, c)
         | otherwise = (c, 0)
 
--- HELPERS
 
+sendHeaders
+  :: Http2FrameClientStream
+  -> HpackEncoderContext
+  -> HeaderList
+  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+  -> (FrameFlags -> FrameFlags)
+  -> IO StreamThread
 sendHeaders s enc headers blockSplitter mod = do
     headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
-    let framers           = (HTTP2.HeadersFrame Nothing) : repeat HTTP2.ContinuationFrame
+    let framers           = (HeadersFrame Nothing) : repeat ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
     let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
     let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
     sendBackToBack s arrangedFrames
     return CST
 
+sendPushPromise
+  :: Http2FrameClientStream
+  -> HpackEncoderContext
+  -> HeaderList
+  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+  -> (FrameFlags -> FrameFlags)
+  -> IO StreamThread
 sendPushPromise s enc headers blockSplitter mod = do
     let sId = _getStreamId s
     headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
-    let framers           = (HTTP2.PushPromiseFrame sId) : repeat HTTP2.ContinuationFrame
+    let framers           = (PushPromiseFrame sId) : repeat ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
     let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
     let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
@@ -380,53 +427,90 @@ sendPushPromise s enc headers blockSplitter mod = do
 --
 -- This function is oblivious to any framing (and hence does not respect the
 -- RFC) but is the only alternative proposed by this library at the moment.
+dontSplitHeaderBlockFragments :: HeaderBlockFragment -> [HeaderBlockFragment]
 dontSplitHeaderBlockFragments x = [x]
 
+sendDataFrame
+  :: Http2FrameClientStream
+  -> (FrameFlags -> FrameFlags) -> ByteString -> IO ()
 sendDataFrame s mod dat = do
-    sendOne s mod (HTTP2.DataFrame dat)
+    sendOne s mod (DataFrame dat)
 
+sendResetFrame :: Http2FrameClientStream -> ErrorCodeId -> IO ()
 sendResetFrame s err = do
-    sendOne s id (HTTP2.RSTStreamFrame err)
+    sendOne s id (RSTStreamFrame err)
 
+sendGTFOFrame
+  :: Http2FrameClientStream
+     -> StreamId -> ErrorCodeId -> ByteString -> IO ()
 sendGTFOFrame s lastStreamId err errStr = do
-    sendOne s id (HTTP2.GoAwayFrame lastStreamId err errStr)
+    sendOne s id (GoAwayFrame lastStreamId err errStr)
 
+rfcError :: String -> a
 rfcError msg = error (msg ++ "draft-ietf-httpbis-http2-17")
 
--- | Sends a ping frame.
+sendPingFrame
+  :: Http2FrameClientStream
+  -> (FrameFlags -> FrameFlags)
+  -> ByteString
+  -> IO ()
 sendPingFrame s flags dat
   | _getStreamId s /= 0        =
         rfcError "PING frames are not associated with any individual stream."
   | ByteString.length dat /= 8 =
         rfcError "PING frames MUST contain 8 octets"
-  | otherwise                  = sendOne s flags (HTTP2.PingFrame dat)
+  | otherwise                  = sendOne s flags (PingFrame dat)
 
+sendWindowUpdateFrame
+  :: Http2FrameClientStream -> WindowSize -> IO ()
 sendWindowUpdateFrame s amount = do
-    let payload = HTTP2.WindowUpdateFrame amount
+    let payload = WindowUpdateFrame amount
     sendOne s id payload
     return ()
 
+sendSettingsFrame
+  :: Http2FrameClientStream
+     -> (FrameFlags -> FrameFlags) -> SettingsList -> IO ()
 sendSettingsFrame s flags setts
   | _getStreamId s /= 0        =
         rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
   | otherwise                  = do
-    let payload = HTTP2.SettingsFrame setts
+    let payload = SettingsFrame setts
     sendOne s flags payload
     return ()
 
--- TODO: need a streamId to add a priority on another stream => we need to expose an opaque StreamId
+-- TODO: need a streamId to add a priority on another stream
+sendPriorityFrame :: Http2FrameClientStream -> Priority -> IO ()
 sendPriorityFrame s p = do
-    let payload = HTTP2.PriorityFrame p
+    let payload = PriorityFrame p
     sendOne s id payload
     return ()
 
+waitFrameWithStreamId
+  :: Exception e =>
+     StreamId -> Chan (FrameHeader, Either e FramePayload) -> IO (FrameHeader, FramePayload)
 waitFrameWithStreamId sid = waitFrame (\h _ -> streamId h == sid)
 
+waitFrameWithTypeId
+  :: (Exception e)
+  => [FrameTypeId]
+  -> Chan (FrameHeader, Either e FramePayload) -> IO (FrameHeader, FramePayload)
 waitFrameWithTypeId tids = waitFrame (\_ p -> HTTP2.framePayloadToFrameTypeId p `elem` tids)
 
+waitFrameWithTypeIdForStreamId
+  :: (Exception e)
+  => StreamId
+  -> [FrameTypeId]
+  -> Chan (FrameHeader, Either e FramePayload)
+  -> IO (FrameHeader, FramePayload)
 waitFrameWithTypeIdForStreamId sid tids =
     waitFrame (\h p -> streamId h == sid && HTTP2.framePayloadToFrameTypeId p `elem` tids)
 
+waitFrame
+  :: Exception e
+  => (FrameHeader -> FramePayload -> Bool)
+  -> Chan (FrameHeader, Either e FramePayload)
+  -> IO (FrameHeader, FramePayload)
 waitFrame pred chan =
     loop
   where
@@ -437,8 +521,17 @@ waitFrame pred chan =
         then return (fHead, dat)
         else loop
 
-waitHeadersWithStreamId sid = waitHeaders (\_ s _ -> s == sid)
+waitHeadersWithStreamId
+  :: StreamId
+  -> Chan (FrameHeader, StreamId, t)
+  -> IO (FrameHeader, StreamId, t)
+waitHeadersWithStreamId sid =
+    waitHeaders (\_ s _ -> s == sid)
 
+waitHeaders
+  :: (FrameHeader -> StreamId -> t -> Bool)
+  -> Chan (FrameHeader, StreamId, t)
+  -> IO (FrameHeader, StreamId, t)
 waitHeaders pred chan =
     loop
   where

@@ -87,8 +87,10 @@ newHttp2FrameConnection host port params = do
 
     -- Define handlers.
     let makeClientStream streamID = 
-            let putFrame modifyFF frame = _sendRaw http2conn $
-                    HTTP2.encodeFrame (encodeInfo modifyFF streamID) frame
+            let putFrame modifyFF frame = do
+                    let info = encodeInfo modifyFF streamID
+                    _sendRaw http2conn $
+                        HTTP2.encodeFrame info frame
                 putFrames xs = writeProtect . void $ traverse (uncurry putFrame) xs
              in Http2FrameClientStream putFrames streamID
 
