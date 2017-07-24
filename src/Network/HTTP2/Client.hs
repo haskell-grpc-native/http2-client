@@ -94,8 +94,12 @@ type StreamStarter a =
 
 -- | Record holding functions one can call while in an HTTP2 client session.
 data Http2Client = Http2Client {
-    _ping             :: ByteString -> IO () --TODO: return a 'waitPingAnswer'
+    _ping             :: ByteString -> IO (IO (FrameHeader, FramePayload))
   -- ^ Send a PING, the payload size must be exactly eight bytes.
+  -- Returns an IO to wait for a ping reply. No timeout is provided. Only the
+  -- first call to this IO will return if a reply is received. Hence we
+  -- recommend wrapping this IO in an Async (e.g., with @race (threadDelay
+  -- timeout)@.)
   , _settings         :: SettingsList -> IO ()
   -- ^ Sends a SETTINGS.
   , _goaway           :: ErrorCodeId -> ByteString -> IO ()
@@ -236,7 +240,12 @@ newHttp2Client host port tlsParams handlePPStream = do
                                  getWork
             cont
 
-    let ping = sendPingFrame controlStream id
+    let ping dat = do
+            -- Need to dupChan before sending the query to avoid missing a fast
+            -- answer if the network is fast.
+            pingFrames <- dupChan serverFrames
+            sendPingFrame controlStream id dat
+            return $ waitFrame (isPingReply dat) serverFrames
     let settings = sendSettingsFrame controlStream id
     let goaway err errStr = do
             sId <- readIORef maxReceivedStreamId
@@ -310,12 +319,17 @@ incomingControlFramesLoop
 incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
-        (SettingsFrame settsList) -> when (not . testAck . flags $ fh) $ do
-            atomicModifyIORef' settings (\setts -> (HTTP2.updateSettings setts settsList, ()))
-            maybe (return ()) (_applySettings hpackEncoder) (lookup SettingsHeaderTableSize settsList)
-            ackSettings
-        (PingFrame pingMsg) -> when (not . testAck . flags $ fh) $
-            ackPing pingMsg
+        (SettingsFrame settsList)
+            | not . testAck . flags $ fh -> do
+                atomicModifyIORef' settings
+                                   (\setts -> (HTTP2.updateSettings setts settsList, ()))
+                maybe (return ())
+                      (_applySettings hpackEncoder)
+                      (lookup SettingsHeaderTableSize settsList)
+                ackSettings
+        (PingFrame pingMsg)
+            | not . testAck . flags $ fh ->
+                ackPing pingMsg
         -- TODO: window updates & co.
         _                   -> print ("unhandled", controlFrame)
 
@@ -520,6 +534,10 @@ waitFrame pred chan =
         if pred fHead dat
         then return (fHead, dat)
         else loop
+
+isPingReply :: ByteString -> FrameHeader -> FramePayload -> Bool
+isPingReply datSent _ (PingFrame datRcv) = datSent == datRcv
+isPingReply _       _ _                  = False
 
 waitHeadersWithStreamId
   :: StreamId

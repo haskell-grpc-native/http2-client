@@ -5,10 +5,11 @@ import Network.HTTP2.Client
 
 import           Control.Monad (forever, when, void)
 import           Control.Concurrent (forkIO, threadDelay)
-import           Control.Concurrent.Async (async, waitAnyCancel)
+import           Control.Concurrent.Async (async, waitAnyCancel, race)
 import           Data.IORef (atomicModifyIORef', atomicModifyIORef, newIORef)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
+import           Data.Time.Clock (getCurrentTime, diffUTCTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.HPACK as HTTP2
 import qualified Network.TLS as TLS
@@ -57,7 +58,11 @@ client host port path = do
                    , (HTTP2.SettingsInitialWindowSize, 1048576)
                    ]
     threadDelay 200000
-    _ping conn "pingpong"
+    t0 <- getCurrentTime
+    waitPing <- _ping conn "pingpong"
+    pingReply <- race (threadDelay 5000000) waitPing 
+    t1 <- getCurrentTime
+    print $ ("ping-reply:", pingReply, diffUTCTime t1 t0)
 
     let go = -- forever $ do
             _startStream conn $ \stream ->

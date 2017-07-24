@@ -37,6 +37,7 @@ executable http2-client-exe
                      , data-default-class
                      , http2
                      , http2-client
+                     , time
                      , tls
   default-language:    Haskell2010
 
