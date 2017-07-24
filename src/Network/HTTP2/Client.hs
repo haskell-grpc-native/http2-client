@@ -2,7 +2,7 @@
 {-# LANGUAGE RankNTypes  #-}
 
 -- TODO:
--- * outbound flow control
+-- * demonstrate outbound flow control, then hide it
 -- * chunking based on SETTINGS
 -- * max stream concurrency
 -- * do not broadcast to every chan but filter upfront with a lookup
@@ -17,7 +17,8 @@ module Network.HTTP2.Client (
     , StreamThread
     , _gtfo
     , StreamDefinition(..)
-    , FlowControl(..)
+    , IncomingFlowControl(..)
+    , OutgoingFlowControl(..)
     , dontSplitHeaderBlockFragments
     , module Network.HTTP2.Client.FrameConnection
     , module Network.Socket
@@ -50,13 +51,36 @@ import           Network.HTTP2.Client.FrameConnection
 -- connection and streams are credited with '_addCredit' as soon as DATA frames
 -- arrive, hence no-need to account for the DATA frames (but you can account
 -- for delay-bandwidth product for instance).
-data FlowControl = FlowControl {
+data IncomingFlowControl = IncomingFlowControl {
     _addCredit   :: WindowSize -> IO ()
   -- ^ Add credit (using a hidden mutable reference underneath). This function
   -- only does accounting, the IO only does mutable changes. See '_updateWindow'.
   , _updateWindow :: IO ()
   -- ^ Sends a WINDOW_UPDATE frame crediting it with the whole amount credited
   -- since the last _updateWindow call.
+  }
+
+-- | Receives credit-based flow-control or block.
+--
+-- There is no way to observe the total amount of credit and receive/withdraw
+-- are atomic hence this object is thread-safe. However we plan to propose an
+-- STM-based API to allow withdrawing atomically from both the connection and a
+-- per-stream 'OutgoingFlowControl' objects at a same time. Without such
+-- atomicity one must ensure consumers do not exhaust the connection credit
+-- before taking the per-stream credit (else they might prevent others sending
+-- data without taking any).
+--
+-- Longer term we plan to hide outgoing-flow-control increment/decrement
+-- altogether because exception between withdrawing credit and sending DATA
+-- could mean lost credit (and hence hanging streams).
+data OutgoingFlowControl = OutgoingFlowControl {
+    _receiveCredit  :: WindowSize -> IO ()
+  -- ^ Add credit (using a hidden mutable reference underneath).
+  , _withdrawCredit :: WindowSize -> IO WindowSize
+  -- ^ Wait until we can take credit from stash. The returned value correspond
+  -- to the amount that could be withdrawn, which is min(current, wanted). A
+  -- caller should withdraw credit to send DATA chunks and put back any unused
+  -- credit with _receiveCredit.
   }
 
 -- | Defines a client stream.
@@ -68,10 +92,10 @@ data StreamDefinition a = StreamDefinition {
   -- exclusive-access section of the code and may prevent other threads to
   -- initialize new streams. Hence, you should ensure this IO does not wait for
   -- long periods of time.
-  , _handleStream :: FlowControl -> IO a
-  -- ^ Function to operate with the stream. FlowControl currently is credited
-  -- on your behalf as soon as a DATA frame arrives (and before you handle it
-  -- with '_waitData'). However we do not send WINDOW_UPDATE with
+  , _handleStream :: IncomingFlowControl -> OutgoingFlowControl -> IO a
+  -- ^ Function to operate with the stream. IncomingFlowControl currently is
+  -- credited on your behalf as soon as a DATA frame arrives (and before you
+  -- handle it with '_waitData'). However we do not send WINDOW_UPDATE with
   -- '_updateWindow'. This design may change in the future to give more leeway
   -- to library users.
   }
@@ -106,8 +130,12 @@ data Http2Client = Http2Client {
   -- ^ Sends a GOAWAY. 
   , _startStream      :: forall a. StreamStarter a
   -- ^ Spawns new streams. See 'StreamStarter'.
-  , _flowControl      :: FlowControl
-  -- ^ Simple getter for the 'FlowControl' for the whole client connection.
+  , _incomingFlowControl :: IncomingFlowControl
+  -- ^ Simple getter for the 'IncomingFlowControl' for the whole client
+  -- connection.
+  , _outgoingFlowControl :: OutgoingFlowControl
+  -- ^ Simple getter for the 'OutgoingFlowControl' for the whole client
+  -- connection.
   }
 
 -- | Synonym of '_goaway'.
@@ -159,7 +187,7 @@ data Http2Stream = Http2Stream {
 -- client-initiated stream. Longer term we may move passing this handler to the
 -- '_startStream' instead of 'newHttp2Client' (as it is for now).
 type PushPromiseHandler a =
-    StreamId -> Http2Stream -> FlowControl -> IO a
+    StreamId -> Http2Stream -> IncomingFlowControl -> OutgoingFlowControl -> IO a
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext {
@@ -219,20 +247,22 @@ newHttp2Client host port tlsParams handlePPStream = do
         dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
         return dt
 
-    connectionFlowControl <- newFlowControl controlStream
+    creditFrames <- dupChan serverFrames
+    connectionOutgoingFlowControl <- newOutgoingFlowControl 0 creditFrames
+    connectionIncomingFlowControl <- newIncomingFlowControl controlStream
 
     _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
                                           serverHeaders
                                           hpackEncoder
                                           hpackDecoder
                                           conn
-                                          connectionFlowControl
+                                          connectionIncomingFlowControl
                                           handlePPStream
 
     let startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
                 initializeStream conn
-                                 connectionFlowControl
+                                 connectionIncomingFlowControl
                                  serverFrames
                                  serverHeaders
                                  hpackEncoder
@@ -251,12 +281,12 @@ newHttp2Client host port tlsParams handlePPStream = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
 
-    return $ Http2Client ping settings goaway startStream connectionFlowControl
+    return $ Http2Client ping settings goaway startStream connectionIncomingFlowControl connectionOutgoingFlowControl
 
 initializeStream
   :: Exception e
   => Http2FrameConnection
-  -> FlowControl
+  -> IncomingFlowControl
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
   -> HpackEncoderContext
@@ -266,12 +296,14 @@ initializeStream
 initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
-    -- Builds a flow-control context.
-    streamFlowControl <- newFlowControl frameStream
-
-    -- TODO: use filtered/routed chans abstraction here directly
+    -- Register interest in frames.
     frames  <- dupChan serverFrames
+    credits <- dupChan serverFrames
     headers <- dupChan serverHeaders
+
+    -- Builds a flow-control context.
+    incomingStreamFlowControl <- newIncomingFlowControl frameStream
+    outgoingStreamFlowControl <- newOutgoingFlowControl sid credits
 
     -- Prepare handlers.
     let _headers      = sendHeaders frameStream hpackEncoder
@@ -280,7 +312,7 @@ initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEnco
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
                 DataFrame dat -> do
-                     _addCredit streamFlowControl (HTTP2.payloadLength fh)
+                     _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
                      _addCredit connectionFlowControl (HTTP2.payloadLength fh)
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
@@ -295,7 +327,7 @@ initializeStream conn connectionFlowControl serverFrames serverHeaders hpackEnco
     _ <- _initStream streamActions
 
     -- Returns 2nd action.
-    return $ _handleStream streamActions streamFlowControl
+    return $ _handleStream streamActions incomingStreamFlowControl outgoingStreamFlowControl
 
 incomingFramesLoop
   :: Http2FrameConnection
@@ -340,8 +372,8 @@ incomingHPACKFramesLoop
   -> HpackEncoderContext
   -> DynamicTable
   -> Http2FrameConnection
-  -> FlowControl
-  -> (StreamId -> Http2Stream -> FlowControl -> IO a)
+  -> IncomingFlowControl
+  -> PushPromiseHandler a
   -> IO ()
 incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connectionFlowControl handlePPStream = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
@@ -389,20 +421,44 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn connection
 
     go fh pattern
 
-newFlowControl :: Http2FrameClientStream -> IO FlowControl
-newFlowControl stream = do
-    flowControlCredit <- newIORef 0
+newIncomingFlowControl :: Http2FrameClientStream -> IO IncomingFlowControl
+newIncomingFlowControl stream = do
+    credit <- newIORef 0
     let _updateWindow = do
-            amount <- atomicModifyIORef' flowControlCredit swapCredit
+            amount <- atomicModifyIORef' credit swapCredit
             when (amount > 0) (sendWindowUpdateFrame stream amount)
-    let _addCredit n = atomicModifyIORef' flowControlCredit (\c -> (c + n,()))
-    -- TODO: take into accont SETTINGS_INITIAL_WINDOW_SIZE
-    return $ FlowControl _addCredit _updateWindow
+    let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
+    -- TODO: take into accont SETTINGS_INITIAL_WINDOW_SIZE that we send
+    return $ IncomingFlowControl _addCredit _updateWindow
   where
     swapCredit c
         | c > 0     = (0, c)
         | otherwise = (c, 0)
 
+newOutgoingFlowControl ::
+     Exception e
+  => StreamId
+  -> Chan (FrameHeader, Either e FramePayload)
+  -> IO OutgoingFlowControl
+newOutgoingFlowControl sid frames = do
+    credit <- newIORef 0
+    let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
+    let withdraw n = do
+            got <- atomicModifyIORef' credit (\c -> if c >= n then (c - n, n) else (0, c))
+            if got > 0
+            then return got
+            else do
+                amount <- waitSomeCredit
+                receive (amount - n)
+                return n
+    -- TODO: take into accont SETTINGS_INITIAL_WINDOW_SIZE that we receive
+    return $ OutgoingFlowControl receive withdraw
+  where
+    waitSomeCredit = do
+        (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
+        case fp of
+            WindowUpdateFrame amt -> return amt
+            -- TODO: consider waither RSTStreamFrame
 
 sendHeaders
   :: Http2FrameClientStream

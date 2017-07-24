@@ -33,7 +33,7 @@ client host port path = do
                           , (":authority", ByteString.pack host)
                           ]
 
-    let onPushPromise parentStreamId stream streamFlowControl = void $ forkIO $ do
+    let onPushPromise parentStreamId stream streamFlowControl _ = void $ forkIO $ do
             _waitHeaders stream >>= print
             moredata
             print "push stream ended"
@@ -47,10 +47,10 @@ client host port path = do
                         moredata
 
     conn <- newHttp2Client host port tlsParams onPushPromise
-    _addCredit (_flowControl conn) largestWindowSize
+    _addCredit (_incomingFlowControl conn) largestWindowSize
     _ <- forkIO $ forever $ do
             threadDelay 1000000
-            _updateWindow $ _flowControl conn
+            _updateWindow $ _incomingFlowControl conn
 
     _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
                    , (HTTP2.SettingsMaxConcurrentStreams, 250)
@@ -67,7 +67,7 @@ client host port path = do
     let go = -- forever $ do
             _startStream conn $ \stream ->
                 let init = _headers stream headersPairs dontSplitHeaderBlockFragments id
-                    handler streamFlowControl = do
+                    handler incomingStreamFlowControl outgoingStreamFlowControl = do
                         _sendData stream HTTP2.setEndStream ""
                         _waitHeaders stream >>= print
                         godata
@@ -77,7 +77,7 @@ client host port path = do
                                 (fh, x) <- _waitData stream
                                 print ("data", fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
                                 when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
-                                    _updateWindow $ streamFlowControl
+                                    _updateWindow $ incomingStreamFlowControl
                                     godata
                 in StreamDefinition init handler
     waitAnyCancel =<< traverse async [go]
