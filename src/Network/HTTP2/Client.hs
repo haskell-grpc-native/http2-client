@@ -248,21 +248,21 @@ newHttp2Client host port tlsParams handlePPStream = do
         return dt
 
     creditFrames <- dupChan serverFrames
-    connectionOutgoingFlowControl <- newOutgoingFlowControl 0 creditFrames
-    connectionIncomingFlowControl <- newIncomingFlowControl controlStream
+    _outgoingFlowControl <- newOutgoingFlowControl 0 creditFrames
+    _incomingFlowControl <- newIncomingFlowControl controlStream
 
     _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
                                           serverHeaders
                                           hpackEncoder
                                           hpackDecoder
                                           conn
-                                          connectionIncomingFlowControl
+                                          _incomingFlowControl
                                           handlePPStream
 
-    let startStream getWork = do
+    let _startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
                 initializeStream conn
-                                 connectionIncomingFlowControl
+                                 _incomingFlowControl
                                  serverFrames
                                  serverHeaders
                                  hpackEncoder
@@ -270,18 +270,18 @@ newHttp2Client host port tlsParams handlePPStream = do
                                  getWork
             cont
 
-    let ping dat = do
+    let _ping dat = do
             -- Need to dupChan before sending the query to avoid missing a fast
             -- answer if the network is fast.
             pingFrames <- dupChan serverFrames
             sendPingFrame controlStream id dat
             return $ waitFrame (isPingReply dat) serverFrames
-    let settings = sendSettingsFrame controlStream id
-    let goaway err errStr = do
+    let _settings = sendSettingsFrame controlStream id
+    let _goaway err errStr = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
 
-    return $ Http2Client ping settings goaway startStream connectionIncomingFlowControl connectionOutgoingFlowControl
+    return $ Http2Client{..}
 
 initializeStream
   :: Exception e
@@ -455,7 +455,9 @@ newOutgoingFlowControl sid frames = do
     return $ OutgoingFlowControl receive withdraw
   where
     waitSomeCredit = do
+        print "waiting for credit frame"
         (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
+        print "got credit frame"
         case fp of
             WindowUpdateFrame amt -> return amt
             -- TODO: consider waither RSTStreamFrame
