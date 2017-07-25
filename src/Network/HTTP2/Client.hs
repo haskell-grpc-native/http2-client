@@ -249,10 +249,8 @@ newHttp2Client host port tlsParams handlePPStream = do
 
     creditFrames <- dupChan serverFrames
 
-    serverSettingsInitialWindowSize <- newIORef HTTP2.defaultInitialWindowSize
-
     _outgoingFlowControl <- newOutgoingFlowControl
-                                serverSettingsInitialWindowSize 0 creditFrames
+                                serverSettings 0 creditFrames
     _incomingFlowControl <- newIncomingFlowControl controlStream
 
     _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
@@ -260,14 +258,14 @@ newHttp2Client host port tlsParams handlePPStream = do
                                           hpackEncoder
                                           hpackDecoder
                                           conn
-                                          serverSettingsInitialWindowSize
+                                          serverSettings
                                           _incomingFlowControl
                                           handlePPStream
 
     let _startStream getWork = do
             cont <- withClientStreamId $ \sid -> do
                 initializeStream conn
-                                 serverSettingsInitialWindowSize
+                                 serverSettings
                                  _incomingFlowControl
                                  serverFrames
                                  serverHeaders
@@ -292,7 +290,7 @@ newHttp2Client host port tlsParams handlePPStream = do
 initializeStream
   :: Exception e
   => Http2FrameConnection
-  -> IORef WindowSize
+  -> IORef Settings
   -> IncomingFlowControl
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
@@ -300,7 +298,7 @@ initializeStream
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn serverSettingsInitialWindowSize connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
+initializeStream conn serverSettings connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
     -- Register interest in frames.
@@ -311,7 +309,7 @@ initializeStream conn serverSettingsInitialWindowSize connectionFlowControl serv
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl frameStream
     outgoingStreamFlowControl <- newOutgoingFlowControl
-        serverSettingsInitialWindowSize sid credits
+        serverSettings sid credits
 
     -- Prepare handlers.
     let _headers      = sendHeaders frameStream hpackEncoder
@@ -380,11 +378,11 @@ incomingHPACKFramesLoop
   -> HpackEncoderContext
   -> DynamicTable
   -> Http2FrameConnection
-  -> IORef WindowSize
+  -> IORef Settings
   -> IncomingFlowControl
   -> PushPromiseHandler a
   -> IO ()
-incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn serverSettingsInitialWindowSize connectionFlowControl handlePPStream = forever $ do
+incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn serverSettings connectionFlowControl handlePPStream = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -395,7 +393,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn serverSett
                 let parentSid = HTTP2.streamId fh
                 let mkStreamActions stream = StreamDefinition (return CST) (handlePPStream parentSid stream)
                 cont <- initializeStream conn
-                                         serverSettingsInitialWindowSize
+                                         serverSettings
                                          connectionFlowControl
                                          frames
                                          headers
@@ -447,15 +445,15 @@ newIncomingFlowControl stream = do
 
 newOutgoingFlowControl ::
      Exception e
-  => IORef WindowSize
+  => IORef Settings
   -> StreamId
   -> Chan (FrameHeader, Either e FramePayload)
   -> IO OutgoingFlowControl
-newOutgoingFlowControl windowSize sid frames = do
+newOutgoingFlowControl settings sid frames = do
     credit <- newIORef 0
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
     let withdraw n = do
-            base <- readIORef windowSize
+            base <- initialWindowSize <$> readIORef settings
             got <- atomicModifyIORef' credit (\c ->
                     if base + c >= n
                     then (c - n, n)

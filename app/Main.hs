@@ -50,7 +50,7 @@ client host port path = do
     _addCredit (_incomingFlowControl conn) largestWindowSize
 
     forever $ do
-        _withdrawCredit (_outgoingFlowControl conn) 100000 >>= print
+        _withdrawCredit (_outgoingFlowControl conn) 1000000 >>= print
 
     _ <- forkIO $ forever $ do
             threadDelay 1000000
