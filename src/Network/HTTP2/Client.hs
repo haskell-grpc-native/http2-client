@@ -26,8 +26,9 @@ module Network.HTTP2.Client (
     ) where
 
 import           Control.Exception (bracket, throw)
+import           Control.Concurrent.Async (race)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
-import           Control.Concurrent (forkIO)
+import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
@@ -461,14 +462,23 @@ newOutgoingFlowControl settings sid frames = do
             if got > 0
             then return got
             else do
-                amount <- waitSomeCredit
-                receive amount
+                amount <- race (waitSettingsChange base) waitSomeCredit
+                print amount
+                receive (either (const 0) id amount)
                 withdraw n
     return $ OutgoingFlowControl receive withdraw
   where
+    -- TODO: broadcast settings changes from Settings using a better data type
+    -- than IORef+busy loop. Currently the busy loop is fine because
+    -- SettingsInitialWindowSize is typically set at the first frame and hence
+    -- waiting one second for an update that is likely to never come is
+    -- probably not an issue. There still is an opportunity risk, however, that
+    -- an hasted client asks for X > initialWindowSize before the server has
+    -- sent its initial SETTINGS frame.
+    waitSettingsChange prev = do
+            new <- initialWindowSize <$> readIORef settings
+            if new == prev then threadDelay 1000000 >> waitSettingsChange prev else return ()
     waitSomeCredit = do
-        -- TODO: also wake up if receive and acknowledge a SETTINGS changing
-        -- the initialWindowSize if it allows extra credit
         (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
         case fp of
             WindowUpdateFrame amt -> return amt
