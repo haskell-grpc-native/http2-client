@@ -462,8 +462,8 @@ newOutgoingFlowControl settings sid frames = do
             then return got
             else do
                 amount <- waitSomeCredit
-                receive (amount - n)
-                return n
+                receive amount
+                withdraw n
     return $ OutgoingFlowControl receive withdraw
   where
     waitSomeCredit = do
