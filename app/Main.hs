@@ -49,9 +49,6 @@ client host port path = do
     conn <- newHttp2Client host port tlsParams onPushPromise
     _addCredit (_incomingFlowControl conn) largestWindowSize
 
-    forever $ do
-        _withdrawCredit (_outgoingFlowControl conn) 1000000 >>= print
-
     _ <- forkIO $ forever $ do
             threadDelay 1000000
             _updateWindow $ _incomingFlowControl conn
@@ -69,9 +66,13 @@ client host port path = do
     print $ ("ping-reply:", pingReply, diffUTCTime t1 t0)
 
     let go = -- forever $ do
-            _startStream conn $ \stream ->
+            print =<< (_startStream conn $ \stream ->
                 let init = _headers stream headersPairs dontSplitHeaderBlockFragments id
                     handler incomingStreamFlowControl outgoingStreamFlowControl = do
+                        forever $ do
+                            _withdrawCredit (_outgoingFlowControl conn) 1000000 >>= print
+                            _withdrawCredit outgoingStreamFlowControl 1000000 >>= print
+
                         _sendData stream HTTP2.setEndStream ""
                         _waitHeaders stream >>= print
                         godata
@@ -83,8 +84,8 @@ client host port path = do
                                 when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
                                     _updateWindow $ incomingStreamFlowControl
                                     godata
-                in StreamDefinition init handler
-    waitAnyCancel =<< traverse async [go]
+                in StreamDefinition init handler)
+    waitAnyCancel =<< traverse async (replicate 1 go)
     threadDelay 5000000
     _gtfo conn HTTP2.NoError "thx <(=O.O=)>"
     return ()

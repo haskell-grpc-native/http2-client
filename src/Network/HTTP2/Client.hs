@@ -4,7 +4,6 @@
 -- TODO:
 -- * demonstrate outbound flow control, then hide it
 -- * chunking based on SETTINGS
--- * max stream concurrency
 -- * do not broadcast to every chan but filter upfront with a lookup
 -- * help to verify authority of push promises
 -- * more strict with protocol checks/goaway/errors
@@ -34,6 +33,7 @@ import           Control.Monad (forever, when)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
+import           Data.Maybe (fromMaybe)
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -115,7 +115,10 @@ data StreamDefinition a = StreamDefinition {
 -- implementation of the critical region, meanwhile, the 'StreamDefinition'
 -- delimits this critical region.
 type StreamStarter a =
-     (Http2Stream -> StreamDefinition a) -> IO a
+     (Http2Stream -> StreamDefinition a) -> IO (Either TooMuchConcurrency a)
+
+newtype TooMuchConcurrency = TooMuchConcurrency Int
+    deriving Show
 
 -- | Record holding functions one can call while in an HTTP2 client session.
 data Http2Client = Http2Client {
@@ -221,7 +224,7 @@ newHttp2Client host port tlsParams handlePPStream = do
         return HpackEncoderContext{..}
 
     -- prepare client streams
-    clientStreamIdMutex <- newMVar 10
+    clientStreamIdMutex <- newMVar 0
     let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
             (putMVar clientStreamIdMutex . succ)
             (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
@@ -263,17 +266,28 @@ newHttp2Client host port tlsParams handlePPStream = do
                                           _incomingFlowControl
                                           handlePPStream
 
+    conccurentStreams <- newIORef 0
     let _startStream getWork = do
-            cont <- withClientStreamId $ \sid -> do
-                initializeStream conn
-                                 serverSettings
-                                 _incomingFlowControl
-                                 serverFrames
-                                 serverHeaders
-                                 hpackEncoder
-                                 sid
-                                 getWork
-            cont
+            maxConcurrency <- fromMaybe 100 . maxConcurrentStreams
+               <$> readIORef serverSettings
+            roomNeeded <- atomicModifyIORef' conccurentStreams
+                (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
+            if roomNeeded > 0
+            then
+                return $ Left $ TooMuchConcurrency roomNeeded
+            else do
+                cont <- withClientStreamId $ \sid -> do
+                    initializeStream conn
+                                     serverSettings
+                                     _incomingFlowControl
+                                     serverFrames
+                                     serverHeaders
+                                     hpackEncoder
+                                     sid
+                                     getWork
+                v <- cont
+                atomicModifyIORef' conccurentStreams (\n -> (n - 1, ()))
+                return $ Right v
 
     let _ping dat = do
             -- Need to dupChan before sending the query to avoid missing a fast
@@ -320,7 +334,7 @@ initializeStream conn serverSettings connectionFlowControl serverFrames serverHe
             case fp of
                 DataFrame dat -> do
                      _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     _addCredit connectionFlowControl (HTTP2.payloadLength fh)
+                     _addCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
