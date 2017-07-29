@@ -142,6 +142,16 @@ data Http2Client = Http2Client {
   -- connection.
   }
 
+-- | Couples client and server settings together.
+data ConnectionSettings = ConnectionSettings {
+    _clientSettings :: !Settings
+  , _serverSettings :: !Settings
+  }
+
+defaultConnectionSettings :: ConnectionSettings
+defaultConnectionSettings =
+    ConnectionSettings defaultSettings defaultSettings
+
 -- | Synonym of '_goaway'.
 --
 -- https://github.com/http2/http2-spec/pull/366
@@ -239,9 +249,9 @@ newHttp2Client host port tlsParams handlePPStream = do
     _ <- forkIO $ incomingFramesLoop conn serverFrames maxReceivedStreamId
 
     -- Thread handling control frames.
-    serverSettings  <- newIORef HTTP2.defaultSettings
+    settings  <- newIORef defaultConnectionSettings
     controlFrames <- dupChan serverFrames
-    _ <- forkIO $ incomingControlFramesLoop controlFrames serverSettings hpackEncoder ackPing ackSettings
+    _ <- forkIO $ incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings
 
     -- Thread handling push-promises and headers frames serializing the buffers.
     serverStreamFrames <- dupChan serverFrames
@@ -253,23 +263,22 @@ newHttp2Client host port tlsParams handlePPStream = do
 
     creditFrames <- dupChan serverFrames
 
-    _outgoingFlowControl <- newOutgoingFlowControl
-                                serverSettings 0 creditFrames
-    _incomingFlowControl <- newIncomingFlowControl controlStream
+    _outgoingFlowControl <- newOutgoingFlowControl settings 0 creditFrames
+    _incomingFlowControl <- newIncomingFlowControl settings controlStream
 
     _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
                                           serverHeaders
                                           hpackEncoder
                                           hpackDecoder
                                           conn
-                                          serverSettings
+                                          settings
                                           _incomingFlowControl
                                           handlePPStream
 
     conccurentStreams <- newIORef 0
     let _startStream getWork = do
-            maxConcurrency <- fromMaybe 100 . maxConcurrentStreams
-               <$> readIORef serverSettings
+            maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings
+               <$> readIORef settings
             roomNeeded <- atomicModifyIORef' conccurentStreams
                 (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
             if roomNeeded > 0
@@ -278,7 +287,7 @@ newHttp2Client host port tlsParams handlePPStream = do
             else do
                 cont <- withClientStreamId $ \sid -> do
                     initializeStream conn
-                                     serverSettings
+                                     settings
                                      _incomingFlowControl
                                      serverFrames
                                      serverHeaders
@@ -305,7 +314,7 @@ newHttp2Client host port tlsParams handlePPStream = do
 initializeStream
   :: Exception e
   => Http2FrameConnection
-  -> IORef Settings
+  -> IORef ConnectionSettings
   -> IncomingFlowControl
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
@@ -313,7 +322,7 @@ initializeStream
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn serverSettings connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
+initializeStream conn settings connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
     -- Register interest in frames.
@@ -322,9 +331,8 @@ initializeStream conn serverSettings connectionFlowControl serverFrames serverHe
     headers <- dupChan serverHeaders
 
     -- Builds a flow-control context.
-    incomingStreamFlowControl <- newIncomingFlowControl frameStream
-    outgoingStreamFlowControl <- newOutgoingFlowControl
-        serverSettings sid credits
+    incomingStreamFlowControl <- newIncomingFlowControl settings frameStream
+    outgoingStreamFlowControl <- newOutgoingFlowControl settings sid credits
 
     -- Prepare handlers.
     let _headers      = sendHeaders frameStream hpackEncoder
@@ -334,7 +342,7 @@ initializeStream conn serverSettings connectionFlowControl serverFrames serverHe
             case fp of
                 DataFrame dat -> do
                      _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     _addCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST
+                     _addCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
@@ -364,7 +372,7 @@ incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
 incomingControlFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
-  -> IORef Settings
+  -> IORef ConnectionSettings
   -> HpackEncoderContext
   -> (ByteString -> IO ())
   -> IO ()
@@ -376,7 +384,8 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
             | not . testAck . flags $ fh -> do
                 print settsList
                 atomicModifyIORef' settings
-                                   (\setts -> (HTTP2.updateSettings setts settsList, ()))
+                                   (\(ConnectionSettings cli srv) ->
+                                      (ConnectionSettings cli (HTTP2.updateSettings srv settsList), ()))
                 maybe (return ())
                       (_applySettings hpackEncoder)
                       (lookup SettingsHeaderTableSize settsList)
@@ -393,11 +402,11 @@ incomingHPACKFramesLoop
   -> HpackEncoderContext
   -> DynamicTable
   -> Http2FrameConnection
-  -> IORef Settings
+  -> IORef ConnectionSettings
   -> IncomingFlowControl
   -> PushPromiseHandler a
   -> IO ()
-incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn serverSettings connectionFlowControl handlePPStream = forever $ do
+incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings connectionFlowControl handlePPStream = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -408,7 +417,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn serverSett
                 let parentSid = HTTP2.streamId fh
                 let mkStreamActions stream = StreamDefinition (return CST) (handlePPStream parentSid stream)
                 cont <- initializeStream conn
-                                         serverSettings
+                                         settings
                                          connectionFlowControl
                                          frames
                                          headers
@@ -444,14 +453,14 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn serverSett
 
     go fh pattern
 
-newIncomingFlowControl :: Http2FrameClientStream -> IO IncomingFlowControl
-newIncomingFlowControl stream = do
+newIncomingFlowControl :: IORef ConnectionSettings -> Http2FrameClientStream -> IO IncomingFlowControl
+newIncomingFlowControl settings stream = do
     credit <- newIORef 0
     let _updateWindow = do
+            -- TODO: read _clientSettings' MAX_INITIAL_WINDOW_FRAME
             amount <- atomicModifyIORef' credit swapCredit
             when (amount > 0) (sendWindowUpdateFrame stream amount)
     let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
-    -- TODO: take into accont SETTINGS_INITIAL_WINDOW_SIZE that we send
     return $ IncomingFlowControl _addCredit _updateWindow
   where
     swapCredit c
@@ -460,7 +469,7 @@ newIncomingFlowControl stream = do
 
 newOutgoingFlowControl ::
      Exception e
-  => IORef Settings
+  => IORef ConnectionSettings
   -> StreamId
   -> Chan (FrameHeader, Either e FramePayload)
   -> IO OutgoingFlowControl
@@ -468,7 +477,7 @@ newOutgoingFlowControl settings sid frames = do
     credit <- newIORef 0
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
     let withdraw n = do
-            base <- initialWindowSize <$> readIORef settings
+            base <- initialWindowSize . _serverSettings <$> readIORef settings
             got <- atomicModifyIORef' credit (\c ->
                     if base + c >= n
                     then (c - n, n)
@@ -482,7 +491,7 @@ newOutgoingFlowControl settings sid frames = do
                 withdraw n
     return $ OutgoingFlowControl receive withdraw
   where
-    -- TODO: broadcast settings changes from Settings using a better data type
+    -- TODO: broadcast settings changes from ConnectionSettings using a better data type
     -- than IORef+busy loop. Currently the busy loop is fine because
     -- SettingsInitialWindowSize is typically set at the first frame and hence
     -- waiting one second for an update that is likely to never come is
@@ -490,7 +499,7 @@ newOutgoingFlowControl settings sid frames = do
     -- an hasted client asks for X > initialWindowSize before the server has
     -- sent its initial SETTINGS frame.
     waitSettingsChange prev = do
-            new <- initialWindowSize <$> readIORef settings
+            new <- initialWindowSize . _serverSettings <$> readIORef settings
             if new == prev then threadDelay 1000000 >> waitSettingsChange prev else return ()
     waitSomeCredit = do
         (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
