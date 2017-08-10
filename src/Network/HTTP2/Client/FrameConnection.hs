@@ -54,7 +54,7 @@ data Http2FrameClientStream = Http2FrameClientStream {
 
 -- | Sends a frame to the server.
 sendOne :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
-sendOne client f payload = _sendFrames client [(f,payload)]
+sendOne client f payload = _sendFrames client [(f, payload)]
 
 -- | Sends multiple back-to-back frames to the server.
 sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
@@ -88,6 +88,7 @@ newHttp2FrameConnection host port params = do
     -- Define handlers.
     let makeClientStream streamID = 
             let putFrame modifyFF frame = do
+                    print (streamID, frame)
                     let info = encodeInfo modifyFF streamID
                     _sendRaw http2conn $
                         HTTP2.encodeFrame info frame

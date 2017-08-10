@@ -56,6 +56,8 @@ data IncomingFlowControl = IncomingFlowControl {
     _addCredit   :: WindowSize -> IO ()
   -- ^ Add credit (using a hidden mutable reference underneath). This function
   -- only does accounting, the IO only does mutable changes. See '_updateWindow'.
+  , _consumeCredit :: WindowSize -> IO () --TODO: return whether total credit became negative and we should trigger a connection error
+  -- ^ Consumes some credit.
   , _updateWindow :: IO ()
   -- ^ Sends a WINDOW_UPDATE frame crediting it with the whole amount credited
   -- since the last _updateWindow call.
@@ -341,6 +343,8 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
                 DataFrame dat -> do
+                     _consumeCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
+                     _consumeCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed
                      _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
                      _addCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed
                      return (fh, Right dat)
@@ -382,7 +386,6 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
     case payload of
         (SettingsFrame settsList)
             | not . testAck . flags $ fh -> do
-                print settsList
                 atomicModifyIORef' settings
                                    (\(ConnectionSettings cli srv) ->
                                       (ConnectionSettings cli (HTTP2.updateSettings srv settsList), ()))
@@ -457,11 +460,14 @@ newIncomingFlowControl :: IORef ConnectionSettings -> Http2FrameClientStream -> 
 newIncomingFlowControl settings stream = do
     credit <- newIORef 0
     let _updateWindow = do
-            -- TODO: read _clientSettings' MAX_INITIAL_WINDOW_FRAME
-            amount <- atomicModifyIORef' credit swapCredit
+            base <- initialWindowSize . _clientSettings <$> readIORef settings
+            current <- atomicModifyIORef' credit swapCredit
+            let amount = base + current
+            print ("****", base, current, amount)
             when (amount > 0) (sendWindowUpdateFrame stream amount)
     let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
-    return $ IncomingFlowControl _addCredit _updateWindow
+    let _consumeCredit n = atomicModifyIORef' credit (\c -> (c - n,()))
+    return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow
   where
     swapCredit c
         | c > 0     = (0, c)
@@ -486,7 +492,6 @@ newOutgoingFlowControl settings sid frames = do
             then return got
             else do
                 amount <- race (waitSettingsChange base) waitSomeCredit
-                print amount
                 receive (either (const 0) id amount)
                 withdraw n
     return $ OutgoingFlowControl receive withdraw
@@ -591,6 +596,7 @@ sendSettingsFrame s flags setts
   | _getStreamId s /= 0        =
         rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
   | otherwise                  = do
+    --TODO: apply settings to the outgoing settings
     let payload = SettingsFrame setts
     sendOne s flags payload
     return ()

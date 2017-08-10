@@ -47,7 +47,7 @@ client host port path = do
                         moredata
 
     conn <- newHttp2Client host port tlsParams onPushPromise
-    _addCredit (_incomingFlowControl conn) largestWindowSize
+    -- _addCredit (_incomingFlowControl conn) largestWindowSize
 
     _ <- forkIO $ forever $ do
             threadDelay 1000000
@@ -56,7 +56,7 @@ client host port path = do
     _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
                    , (HTTP2.SettingsMaxConcurrentStreams, 250)
                    , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
-                   , (HTTP2.SettingsInitialWindowSize, 1048576)
+                   , (HTTP2.SettingsInitialWindowSize, 1048576000)
                    ]
     threadDelay 200000
     t0 <- getCurrentTime
@@ -65,18 +65,14 @@ client host port path = do
     t1 <- getCurrentTime
     print $ ("ping-reply:", pingReply, diffUTCTime t1 t0)
 
-    let go = -- forever $ do
-            print =<< (_startStream conn $ \stream ->
+    let go = forever $ do
+            (_startStream conn $ \stream ->
                 let init = _headers stream headersPairs dontSplitHeaderBlockFragments id
                     handler incomingStreamFlowControl outgoingStreamFlowControl = do
-                        forever $ do
-                            _withdrawCredit (_outgoingFlowControl conn) 1000000 >>= print
-                            _withdrawCredit outgoingStreamFlowControl 1000000 >>= print
-
-                        _sendData stream HTTP2.setEndStream ""
+                        -- NOTE: warp doesn't like: _sendData stream HTTP2.setEndStream ""
                         _waitHeaders stream >>= print
                         godata
-                        print "stream ended"
+                        -- print "stream ended"
                           where
                             godata = do
                                 (fh, x) <- _waitData stream
