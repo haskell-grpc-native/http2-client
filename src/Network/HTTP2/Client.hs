@@ -2,7 +2,6 @@
 {-# LANGUAGE RankNTypes  #-}
 
 -- TODO:
--- * demonstrate outbound flow control, then hide it
 -- * chunking based on SETTINGS
 -- * do not broadcast to every chan but filter upfront with a lookup
 -- * help to verify authority of push promises
@@ -169,7 +168,7 @@ data StreamThread = CST
 -- | Record holding functions one can call while in an HTTP2 client stream.
 data Http2Stream = Http2Stream {
     _headers      :: HPACK.HeaderList
-                  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+                  -> HeaderBlockSplitter
                   -> (FrameFlags -> FrameFlags)
                   -> IO StreamThread
   -- ^ Starts the stream with HTTP headers. Flags modifier can use
@@ -515,7 +514,7 @@ sendHeaders
   :: Http2FrameClientStream
   -> HpackEncoderContext
   -> HeaderList
-  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+  -> HeaderBlockSplitter
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
 sendHeaders s enc headers blockSplitter mod = do
@@ -531,7 +530,7 @@ sendPushPromise
   :: Http2FrameClientStream
   -> HpackEncoderContext
   -> HeaderList
-  -> (HeaderBlockFragment -> [HeaderBlockFragment])
+  -> HeaderBlockSplitter
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
 sendPushPromise s enc headers blockSplitter mod = do
@@ -544,11 +543,14 @@ sendPushPromise s enc headers blockSplitter mod = do
     sendBackToBack s arrangedFrames
     return CST
 
+-- | A function able to split a header block into multiple fragments.
+type HeaderBlockSplitter = HeaderBlockFragment -> [HeaderBlockFragment]
+
 -- | Sends all in a single HEADERS frame.
 --
 -- This function is oblivious to any framing (and hence does not respect the
 -- RFC) but is the only alternative proposed by this library at the moment.
-dontSplitHeaderBlockFragments :: HeaderBlockFragment -> [HeaderBlockFragment]
+dontSplitHeaderBlockFragments :: HeaderBlockSplitter
 dontSplitHeaderBlockFragments x = [x]
 
 sendDataFrame
