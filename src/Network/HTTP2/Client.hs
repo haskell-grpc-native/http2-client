@@ -526,23 +526,6 @@ sendHeaders s enc headers blockSplitter mod = do
     sendBackToBack s arrangedFrames
     return CST
 
-sendPushPromise
-  :: Http2FrameClientStream
-  -> HpackEncoderContext
-  -> HeaderList
-  -> HeaderBlockSplitter
-  -> (FrameFlags -> FrameFlags)
-  -> IO StreamThread
-sendPushPromise s enc headers blockSplitter mod = do
-    let sId = _getStreamId s
-    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
-    let framers           = (PushPromiseFrame sId) : repeat ContinuationFrame
-    let frames            = zipWith ($) framers headerBlockFragments
-    let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
-    let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
-    sendBackToBack s arrangedFrames
-    return CST
-
 -- | A function able to split a header block into multiple fragments.
 type HeaderBlockSplitter = HeaderBlockFragment -> [HeaderBlockFragment]
 
