@@ -306,7 +306,11 @@ newHttp2Client host port tlsParams handlePPStream = do
             pingFrames <- dupChan serverFrames
             sendPingFrame controlStream id dat
             return $ waitFrame (isPingReply dat) serverFrames
-    let _settings = sendSettingsFrame controlStream id
+    let _settings settslist = do
+            atomicModifyIORef' settings
+                       (\(ConnectionSettings cli srv) ->
+                           (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
+            sendSettingsFrame controlStream id settslist
     let _goaway err errStr = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
@@ -461,17 +465,13 @@ newIncomingFlowControl settings stream = do
     credit <- newIORef 0
     let _updateWindow = do
             base <- initialWindowSize . _clientSettings <$> readIORef settings
-            current <- atomicModifyIORef' credit swapCredit
+            current <- readIORef credit
             let amount = base + current
             print ("****", base, current, amount)
             when (amount > 0) (sendWindowUpdateFrame stream amount)
     let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
     let _consumeCredit n = atomicModifyIORef' credit (\c -> (c - n,()))
     return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow
-  where
-    swapCredit c
-        | c > 0     = (0, c)
-        | otherwise = (c, 0)
 
 newOutgoingFlowControl ::
      Exception e
@@ -596,7 +596,6 @@ sendSettingsFrame s flags setts
   | _getStreamId s /= 0        =
         rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
   | otherwise                  = do
-    --TODO: apply settings to the outgoing settings
     let payload = SettingsFrame setts
     sendOne s flags payload
     return ()

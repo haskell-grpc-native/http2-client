@@ -56,7 +56,6 @@ client host port path = do
     _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
                    , (HTTP2.SettingsMaxConcurrentStreams, 250)
                    , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
-                   , (HTTP2.SettingsInitialWindowSize, 1048576000)
                    ]
     threadDelay 200000
     t0 <- getCurrentTime
