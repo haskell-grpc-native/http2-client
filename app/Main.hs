@@ -69,17 +69,9 @@ client QueryArgs{..} = do
                           ] <> _extraHeaders
 
     let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
-            _waitHeaders stream >>= print
-            moredata
+            putStrLn "push stream started"
+            sinkAllPromisedData stream streamFlowControl >>= print
             putStrLn "push stream ended"
-            threadDelay 1000000
-            where
-                moredata = do
-                    (fh, x) <- _waitData stream
-                    print ("(push)" :: String, fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
-                    when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
-                        _updateWindow $ streamFlowControl
-                        moredata
 
     conn <- newHttp2Client _host _port tlsParams onPushPromise
 
