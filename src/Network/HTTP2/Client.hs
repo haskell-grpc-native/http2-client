@@ -28,7 +28,7 @@ import           Control.Concurrent.Async (race)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
-import           Control.Monad (forever, when)
+import           Control.Monad (forever, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
@@ -340,7 +340,7 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
 
     -- Prepare handlers.
     let _headers headersList flags = do
-            splitter <- settingsHeaderBlockSplitter <$> readIORef settings
+            splitter <- settingsPayloadSplitter <$> readIORef settings
             sendHeaders frameStream hpackEncoder headersList splitter flags
     let _waitHeaders  = waitHeadersWithStreamId sid headers
     let _waitData     = do
@@ -354,7 +354,11 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
-    let _sendData     = sendDataFrame frameStream
+    let _sendData mod dat = do
+            splitter <- settingsPayloadSplitter <$> readIORef settings
+            let chunks = splitter dat
+            let pairs  = reverse $ zip (mod : repeat id) (reverse chunks)
+            forM_ pairs $ \(flags, dat) -> sendDataFrame frameStream flags dat
     let _rst          = sendResetFrame frameStream
     let _prio         = sendPriorityFrame frameStream
 
@@ -515,7 +519,7 @@ sendHeaders
   :: Http2FrameClientStream
   -> HpackEncoderContext
   -> HeaderList
-  -> HeaderBlockSplitter
+  -> PayloadSplitter
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
 sendHeaders s enc headers blockSplitter mod = do
@@ -528,11 +532,11 @@ sendHeaders s enc headers blockSplitter mod = do
     return CST
 
 -- | A function able to split a header block into multiple fragments.
-type HeaderBlockSplitter = HeaderBlockFragment -> [HeaderBlockFragment]
+type PayloadSplitter = ByteString -> [ByteString]
 
 -- | Split headers like so that no payload exceeds server's maxFrameSize.
-settingsHeaderBlockSplitter :: ConnectionSettings -> HeaderBlockSplitter
-settingsHeaderBlockSplitter (ConnectionSettings _ srv) =
+settingsPayloadSplitter :: ConnectionSettings -> PayloadSplitter
+settingsPayloadSplitter (ConnectionSettings _ srv) =
     fixedSizeChunks (maxFrameSize srv)
 
 -- | Breaks a ByteString into fixed-sized chunks.

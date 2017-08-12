@@ -31,6 +31,7 @@ client host port path = do
                           , (":scheme", "https")
                           , (":path", ByteString.pack path)
                           , (":authority", ByteString.pack host)
+                          , ("X-Stupid-Header1", ByteString.replicate 1024 '1')
                           ]
 
     let onPushPromise parentStreamId stream streamFlowControl _ = void $ forkIO $ do
@@ -64,11 +65,11 @@ client host port path = do
     t1 <- getCurrentTime
     print $ ("ping-reply:", pingReply, diffUTCTime t1 t0)
 
-    let go = forever $ do
+    let go = -- forever $ do
             (_startStream conn $ \stream ->
                 let init = _headers stream headersPairs id
                     handler incomingStreamFlowControl outgoingStreamFlowControl = do
-                        -- NOTE: warp doesn't like: _sendData stream HTTP2.setEndStream ""
+                        _sendData stream HTTP2.setEndStream (ByteString.replicate 1024 'p')
                         _waitHeaders stream >>= print
                         godata
                         -- print "stream ended"
