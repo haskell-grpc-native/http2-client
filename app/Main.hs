@@ -4,11 +4,11 @@ module Main where
 
 import           Control.Monad (forever, when, void)
 import           Control.Concurrent (forkIO, threadDelay)
-import           Control.Concurrent.Async (async, waitAnyCancel, race)
+import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
-import           Data.Time.Clock (getCurrentTime, diffUTCTime)
+import           Data.Time.Clock (diffUTCTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
@@ -16,6 +16,7 @@ import           Options.Applicative
 import           Data.Monoid ((<>))
 
 import Network.HTTP2.Client
+import Network.HTTP2.Client.Helpers
 
 type Path = ByteString
 type Verb = ByteString
@@ -54,6 +55,7 @@ main = execParser opts >>= client
       , header "http2-client-exe: a CLI HTTP2 client written in Haskell"
       ])
 
+
 client :: QueryArgs -> IO ()
 client QueryArgs{..} = do
     let headersPairs    = [ (":method", _verb)
@@ -61,8 +63,6 @@ client QueryArgs{..} = do
                           , (":path", _path)
                           , (":authority", ByteString.pack _host)
                           ] <> _extraHeaders
-
-    print headersPairs
 
     let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
             _waitHeaders stream >>= print
@@ -88,11 +88,7 @@ client QueryArgs{..} = do
                    , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
                    , (HTTP2.SettingsInitialWindowSize, 10485760)
                    ]
-    threadDelay 2000000
-    t0 <- getCurrentTime
-    waitPing <- _ping conn "pingpong"
-    pingReply <- race (threadDelay 5000000) waitPing 
-    t1 <- getCurrentTime
+    (t0, t1, pingReply) <- ping 5000000 "pingpong" conn
     print $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
     let go = -- forever $ do

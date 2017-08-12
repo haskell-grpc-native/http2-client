@@ -16,8 +16,9 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Network.HTTP2.Client
-                     , Network.HTTP2.Client.RawConnection
                      , Network.HTTP2.Client.FrameConnection
+                     , Network.HTTP2.Client.Helpers
+                     , Network.HTTP2.Client.RawConnection
   build-depends:       base >= 4.7 && < 5
                      , async
                      , bytestring
@@ -25,6 +26,7 @@ library
                      , containers
                      , http2
                      , network
+                     , time
                      , tls
   default-language:    Haskell2010
 
