@@ -1,20 +1,18 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
-import Network.HTTP2.Client
-
 import           Control.Monad (forever, when, void)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel, race)
-import           Data.IORef (atomicModifyIORef', atomicModifyIORef, newIORef)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
 import           Data.Time.Clock (getCurrentTime, diffUTCTime)
 import qualified Network.HTTP2 as HTTP2
-import qualified Network.HPACK as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
 import           System.Environment (getArgs)
+
+import Network.HTTP2.Client
 
 main :: IO ()
 main = getArgs >>= mainArgs
@@ -24,9 +22,10 @@ mainArgs []                  = client "127.0.0.1" 3000 "/"
 mainArgs (host:[])           = client host 443 "/"
 mainArgs (host:port:[])      = client host (read port) "/"
 mainArgs (host:port:path:[]) = client host (read port) path
+mainArgs _                   = error "args: <host> <port> <path>"
 
+client :: HostName -> PortNumber -> String -> IO ()
 client host port path = do
-    let largestWindowSize = HTTP2.maxWindowSize - HTTP2.defaultInitialWindowSize
     let headersPairs    = [ (":method", "GET")
                           , (":scheme", "https")
                           , (":path", ByteString.pack path)
@@ -34,15 +33,15 @@ client host port path = do
                           , ("X-Stupid-Header1", ByteString.replicate 1024 '1')
                           ]
 
-    let onPushPromise parentStreamId stream streamFlowControl _ = void $ forkIO $ do
+    let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
             _waitHeaders stream >>= print
             moredata
-            print "push stream ended"
+            putStrLn "push stream ended"
             threadDelay 1000000
             where
                 moredata = do
                     (fh, x) <- _waitData stream
-                    print ("(push)", fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
+                    print ("(push)" :: String, fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
                     when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
                         _updateWindow $ streamFlowControl
                         moredata
@@ -63,12 +62,12 @@ client host port path = do
     waitPing <- _ping conn "pingpong"
     pingReply <- race (threadDelay 5000000) waitPing 
     t1 <- getCurrentTime
-    print $ ("ping-reply:", pingReply, diffUTCTime t1 t0)
+    print $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
     let go = -- forever $ do
             (_startStream conn $ \stream ->
-                let init = _headers stream headersPairs id
-                    handler incomingStreamFlowControl outgoingStreamFlowControl = do
+                let initStream = _headers stream headersPairs id
+                    handler incomingStreamFlowControl _ = do
                         sendData conn stream HTTP2.setEndStream (ByteString.replicate 1024 'p')
                         _waitHeaders stream >>= print
                         godata
@@ -76,12 +75,12 @@ client host port path = do
                           where
                             godata = do
                                 (fh, x) <- _waitData stream
-                                print ("data", fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
+                                print ("data" :: String, fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
                                 when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
                                     _updateWindow $ incomingStreamFlowControl
                                     godata
-                in StreamDefinition init handler)
-    waitAnyCancel =<< traverse async (replicate 1 go)
+                in StreamDefinition initStream handler)
+    _ <- waitAnyCancel =<< traverse async (replicate 1 go)
     threadDelay 5000000
     _gtfo conn HTTP2.NoError "thx <(=O.O=)>"
     return ()
