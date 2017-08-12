@@ -1,5 +1,6 @@
-{-# LANGUAGE RecordWildCards  #-}
-{-# LANGUAGE RankNTypes  #-}
+{-# LANGUAGE RecordWildCards    #-}
+{-# LANGUAGE RankNTypes         #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 -- TODO:
 -- * chunking based on SETTINGS
@@ -17,7 +18,6 @@ module Network.HTTP2.Client (
     , StreamDefinition(..)
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
-    , dontSplitHeaderBlockFragments
     , module Network.HTTP2.Client.FrameConnection
     , module Network.Socket
     , module Network.TLS
@@ -168,7 +168,6 @@ data StreamThread = CST
 -- | Record holding functions one can call while in an HTTP2 client stream.
 data Http2Stream = Http2Stream {
     _headers      :: HPACK.HeaderList
-                  -> HeaderBlockSplitter
                   -> (FrameFlags -> FrameFlags)
                   -> IO StreamThread
   -- ^ Starts the stream with HTTP headers. Flags modifier can use
@@ -340,7 +339,9 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
     outgoingStreamFlowControl <- newOutgoingFlowControl settings sid credits
 
     -- Prepare handlers.
-    let _headers      = sendHeaders frameStream hpackEncoder
+    let _headers headersList flags = do
+            splitter <- settingsHeaderBlockSplitter <$> readIORef settings
+            sendHeaders frameStream hpackEncoder headersList splitter flags
     let _waitHeaders  = waitHeadersWithStreamId sid headers
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
@@ -529,12 +530,22 @@ sendHeaders s enc headers blockSplitter mod = do
 -- | A function able to split a header block into multiple fragments.
 type HeaderBlockSplitter = HeaderBlockFragment -> [HeaderBlockFragment]
 
--- | Sends all in a single HEADERS frame.
+-- | Split headers like so that no payload exceeds server's maxFrameSize.
+settingsHeaderBlockSplitter :: ConnectionSettings -> HeaderBlockSplitter
+settingsHeaderBlockSplitter (ConnectionSettings _ srv) =
+    fixedSizeChunks (maxFrameSize srv)
+
+-- | Breaks a ByteString into fixed-sized chunks.
 --
--- This function is oblivious to any framing (and hence does not respect the
--- RFC) but is the only alternative proposed by this library at the moment.
-dontSplitHeaderBlockFragments :: HeaderBlockSplitter
-dontSplitHeaderBlockFragments x = [x]
+-- @ fixedSizeChunks 2 "hello" = ["he", "ll", "o"] @
+fixedSizeChunks :: Int -> ByteString -> [ByteString]
+fixedSizeChunks 0   _    = error "cannot chunk by zero-length blocks"
+fixedSizeChunks len ""   = []
+fixedSizeChunks len bstr =
+      let
+        (chunk, rest) = ByteString.splitAt len bstr
+      in
+        chunk : fixedSizeChunks len rest
 
 sendDataFrame
   :: Http2FrameClientStream

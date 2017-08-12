@@ -66,7 +66,7 @@ client host port path = do
 
     let go = forever $ do
             (_startStream conn $ \stream ->
-                let init = _headers stream headersPairs dontSplitHeaderBlockFragments id
+                let init = _headers stream headersPairs id
                     handler incomingStreamFlowControl outgoingStreamFlowControl = do
                         -- NOTE: warp doesn't like: _sendData stream HTTP2.setEndStream ""
                         _waitHeaders stream >>= print
