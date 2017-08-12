@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 module Main where
 
 import           Control.Monad (forever, when, void)
@@ -10,19 +11,36 @@ import           Data.Time.Clock (getCurrentTime, diffUTCTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
-import           System.Environment (getArgs)
+import           Options.Applicative
+import           Data.Monoid ((<>))
 
 import Network.HTTP2.Client
 
-main :: IO ()
-main = getArgs >>= mainArgs
+data QueryArgs = QueryArgs {
+    _host :: !HostName
+  , _port :: !PortNumber
+  , _path :: !String
+  }
 
-mainArgs :: [String] -> IO ()
-mainArgs []                  = client "127.0.0.1" 3000 "/"
-mainArgs (host:[])           = client host 443 "/"
-mainArgs (host:port:[])      = client host (read port) "/"
-mainArgs (host:port:path:[]) = client host (read port) path
-mainArgs _                   = error "args: <host> <port> <path>"
+clientArgs :: Parser QueryArgs
+clientArgs =
+    QueryArgs
+        <$> host
+        <*> port
+        <*> path
+  where
+    host = strOption (long "host" <> value "127.0.0.1")
+    path = strOption (long "path" <> value "/")
+    port = option auto (long "port" <> value 443)
+
+main :: IO ()
+main = execParser opts >>= go
+  where
+    opts = info (helper <*> clientArgs) (mconcat [
+        fullDesc
+      , header "http2-client-exe: a CLI HTTP2 client written in Haskell"
+      ])
+    go QueryArgs{..} = client _host _port _path
 
 client :: HostName -> PortNumber -> String -> IO ()
 client host port path = do
