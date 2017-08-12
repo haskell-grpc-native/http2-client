@@ -22,6 +22,9 @@ import Network.HTTP2.Client.Helpers
 type Path = ByteString
 type Verb = ByteString
 
+data ServerPushSwitch = PushEnabled | PushDisabled
+  deriving Show
+
 data QueryArgs = QueryArgs {
     _host                    :: !HostName
   , _port                    :: !PortNumber
@@ -32,6 +35,7 @@ data QueryArgs = QueryArgs {
   , _pingTimeout             :: !Int
   , _interFlowControlUpdates :: !Int
   , _settingsMaxConcurrency  :: !Int
+  , _settingsAllowServerPush :: !ServerPushSwitch
   , _settingsMaxFrameSize       :: !Int
   , _settingsMaxHeaderBlockSize :: !Int
   , _settingsInitialWindowSize  :: !Int
@@ -41,7 +45,7 @@ data QueryArgs = QueryArgs {
   , _finalMessage              :: !ByteString
   , _encoderBufsize :: !Int
   , _decoderBufsize :: !Int
-  }
+  } deriving Show
 
 clientArgs :: Parser QueryArgs
 clientArgs =
@@ -55,6 +59,7 @@ clientArgs =
         <*> milliseconds "ping-timeout-ms" 5000
         <*> milliseconds "inter-flow-control-updates-ms" 1000
         <*> concurrency
+        <*> allowPush
         <*> frameBytes
         <*> headersBytes
         <*> initialWindowBytes
@@ -75,6 +80,7 @@ clientArgs =
     verb = bstrOption (long "verb" <> value "GET")
     extraHeaders = many (fmap keyval $ bstrOption (short 'H'))
     concurrency = option auto (long "max-concurrency" <> value 100)
+    allowPush = flag PushEnabled PushDisabled (long "disable-server-push")
     frameBytes = option auto (long "max-frame-size" <> value 1048576)
     headersBytes = option auto (long "max-headers-list-size" <> value 1048576)
     initialWindowBytes = option auto (long "initial-window-size" <> value 10485760)
@@ -118,6 +124,8 @@ client QueryArgs{..} = do
                    , (HTTP2.SettingsMaxConcurrentStreams, _settingsMaxConcurrency)
                    , (HTTP2.SettingsMaxHeaderBlockSize, _settingsMaxHeaderBlockSize)
                    , (HTTP2.SettingsInitialWindowSize, _settingsInitialWindowSize)
+                   , (HTTP2.SettingsEnablePush, case _settingsAllowServerPush of
+                       PushEnabled -> 1 ; PushDisabled -> 0)
                    ]
 
     _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
