@@ -126,9 +126,12 @@ client QueryArgs{..} = do
                             putStrLn $ "stream ended " <> show (idx, n)
                     in StreamDefinition initStream handler)
             go (n - 1) idx
+
     _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
+
     threadDelay _finalDelay
     _gtfo conn HTTP2.NoError _finalMessage
+
     return ()
   where
     tlsParams = TLS.ClientParams {
