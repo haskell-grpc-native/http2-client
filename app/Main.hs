@@ -69,7 +69,7 @@ client host port path = do
             (_startStream conn $ \stream ->
                 let init = _headers stream headersPairs id
                     handler incomingStreamFlowControl outgoingStreamFlowControl = do
-                        _sendData stream HTTP2.setEndStream (ByteString.replicate 1024 'p')
+                        sendData conn stream HTTP2.setEndStream (ByteString.replicate 1024 'p')
                         _waitHeaders stream >>= print
                         godata
                         -- print "stream ended"

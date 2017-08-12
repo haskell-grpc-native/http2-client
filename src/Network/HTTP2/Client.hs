@@ -13,6 +13,7 @@ module Network.HTTP2.Client (
     , newHttp2Client
     , PushPromiseHandler
     , Http2Stream(..)
+    , sendData
     , StreamThread
     , _gtfo
     , StreamDefinition(..)
@@ -141,6 +142,8 @@ data Http2Client = Http2Client {
   , _outgoingFlowControl :: OutgoingFlowControl
   -- ^ Simple getter for the 'OutgoingFlowControl' for the whole client
   -- connection.
+  , _paylodSplitter :: IO PayloadSplitter
+  -- ^ Returns a function to split a payload.
   }
 
 -- | Couples client and server settings together.
@@ -184,11 +187,12 @@ data Http2Stream = Http2Stream {
   , _waitData     :: IO (FrameHeader, Either ErrorCode ByteString)
   -- ^ Waits for a DATA frame chunk. A user should testEndStream on the frame
   -- header to know when the server is done with the stream.
-  , _sendData     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
+  , _sendDataChunk     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
   -- ^ Sends a DATA frame chunk. You can use send empty frames with only
   -- headers modifiers to close streams. This function is oblivious to framing
-  -- and hence does not respect the RFC if sending large blocks (but is the
-  -- only alternative for now).
+  -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
+  -- to chunk and send naively according to server\'s preferences. This function
+  -- can be useful if you intend to handle the framing yourself.
   }
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
@@ -313,6 +317,8 @@ newHttp2Client host port tlsParams handlePPStream = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
 
+    let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
+
     return $ Http2Client{..}
 
 initializeStream
@@ -354,13 +360,9 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
-    let _sendData mod dat = do
-            splitter <- settingsPayloadSplitter <$> readIORef settings
-            let chunks = splitter dat
-            let pairs  = reverse $ zip (mod : repeat id) (reverse chunks)
-            forM_ pairs $ \(flags, dat) -> sendDataFrame frameStream flags dat
-    let _rst          = sendResetFrame frameStream
-    let _prio         = sendPriorityFrame frameStream
+    let _sendDataChunk  = sendDataFrame frameStream
+    let _rst            = sendResetFrame frameStream
+    let _prio           = sendPriorityFrame frameStream
 
     let streamActions = getWork $ Http2Stream{..}
 
@@ -550,6 +552,13 @@ fixedSizeChunks len bstr =
         (chunk, rest) = ByteString.splitAt len bstr
       in
         chunk : fixedSizeChunks len rest
+
+sendData :: Http2Client -> Http2Stream -> (FrameFlags -> FrameFlags) -> ByteString -> IO ()
+sendData conn stream mod dat = do
+    splitter <- _paylodSplitter conn
+    let chunks = splitter dat
+    let pairs  = reverse $ zip (mod : repeat id) (reverse chunks)
+    forM_ pairs $ \(flags, chunk) -> _sendDataChunk stream flags chunk
 
 sendDataFrame
   :: Http2FrameClientStream
