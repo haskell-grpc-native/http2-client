@@ -27,6 +27,8 @@ data QueryArgs = QueryArgs {
   , _verb         :: !Verb
   , _path         :: !Path
   , _extraHeaders :: ![(ByteString, ByteString)]
+  , _interPingDelay    :: !Int
+  , _pingTimeout       :: !Int
   }
 
 clientArgs :: Parser QueryArgs
@@ -37,8 +39,11 @@ clientArgs =
         <*> verb
         <*> path
         <*> extraHeaders
+        <*> milliseconds "inter-ping-delay-ms" 0
+        <*> milliseconds "ping-timeout-ms" 5000
   where
     bstrOption = fmap ByteString.pack . strOption
+    milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
     keyval kv = let (k,v1) = ByteString.break (== ':') kv in (k, ByteString.drop 1 v1)
 
     host = strOption (long "host" <> value "127.0.0.1")
@@ -54,7 +59,6 @@ main = execParser opts >>= client
         fullDesc
       , header "http2-client-exe: a CLI HTTP2 client written in Haskell"
       ])
-
 
 client :: QueryArgs -> IO ()
 client QueryArgs{..} = do
@@ -88,8 +92,11 @@ client QueryArgs{..} = do
                    , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
                    , (HTTP2.SettingsInitialWindowSize, 10485760)
                    ]
-    (t0, t1, pingReply) <- ping 5000000 "pingpong" conn
-    print $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
+
+    _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
+        threadDelay _interPingDelay
+        (t0, t1, pingReply) <- ping _pingTimeout "pingpong" conn
+        print $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
     let go = -- forever $ do
             (_startStream conn $ \stream ->
