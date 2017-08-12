@@ -14,6 +14,7 @@ import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
 import           Options.Applicative
 import           Data.Monoid ((<>))
+import           System.IO
 
 import Network.HTTP2.Client
 import Network.HTTP2.Client.Helpers
@@ -87,6 +88,8 @@ main = execParser opts >>= client
 
 client :: QueryArgs -> IO ()
 client QueryArgs{..} = do
+    hSetBuffering stdout LineBuffering
+
     let headersPairs    = [ (":method", _verb)
                           , (":scheme", "https")
                           , (":path", _path)

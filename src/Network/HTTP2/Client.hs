@@ -431,9 +431,10 @@ creditDataFramesLoop
   -> Chan (FrameHeader, Either e FramePayload)
   -> IO ()
 creditDataFramesLoop flowControl frames = forever $ do
-    (fh,_) <- waitFrameWithTypeId [ FrameData ] frames
+    (fh,_) <- waitFrameWithTypeId [FrameData] frames
+    -- TODO: error if detect over-run, current implementation credits
+    -- everything back so that should never happen
     _ <- _consumeCredit flowControl (HTTP2.payloadLength fh)
-    -- TODO: error if ends in negative territory
     _addCredit flowControl (HTTP2.payloadLength fh)
 
 incomingHPACKFramesLoop
@@ -493,18 +494,33 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings h
 
     go fh pattern
 
-newIncomingFlowControl :: IORef ConnectionSettings -> Http2FrameClientStream -> IO IncomingFlowControl
+newIncomingFlowControl
+  :: IORef ConnectionSettings
+  -> Http2FrameClientStream
+  -> IO IncomingFlowControl
 newIncomingFlowControl settings stream = do
-    credit <- newIORef 0
+    creditAdded <- newIORef 0
+    creditConsumed <- newIORef 0
+    let _addCredit n = atomicModifyIORef' creditAdded (\c -> (c + n, ()))
+    let _consumeCredit n = do
+            conso <- atomicModifyIORef' creditConsumed (\c -> (c + n, c + n))
+            base <- initialWindowSize . _clientSettings <$> readIORef settings
+            extra <- readIORef creditAdded
+            return $ base + extra - conso
     let _updateWindow = do
             base <- initialWindowSize . _clientSettings <$> readIORef settings
-            current <- readIORef credit
-            let amount = base + current
-            let shouldUpdate = amount > 0
-            when shouldUpdate (sendWindowUpdateFrame stream amount)
+            added <- readIORef creditAdded
+            consumed <- readIORef creditConsumed
+
+            let transferred = min added (HTTP2.maxWindowSize - base + consumed)
+            let shouldUpdate = transferred > 0
+
+            _addCredit (negate transferred)
+            _ <- _consumeCredit (negate transferred)
+
+            when shouldUpdate (sendWindowUpdateFrame stream transferred)
+
             return shouldUpdate
-    let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
-    let _consumeCredit n = atomicModifyIORef' credit (\c -> (c - n, c - n))
     return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow
 
 newOutgoingFlowControl ::
