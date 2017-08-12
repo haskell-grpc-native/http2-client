@@ -5,6 +5,7 @@ module Main where
 import           Control.Monad (forever, when, void)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel, race)
+import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
 import           Data.Time.Clock (getCurrentTime, diffUTCTime)
@@ -16,10 +17,15 @@ import           Data.Monoid ((<>))
 
 import Network.HTTP2.Client
 
+type Path = ByteString
+type Verb = ByteString
+
 data QueryArgs = QueryArgs {
-    _host :: !HostName
-  , _port :: !PortNumber
-  , _path :: !String
+    _host         :: !HostName
+  , _port         :: !PortNumber
+  , _verb         :: !Verb
+  , _path         :: !Path
+  , _extraHeaders :: ![(ByteString, ByteString)]
   }
 
 clientArgs :: Parser QueryArgs
@@ -27,29 +33,36 @@ clientArgs =
     QueryArgs
         <$> host
         <*> port
+        <*> verb
         <*> path
+        <*> extraHeaders
   where
+    bstrOption = fmap ByteString.pack . strOption
+    keyval kv = let (k,v1) = ByteString.break (== ':') kv in (k, ByteString.drop 1 v1)
+
     host = strOption (long "host" <> value "127.0.0.1")
-    path = strOption (long "path" <> value "/")
+    path = bstrOption (long "path" <> value "/")
     port = option auto (long "port" <> value 443)
+    verb = bstrOption (long "verb" <> value "GET")
+    extraHeaders = many (fmap keyval $ bstrOption (short 'H'))
 
 main :: IO ()
-main = execParser opts >>= go
+main = execParser opts >>= client
   where
     opts = info (helper <*> clientArgs) (mconcat [
         fullDesc
       , header "http2-client-exe: a CLI HTTP2 client written in Haskell"
       ])
-    go QueryArgs{..} = client _host _port _path
 
-client :: HostName -> PortNumber -> String -> IO ()
-client host port path = do
-    let headersPairs    = [ (":method", "GET")
+client :: QueryArgs -> IO ()
+client QueryArgs{..} = do
+    let headersPairs    = [ (":method", _verb)
                           , (":scheme", "https")
-                          , (":path", ByteString.pack path)
-                          , (":authority", ByteString.pack host)
-                          , ("X-Stupid-Header1", ByteString.replicate 1024 '1')
-                          ]
+                          , (":path", _path)
+                          , (":authority", ByteString.pack _host)
+                          ] <> _extraHeaders
+
+    print headersPairs
 
     let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
             _waitHeaders stream >>= print
@@ -64,7 +77,7 @@ client host port path = do
                         _updateWindow $ streamFlowControl
                         moredata
 
-    conn <- newHttp2Client host port tlsParams onPushPromise
+    conn <- newHttp2Client _host _port tlsParams onPushPromise
 
     _ <- forkIO $ forever $ do
             threadDelay 1000000
