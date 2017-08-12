@@ -14,7 +14,6 @@ An native-Haskell HTTP2 client library based on `http2` and `tls` packages.
 
 * fix broken incoming flow control accounting
 * a Simple module for simple and sane behaviors
-* change location where to consume/add-credit to expose some knobs to flow-control
 * modify client SETTINGS only when acknowledged
 * consider a beter frame-subscription mechanism than broadcast wake-up
 * consider most performant functions for HTTP2.HPACK encoding/decoding

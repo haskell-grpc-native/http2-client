@@ -278,8 +278,10 @@ newHttp2Client host port tlsParams handlePPStream = do
                                           hpackDecoder
                                           conn
                                           settings
-                                          _incomingFlowControl
                                           handlePPStream
+
+    dataFrames <- dupChan serverFrames
+    _ <- forkIO $ creditDataFramesLoop _incomingFlowControl dataFrames
 
     conccurentStreams <- newIORef 0
     let _startStream getWork = do
@@ -294,7 +296,6 @@ newHttp2Client host port tlsParams handlePPStream = do
                 cont <- withClientStreamId $ \sid -> do
                     initializeStream conn
                                      settings
-                                     _incomingFlowControl
                                      serverFrames
                                      serverHeaders
                                      hpackEncoder
@@ -327,14 +328,13 @@ initializeStream
   :: Exception e
   => Http2FrameConnection
   -> IORef ConnectionSettings
-  -> IncomingFlowControl
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
   -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn settings connectionFlowControl serverFrames serverHeaders hpackEncoder sid getWork = do
+initializeStream conn settings serverFrames serverHeaders hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
     -- Register interest in frames.
@@ -356,9 +356,7 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
             case fp of
                 DataFrame dat -> do
                      _ <- _consumeCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     _ <- _consumeCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed, also: fail on non-zero
                      _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     _addCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
@@ -421,6 +419,23 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
     ignore :: String -> IO ()
     ignore _ = return ()
 
+-- | We currently need a specific loop for crediting streams because a client
+-- user may programmatically reset and stop listening for a stream and stop
+-- calling waitData (which credits streams).
+--
+-- TODO: modify the '_rst' function to wait and credit all the remaining data
+-- that could have been sent in flight
+creditDataFramesLoop
+  :: Exception e
+  => IncomingFlowControl
+  -> Chan (FrameHeader, Either e FramePayload)
+  -> IO ()
+creditDataFramesLoop flowControl frames = forever $ do
+    (fh,_) <- waitFrameWithTypeId [ FrameData ] frames
+    _ <- _consumeCredit flowControl (HTTP2.payloadLength fh)
+    -- TODO: error if ends in negative territory
+    _addCredit flowControl (HTTP2.payloadLength fh)
+
 incomingHPACKFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
@@ -429,10 +444,9 @@ incomingHPACKFramesLoop
   -> DynamicTable
   -> Http2FrameConnection
   -> IORef ConnectionSettings
-  -> IncomingFlowControl
   -> PushPromiseHandler a
   -> IO ()
-incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings connectionFlowControl handlePPStream = forever $ do
+incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings handlePPStream = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -444,7 +458,6 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings c
                 let mkStreamActions stream = StreamDefinition (return CST) (handlePPStream parentSid stream)
                 cont <- initializeStream conn
                                          settings
-                                         connectionFlowControl
                                          frames
                                          headers
                                          hpackEncoder
