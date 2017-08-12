@@ -84,7 +84,7 @@ client QueryArgs{..} = do
 
     let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
             putStrLn "push stream started"
-            sinkAllPromisedData stream streamFlowControl >>= print
+            waitStream stream streamFlowControl >>= print
             putStrLn "push stream ended"
 
     conn <- newHttp2Client _host _port tlsParams onPushPromise
@@ -108,18 +108,10 @@ client QueryArgs{..} = do
     let go = -- forever $ do
             (_startStream conn $ \stream ->
                 let initStream = _headers stream headersPairs id
-                    handler incomingStreamFlowControl _ = do
-                        sendData conn stream HTTP2.setEndStream (ByteString.replicate 1024 'p')
-                        _waitHeaders stream >>= print
-                        godata
-                        -- print "stream ended"
-                          where
-                            godata = do
-                                (fh, x) <- _waitData stream
-                                print ("data" :: String, fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
-                                when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
-                                    _ <- _updateWindow $ incomingStreamFlowControl
-                                    godata
+                    handler streamFlowControl _ = do
+                        putStrLn "stream started"
+                        waitStream stream streamFlowControl >>= print
+                        putStrLn "stream ended"
                 in StreamDefinition initStream handler)
     _ <- waitAnyCancel =<< traverse async (replicate 1 go)
     threadDelay 5000000

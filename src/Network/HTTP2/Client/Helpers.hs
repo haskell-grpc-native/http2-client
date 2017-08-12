@@ -20,10 +20,10 @@ ping timeout msg conn = do
     t1 <- getCurrentTime
     return $ (t0, t1, pingReply)
 
-type PromiseDataResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString])
+type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString])
 
-sinkAllPromisedData :: Http2Stream -> IncomingFlowControl -> IO PromiseDataResult
-sinkAllPromisedData stream streamFlowControl = do
+waitStream :: Http2Stream -> IncomingFlowControl -> IO StreamResult
+waitStream stream streamFlowControl = do
     (_,_,hdrs) <- _waitHeaders stream
     dataFrames <- moredata []
     return (hdrs, reverse dataFrames)
@@ -32,7 +32,7 @@ sinkAllPromisedData stream streamFlowControl = do
         (fh, x) <- _waitData stream
         if HTTP2.testEndStream (HTTP2.flags fh)
         then
-            return xs
+            return (x:xs)
         else do
             _ <- _updateWindow $ streamFlowControl
             moredata (x:xs)
