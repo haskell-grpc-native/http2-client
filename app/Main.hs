@@ -30,6 +30,10 @@ data QueryArgs = QueryArgs {
   , _interPingDelay          :: !Int
   , _pingTimeout             :: !Int
   , _interFlowControlUpdates :: !Int
+  , _settingsMaxConcurrency  :: !Int
+  , _settingsMaxFrameSize       :: !Int
+  , _settingsMaxHeaderBlockSize :: !Int
+  , _settingsInitialWindowSize  :: !Int
   }
 
 clientArgs :: Parser QueryArgs
@@ -43,6 +47,10 @@ clientArgs =
         <*> milliseconds "inter-ping-delay-ms" 0
         <*> milliseconds "ping-timeout-ms" 5000
         <*> milliseconds "inter-flow-control-updates-ms" 1000
+        <*> concurrency
+        <*> frameBytes
+        <*> headersBytes
+        <*> initialWindowBytes
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -53,6 +61,10 @@ clientArgs =
     port = option auto (long "port" <> value 443)
     verb = bstrOption (long "verb" <> value "GET")
     extraHeaders = many (fmap keyval $ bstrOption (short 'H'))
+    concurrency = option auto (long "max-concurrency" <> value 100)
+    frameBytes = option auto (long "max-frame-size" <> value 1048576)
+    headersBytes = option auto (long "max-headers-list-size" <> value 1048576)
+    initialWindowBytes = option auto (long "initial-window-size" <> value 10485760)
 
 main :: IO ()
 main = execParser opts >>= client
@@ -82,10 +94,10 @@ client QueryArgs{..} = do
             updated <- _updateWindow $ _incomingFlowControl conn
             when updated $ putStrLn "sending flow-control update"
 
-    _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
-                   , (HTTP2.SettingsMaxConcurrentStreams, 250)
-                   , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
-                   , (HTTP2.SettingsInitialWindowSize, 10485760)
+    _settings conn [ (HTTP2.SettingsMaxFrameSize, _settingsMaxFrameSize)
+                   , (HTTP2.SettingsMaxConcurrentStreams, _settingsMaxConcurrency)
+                   , (HTTP2.SettingsMaxHeaderBlockSize, _settingsMaxHeaderBlockSize)
+                   , (HTTP2.SettingsInitialWindowSize, _settingsInitialWindowSize)
                    ]
 
     _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
