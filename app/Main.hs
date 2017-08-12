@@ -36,6 +36,8 @@ data QueryArgs = QueryArgs {
   , _settingsInitialWindowSize  :: !Int
   , _concurrentQueriesCount     :: !Int
   , _numberQueries              :: !Int
+  , _finalDelay                :: !Int
+  , _finalMessage              :: !ByteString
   }
 
 clientArgs :: Parser QueryArgs
@@ -55,6 +57,8 @@ clientArgs =
         <*> initialWindowBytes
         <*> numConcurrentThreads
         <*> numQueriesPerThread
+        <*> milliseconds "delay-before-quitting-ms" 200
+        <*> kthxByeMessage
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -71,6 +75,7 @@ clientArgs =
     initialWindowBytes = option auto (long "initial-window-size" <> value 10485760)
     numConcurrentThreads = option auto (long "num-concurrent-threads" <> value 1)
     numQueriesPerThread = option auto (long "num-queries-per-thread" <> value 1)
+    kthxByeMessage = bstrOption (long "exit-greeting" <> value "kthxbye (>;_;<)")
 
 main :: IO ()
 main = execParser opts >>= client
@@ -122,8 +127,8 @@ client QueryArgs{..} = do
                     in StreamDefinition initStream handler)
             go (n - 1) idx
     _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
-    threadDelay 5000000
-    _gtfo conn HTTP2.NoError "thx <(=O.O=)>"
+    threadDelay _finalDelay
+    _gtfo conn HTTP2.NoError _finalMessage
     return ()
   where
     tlsParams = TLS.ClientParams {
