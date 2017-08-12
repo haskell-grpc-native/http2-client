@@ -2,12 +2,6 @@
 {-# LANGUAGE RankNTypes         #-}
 {-# LANGUAGE OverloadedStrings  #-}
 
--- TODO:
--- * chunking based on SETTINGS
--- * do not broadcast to every chan but filter upfront with a lookup
--- * help to verify authority of push promises
--- * more strict with protocol checks/goaway/errors
--- * proper exceptions handling/throwing
 module Network.HTTP2.Client (
       Http2Client(..)
     , newHttp2Client
@@ -34,6 +28,7 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import           Data.Maybe (fromMaybe)
+import           Data.Monoid ((<>))
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -56,8 +51,8 @@ data IncomingFlowControl = IncomingFlowControl {
     _addCredit   :: WindowSize -> IO ()
   -- ^ Add credit (using a hidden mutable reference underneath). This function
   -- only does accounting, the IO only does mutable changes. See '_updateWindow'.
-  , _consumeCredit :: WindowSize -> IO () --TODO: return whether total credit became negative and we should trigger a connection error
-  -- ^ Consumes some credit.
+  , _consumeCredit :: WindowSize -> IO Int
+  -- ^ Consumes some credit and returns the credit left.
   , _updateWindow :: IO ()
   -- ^ Sends a WINDOW_UPDATE frame crediting it with the whole amount credited
   -- since the last _updateWindow call.
@@ -119,7 +114,12 @@ data StreamDefinition a = StreamDefinition {
 type StreamStarter a =
      (Http2Stream -> StreamDefinition a) -> IO (Either TooMuchConcurrency a)
 
-newtype TooMuchConcurrency = TooMuchConcurrency Int
+-- | Whether or not the client library believes the server will reject the new
+-- stream. The Int content corresponds to the number of streams that should end
+-- before accepting more streams. A reason this number can be more than zero is
+-- that servers can change (and hence reduce) the advertised number of allowed
+-- 'maxConcurrentStreams' at any time.
+newtype TooMuchConcurrency = TooMuchConcurrency { _getStreamRoomNeeded :: Int }
     deriving Show
 
 -- | Record holding functions one can call while in an HTTP2 client session.
@@ -307,7 +307,7 @@ newHttp2Client host port tlsParams handlePPStream = do
             -- answer if the network is fast.
             pingFrames <- dupChan serverFrames
             sendPingFrame controlStream id dat
-            return $ waitFrame (isPingReply dat) serverFrames
+            return $ waitFrame (isPingReply dat) pingFrames
     let _settings settslist = do
             atomicModifyIORef' settings
                        (\(ConnectionSettings cli srv) ->
@@ -353,13 +353,14 @@ initializeStream conn settings connectionFlowControl serverFrames serverHeaders 
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
                 DataFrame dat -> do
-                     _consumeCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     _consumeCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed
+                     _ <- _consumeCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
+                     _ <- _consumeCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed, also: fail on non-zero
                      _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
                      _addCredit connectionFlowControl (HTTP2.payloadLength fh) -- TODO: move this one to the main thread because we must count DATA frames even after a RST and here this is not guaranteed
                      return (fh, Right dat)
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
+                _                  -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
     let _sendDataChunk  = sendDataFrame frameStream
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
@@ -403,10 +404,20 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
                       (_applySettings hpackEncoder)
                       (lookup SettingsHeaderTableSize settsList)
                 ackSettings
+            | otherwise                 -> do
+                ignore "TODO: settings ack should be taken into account only after reception, we should return a waitSettingsAck in the _settings function"
         (PingFrame pingMsg)
             | not . testAck . flags $ fh ->
                 ackPing pingMsg
-        _                   -> print ("unhandled", controlFrame)
+            | otherwise                 -> do
+                ignore "PingFrame replies waited for in the requestor thread"
+        (WindowUpdateFrame _ )  ->
+                ignore "connection-wide WindowUpdateFrame waited for in OutgoingFlowControl threads"
+        _                   -> putStrLn ("UNHANDLED frame: " <> show controlFrame)
+
+  where
+    ignore :: String -> IO ()
+    ignore _ = return ()
 
 incomingHPACKFramesLoop
   :: Exception e
@@ -437,7 +448,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings c
                                          hpackEncoder
                                          sid
                                          mkStreamActions
-                cont
+                _ <- cont -- TODO: inline
                 return (sid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
                 return (HTTP2.streamId fh, Right hbf)
@@ -457,6 +468,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings c
                         go lastFh (Right (ByteString.append buffer chbf))
                     RSTStreamFrame err     ->
                         go lastFh (Left err)
+                    _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
             else do
                 hdrs <- decodeHeader hpackDecoder buffer
                 writeChan headers (curFh, sId, Right hdrs)
@@ -473,10 +485,9 @@ newIncomingFlowControl settings stream = do
             base <- initialWindowSize . _clientSettings <$> readIORef settings
             current <- readIORef credit
             let amount = base + current
-            print ("****", base, current, amount)
             when (amount > 0) (sendWindowUpdateFrame stream amount)
     let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
-    let _consumeCredit n = atomicModifyIORef' credit (\c -> (c - n,()))
+    let _consumeCredit n = atomicModifyIORef' credit (\c -> (c - n, c - n))
     return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow
 
 newOutgoingFlowControl ::
@@ -513,9 +524,10 @@ newOutgoingFlowControl settings sid frames = do
             new <- initialWindowSize . _serverSettings <$> readIORef settings
             if new == prev then threadDelay 1000000 >> waitSettingsChange prev else return ()
     waitSomeCredit = do
-        (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
+        (_, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
         case fp of
             WindowUpdateFrame amt -> return amt
+            _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
 
 sendHeaders
   :: Http2FrameClientStream
@@ -524,11 +536,11 @@ sendHeaders
   -> PayloadSplitter
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
-sendHeaders s enc headers blockSplitter mod = do
+sendHeaders s enc headers blockSplitter flagmod = do
     headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
     let framers           = (HeadersFrame Nothing) : repeat ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
-    let modifiersReversed = (HTTP2.setEndHeader . mod) : repeat id
+    let modifiersReversed = (HTTP2.setEndHeader . flagmod) : repeat id
     let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
     sendBackToBack s arrangedFrames
     return CST
@@ -546,7 +558,7 @@ settingsPayloadSplitter (ConnectionSettings _ srv) =
 -- @ fixedSizeChunks 2 "hello" = ["he", "ll", "o"] @
 fixedSizeChunks :: Int -> ByteString -> [ByteString]
 fixedSizeChunks 0   _    = error "cannot chunk by zero-length blocks"
-fixedSizeChunks len ""   = []
+fixedSizeChunks _   ""   = []
 fixedSizeChunks len bstr =
       let
         (chunk, rest) = ByteString.splitAt len bstr
@@ -554,17 +566,17 @@ fixedSizeChunks len bstr =
         chunk : fixedSizeChunks len rest
 
 sendData :: Http2Client -> Http2Stream -> (FrameFlags -> FrameFlags) -> ByteString -> IO ()
-sendData conn stream mod dat = do
+sendData conn stream flagmod dat = do
     splitter <- _paylodSplitter conn
     let chunks = splitter dat
-    let pairs  = reverse $ zip (mod : repeat id) (reverse chunks)
+    let pairs  = reverse $ zip (flagmod : repeat id) (reverse chunks)
     forM_ pairs $ \(flags, chunk) -> _sendDataChunk stream flags chunk
 
 sendDataFrame
   :: Http2FrameClientStream
   -> (FrameFlags -> FrameFlags) -> ByteString -> IO ()
-sendDataFrame s mod dat = do
-    sendOne s mod (DataFrame dat)
+sendDataFrame s flagmod dat = do
+    sendOne s flagmod (DataFrame dat)
 
 sendResetFrame :: Http2FrameClientStream -> ErrorCodeId -> IO ()
 sendResetFrame s err = do
@@ -609,7 +621,6 @@ sendSettingsFrame s flags setts
     sendOne s flags payload
     return ()
 
--- TODO: need a streamId to add a priority on another stream
 sendPriorityFrame :: Http2FrameClientStream -> Priority -> IO ()
 sendPriorityFrame s p = do
     let payload = PriorityFrame p
@@ -641,13 +652,13 @@ waitFrame
   => (FrameHeader -> FramePayload -> Bool)
   -> Chan (FrameHeader, Either e FramePayload)
   -> IO (FrameHeader, FramePayload)
-waitFrame pred chan =
+waitFrame test chan =
     loop
   where
     loop = do
         (fHead, fPayload) <- readChan chan
         let dat = either throw id fPayload
-        if pred fHead dat
+        if test fHead dat
         then return (fHead, dat)
         else loop
 
@@ -666,11 +677,11 @@ waitHeaders
   :: (FrameHeader -> StreamId -> t -> Bool)
   -> Chan (FrameHeader, StreamId, t)
   -> IO (FrameHeader, StreamId, t)
-waitHeaders pred chan =
+waitHeaders test chan =
     loop
   where
     loop = do
         tuple@(fH, sId, headers) <- readChan chan
-        if pred fH sId headers
+        if test fH sId headers
         then return tuple
         else loop

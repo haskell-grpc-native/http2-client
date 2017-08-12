@@ -17,7 +17,6 @@ module Network.HTTP2.Client.FrameConnection (
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Monad (void)
-import           Data.IORef (newIORef, atomicModifyIORef')
 import           Network.HTTP2 (FrameHeader(..), FrameFlags, FramePayload, HTTP2Error, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
@@ -88,7 +87,6 @@ newHttp2FrameConnection host port params = do
     -- Define handlers.
     let makeClientStream streamID = 
             let putFrame modifyFF frame = do
-                    print (streamID, frame)
                     let info = encodeInfo modifyFF streamID
                     _sendRaw http2conn $
                         HTTP2.encodeFrame info frame

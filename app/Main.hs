@@ -48,7 +48,6 @@ client host port path = do
                         moredata
 
     conn <- newHttp2Client host port tlsParams onPushPromise
-    -- _addCredit (_incomingFlowControl conn) largestWindowSize
 
     _ <- forkIO $ forever $ do
             threadDelay 1000000
@@ -57,8 +56,9 @@ client host port path = do
     _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
                    , (HTTP2.SettingsMaxConcurrentStreams, 250)
                    , (HTTP2.SettingsMaxHeaderBlockSize, 1048576)
+                   , (HTTP2.SettingsInitialWindowSize, 10485760)
                    ]
-    threadDelay 200000
+    threadDelay 2000000
     t0 <- getCurrentTime
     waitPing <- _ping conn "pingpong"
     pingReply <- race (threadDelay 5000000) waitPing 
