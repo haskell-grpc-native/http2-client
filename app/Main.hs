@@ -39,6 +39,8 @@ data QueryArgs = QueryArgs {
   , _numberQueries              :: !Int
   , _finalDelay                :: !Int
   , _finalMessage              :: !ByteString
+  , _encoderBufsize :: !Int
+  , _decoderBufsize :: !Int
   }
 
 clientArgs :: Parser QueryArgs
@@ -60,6 +62,8 @@ clientArgs =
         <*> numQueriesPerThread
         <*> milliseconds "delay-before-quitting-ms" 200
         <*> kthxByeMessage
+        <*> encoderBufSize
+        <*> decoderBufSize
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -77,6 +81,8 @@ clientArgs =
     numConcurrentThreads = option auto (long "num-concurrent-threads" <> value 1)
     numQueriesPerThread = option auto (long "num-queries-per-thread" <> value 1)
     kthxByeMessage = bstrOption (long "exit-greeting" <> value "kthxbye (>;_;<)")
+    encoderBufSize = option auto (long "hpack-encoder-buffer-size" <> value 4096)
+    decoderBufSize = option auto (long "hpack-decoder-buffer-size" <> value 4096)
 
 main :: IO ()
 main = execParser opts >>= client
@@ -101,7 +107,7 @@ client QueryArgs{..} = do
             waitStream stream streamFlowControl >>= print
             putStrLn "push stream ended"
 
-    conn <- newHttp2Client _host _port tlsParams onPushPromise
+    conn <- newHttp2Client _host _port _encoderBufsize _decoderBufsize tlsParams onPushPromise
 
     _ <- forkIO $ forever $ do
             threadDelay _interFlowControlUpdates

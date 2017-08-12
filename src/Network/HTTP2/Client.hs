@@ -221,21 +221,24 @@ newHttp2Client :: HostName
                -- ^ Host to connect to.
                -> PortNumber
                -- ^ Port number to connect to (usually 443 on the web).
+               -> Int
+               -- ^ The buffersize for the Network.HPACK encoder.
+               -> Int
+               -- ^ The buffersize for the Network.HPACK decoder.
                -> ClientParams
                -- ^ The TLS client parameters (e.g., to allow some certificates).
                -> PushPromiseHandler a
                -- ^ Action to perform when a server sends a PUSH_PROMISE.
                -> IO Http2Client
-newHttp2Client host port tlsParams handlePPStream = do
+newHttp2Client host port encoderBufSize decoderBufSize tlsParams handlePPStream = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
 
     -- prepare hpack contexts
     hpackEncoder <- do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
-        let bufsize  = 4096
         dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
-        let _encodeHeaders = HPACK.encodeHeader strategy bufsize dt
+        let _encodeHeaders = HPACK.encodeHeader strategy encoderBufSize dt
         let _applySettings n = HPACK.setLimitForEncoding n dt
         return HpackEncoderContext{..}
 
@@ -263,8 +266,7 @@ newHttp2Client host port tlsParams handlePPStream = do
     serverStreamFrames <- dupChan serverFrames
     serverHeaders <- newChan
     hpackDecoder <- do
-        let bufsize  = 4096
-        dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize bufsize
+        dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize decoderBufSize
         return dt
 
     creditFrames <- dupChan serverFrames
