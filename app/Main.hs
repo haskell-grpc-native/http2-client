@@ -136,7 +136,7 @@ client QueryArgs{..} = do
     let go 0 idx = putStrLn $ "done worker: " <> show idx
         go n idx = do
             _ <- (_startStream conn $ \stream ->
-                    let initStream = _headers stream headersPairs id
+                    let initStream = _headers stream headersPairs (HTTP2.setEndStream)
                         handler streamFlowControl _ = do
                             putStrLn $ "stream started " <> show (idx, n)
                             waitStream stream streamFlowControl >>= print
