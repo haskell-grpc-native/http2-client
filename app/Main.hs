@@ -34,6 +34,8 @@ data QueryArgs = QueryArgs {
   , _settingsMaxFrameSize       :: !Int
   , _settingsMaxHeaderBlockSize :: !Int
   , _settingsInitialWindowSize  :: !Int
+  , _concurrentQueriesCount     :: !Int
+  , _numberQueries              :: !Int
   }
 
 clientArgs :: Parser QueryArgs
@@ -51,6 +53,8 @@ clientArgs =
         <*> frameBytes
         <*> headersBytes
         <*> initialWindowBytes
+        <*> numConcurrentThreads
+        <*> numQueriesPerThread
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -65,6 +69,8 @@ clientArgs =
     frameBytes = option auto (long "max-frame-size" <> value 1048576)
     headersBytes = option auto (long "max-headers-list-size" <> value 1048576)
     initialWindowBytes = option auto (long "initial-window-size" <> value 10485760)
+    numConcurrentThreads = option auto (long "num-concurrent-threads" <> value 1)
+    numQueriesPerThread = option auto (long "num-queries-per-thread" <> value 1)
 
 main :: IO ()
 main = execParser opts >>= client
@@ -105,15 +111,17 @@ client QueryArgs{..} = do
         (t0, t1, pingReply) <- ping _pingTimeout "pingpong" conn
         print $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
-    let go = -- forever $ do
-            (_startStream conn $ \stream ->
-                let initStream = _headers stream headersPairs id
-                    handler streamFlowControl _ = do
-                        putStrLn "stream started"
-                        waitStream stream streamFlowControl >>= print
-                        putStrLn "stream ended"
-                in StreamDefinition initStream handler)
-    _ <- waitAnyCancel =<< traverse async (replicate 1 go)
+    let go 0 idx = putStrLn $ "done worker: " <> show idx
+        go n idx = do
+            _ <- (_startStream conn $ \stream ->
+                    let initStream = _headers stream headersPairs id
+                        handler streamFlowControl _ = do
+                            putStrLn $ "stream started " <> show (idx, n)
+                            waitStream stream streamFlowControl >>= print
+                            putStrLn $ "stream ended " <> show (idx, n)
+                    in StreamDefinition initStream handler)
+            go (n - 1) idx
+    _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
     threadDelay 5000000
     _gtfo conn HTTP2.NoError "thx <(=O.O=)>"
     return ()
