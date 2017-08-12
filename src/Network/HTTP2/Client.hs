@@ -53,9 +53,11 @@ data IncomingFlowControl = IncomingFlowControl {
   -- only does accounting, the IO only does mutable changes. See '_updateWindow'.
   , _consumeCredit :: WindowSize -> IO Int
   -- ^ Consumes some credit and returns the credit left.
-  , _updateWindow :: IO ()
+  , _updateWindow :: IO Bool
   -- ^ Sends a WINDOW_UPDATE frame crediting it with the whole amount credited
-  -- since the last _updateWindow call.
+  -- since the last _updateWindow call. The boolean tells whether an update was
+  -- actually sent or not. A reason for not sending an update is if there is no
+  -- credit in the flow-control system.
   }
 
 -- | Receives credit-based flow-control or block.
@@ -485,7 +487,9 @@ newIncomingFlowControl settings stream = do
             base <- initialWindowSize . _clientSettings <$> readIORef settings
             current <- readIORef credit
             let amount = base + current
-            when (amount > 0) (sendWindowUpdateFrame stream amount)
+            let shouldUpdate = amount > 0
+            when shouldUpdate (sendWindowUpdateFrame stream amount)
+            return shouldUpdate
     let _addCredit n = atomicModifyIORef' credit (\c -> (c + n,()))
     let _consumeCredit n = atomicModifyIORef' credit (\c -> (c - n, c - n))
     return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow

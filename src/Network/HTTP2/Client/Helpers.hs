@@ -34,5 +34,5 @@ sinkAllPromisedData stream streamFlowControl = do
         then
             return xs
         else do
-            _updateWindow $ streamFlowControl
+            _ <- _updateWindow $ streamFlowControl
             moredata (x:xs)

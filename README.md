@@ -2,8 +2,17 @@
 
 An native-Haskell HTTP2 client library based on `http2` and `tls` packages.
 
+## Things that will likely change
+
+* onPushPromise handler will be passed when opening new streams rather than when opening connections
+* helpers will likely allow some more customization
+* there will be a few strategies to pick from for flow-control
+* error handling will likely necessitate throwIO
+* logging will be added
+
 ## TODO
 
+* fix broken incoming flow control accounting
 * a Simple module for simple and sane behaviors
 * change location where to consume/add-credit to expose some knobs to flow-control
 * modify client SETTINGS only when acknowledged

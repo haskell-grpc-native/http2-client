@@ -22,13 +22,14 @@ type Path = ByteString
 type Verb = ByteString
 
 data QueryArgs = QueryArgs {
-    _host         :: !HostName
-  , _port         :: !PortNumber
-  , _verb         :: !Verb
-  , _path         :: !Path
-  , _extraHeaders :: ![(ByteString, ByteString)]
-  , _interPingDelay    :: !Int
-  , _pingTimeout       :: !Int
+    _host                    :: !HostName
+  , _port                    :: !PortNumber
+  , _verb                    :: !Verb
+  , _path                    :: !Path
+  , _extraHeaders            :: ![(ByteString, ByteString)]
+  , _interPingDelay          :: !Int
+  , _pingTimeout             :: !Int
+  , _interFlowControlUpdates :: !Int
   }
 
 clientArgs :: Parser QueryArgs
@@ -41,6 +42,7 @@ clientArgs =
         <*> extraHeaders
         <*> milliseconds "inter-ping-delay-ms" 0
         <*> milliseconds "ping-timeout-ms" 5000
+        <*> milliseconds "inter-flow-control-updates-ms" 1000
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -76,8 +78,9 @@ client QueryArgs{..} = do
     conn <- newHttp2Client _host _port tlsParams onPushPromise
 
     _ <- forkIO $ forever $ do
-            threadDelay 1000000
-            _updateWindow $ _incomingFlowControl conn
+            threadDelay _interFlowControlUpdates
+            updated <- _updateWindow $ _incomingFlowControl conn
+            when updated $ putStrLn "sending flow-control update"
 
     _settings conn [ (HTTP2.SettingsMaxFrameSize, 1048576)
                    , (HTTP2.SettingsMaxConcurrentStreams, 250)
@@ -103,7 +106,7 @@ client QueryArgs{..} = do
                                 (fh, x) <- _waitData stream
                                 print ("data" :: String, fmap (\bs -> (ByteString.length bs, ByteString.take 64 bs)) x)
                                 when (not $ HTTP2.testEndStream (HTTP2.flags fh)) $ do
-                                    _updateWindow $ incomingStreamFlowControl
+                                    _ <- _updateWindow $ incomingStreamFlowControl
                                     godata
                 in StreamDefinition initStream handler)
     _ <- waitAnyCancel =<< traverse async (replicate 1 go)
