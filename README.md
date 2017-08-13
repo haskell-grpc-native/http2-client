@@ -144,6 +144,7 @@ to follow the following procedure:
 Please pay attention to the following:
 - avoid introducing external dependencies, especially if dependencies are not in stackage
 - avoid reformatting-only merge requests
+- please verify that you can `stack clean` and `stack build --pedantic`
 
 General mindset to have during code-reviews:
 - be kind
