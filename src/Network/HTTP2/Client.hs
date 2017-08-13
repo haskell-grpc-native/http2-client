@@ -3,16 +3,23 @@
 {-# LANGUAGE OverloadedStrings  #-}
 
 module Network.HTTP2.Client (
+    -- * Creating a client
       Http2Client(..)
     , newHttp2Client
     , PushPromiseHandler
-    , Http2Stream(..)
-    , sendData
-    , StreamThread
-    , _gtfo
+    -- * Starting streams
     , StreamDefinition(..)
+    , StreamStarter
+    , StreamThread
+    , Http2Stream(..)
+    -- * Sending data for POSTs.
+    , sendData
+    -- * Flow control
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
+    -- * Misc.
+    , _gtfo
+    -- * Convenience re-exports
     , module Network.HTTP2.Client.FrameConnection
     , module Network.Socket
     , module Network.TLS
