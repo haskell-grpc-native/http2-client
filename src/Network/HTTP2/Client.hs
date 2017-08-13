@@ -227,10 +227,12 @@ newHttp2Client :: HostName
                -- ^ The buffersize for the Network.HPACK decoder.
                -> ClientParams
                -- ^ The TLS client parameters (e.g., to allow some certificates).
+               -> SettingsList
+               -- ^ Initial SETTINGS that are sent as first frame.
                -> PushPromiseHandler a
                -- ^ Action to perform when a server sends a PUSH_PROMISE.
                -> IO Http2Client
-newHttp2Client host port encoderBufSize decoderBufSize tlsParams handlePPStream = do
+newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings handlePPStream = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
 
@@ -323,6 +325,8 @@ newHttp2Client host port encoderBufSize decoderBufSize tlsParams handlePPStream 
             sendGTFOFrame controlStream sId err errStr
 
     let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
+
+    _settings initSettings
 
     return $ Http2Client{..}
 

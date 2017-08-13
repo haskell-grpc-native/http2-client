@@ -8,7 +8,7 @@ import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
-import           Data.Time.Clock (diffUTCTime)
+import           Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
@@ -39,6 +39,7 @@ data QueryArgs = QueryArgs {
   , _settingsMaxFrameSize       :: !Int
   , _settingsMaxHeaderBlockSize :: !Int
   , _settingsInitialWindowSize  :: !Int
+  , _initialWindowKick          :: !Int
   , _concurrentQueriesCount     :: !Int
   , _numberQueries              :: !Int
   , _finalDelay                :: !Int
@@ -63,9 +64,10 @@ clientArgs =
         <*> frameBytes
         <*> headersBytes
         <*> initialWindowBytes
+        <*> initialWindowKick
         <*> numConcurrentThreads
         <*> numQueriesPerThread
-        <*> milliseconds "delay-before-quitting-ms" 200
+        <*> milliseconds "delay-before-quitting-ms" 0
         <*> kthxByeMessage
         <*> encoderBufSize
         <*> decoderBufSize
@@ -84,6 +86,7 @@ clientArgs =
     frameBytes = option auto (long "max-frame-size" <> value 1048576)
     headersBytes = option auto (long "max-headers-list-size" <> value 1048576)
     initialWindowBytes = option auto (long "initial-window-size" <> value 10485760)
+    initialWindowKick  = option auto (long "initial-window-kick" <> value 0)
     numConcurrentThreads = option auto (long "num-concurrent-threads" <> value 1)
     numQueriesPerThread = option auto (long "num-queries-per-thread" <> value 1)
     kthxByeMessage = bstrOption (long "exit-greeting" <> value "kthxbye (>;_;<)")
@@ -109,44 +112,46 @@ client QueryArgs{..} = do
                           ] <> _extraHeaders
 
     let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
-            putStrLn "push stream started"
-            waitStream stream streamFlowControl >>= print
-            putStrLn "push stream ended"
+            timePrint ("push stream started" :: String)
+            waitStream stream streamFlowControl >>= timePrint
+            timePrint ("push stream ended" :: String)
 
-    conn <- newHttp2Client _host _port _encoderBufsize _decoderBufsize tlsParams onPushPromise
+    let conf = [ (HTTP2.SettingsMaxFrameSize, _settingsMaxFrameSize)
+               , (HTTP2.SettingsMaxConcurrentStreams, _settingsMaxConcurrency)
+               , (HTTP2.SettingsMaxHeaderBlockSize, _settingsMaxHeaderBlockSize)
+               , (HTTP2.SettingsInitialWindowSize, _settingsInitialWindowSize)
+               , (HTTP2.SettingsEnablePush, case _settingsAllowServerPush of
+                   PushEnabled -> 1 ; PushDisabled -> 0)
+               ]
+    timePrint conf
 
+    conn <- newHttp2Client _host _port _encoderBufsize _decoderBufsize tlsParams conf onPushPromise
+    _addCredit (_incomingFlowControl conn) _initialWindowKick
     _ <- forkIO $ forever $ do
-            threadDelay _interFlowControlUpdates
             updated <- _updateWindow $ _incomingFlowControl conn
-            when updated $ putStrLn "sending flow-control update"
-
-    _settings conn [ (HTTP2.SettingsMaxFrameSize, _settingsMaxFrameSize)
-                   , (HTTP2.SettingsMaxConcurrentStreams, _settingsMaxConcurrency)
-                   , (HTTP2.SettingsMaxHeaderBlockSize, _settingsMaxHeaderBlockSize)
-                   , (HTTP2.SettingsInitialWindowSize, _settingsInitialWindowSize)
-                   , (HTTP2.SettingsEnablePush, case _settingsAllowServerPush of
-                       PushEnabled -> 1 ; PushDisabled -> 0)
-                   ]
+            when updated $ timePrint ("sending flow-control update" :: String)
+            threadDelay _interFlowControlUpdates
 
     _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
         threadDelay _interPingDelay
         (t0, t1, pingReply) <- ping _pingTimeout "pingpong" conn
-        print $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
+        timePrint $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
-    let go 0 idx = putStrLn $ "done worker: " <> show idx
+    let go 0 idx = timePrint $ "done worker: " <> show idx
         go n idx = do
             _ <- (_startStream conn $ \stream ->
                     let initStream = _headers stream headersPairs (HTTP2.setEndStream)
                         handler streamFlowControl _ = do
-                            putStrLn $ "stream started " <> show (idx, n)
-                            waitStream stream streamFlowControl >>= print
-                            putStrLn $ "stream ended " <> show (idx, n)
+                            timePrint $ "stream started " <> show (idx, n)
+                            waitStream stream streamFlowControl >>= timePrint
+                            timePrint $ "stream ended " <> show (idx, n)
                     in StreamDefinition initStream handler)
             go (n - 1) idx
 
     _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
 
-    threadDelay _finalDelay
+    when (_finalDelay > 0) (threadDelay _finalDelay)
+
     _gtfo conn HTTP2.NoError _finalMessage
 
     return ()
@@ -162,3 +167,8 @@ client QueryArgs{..} = do
         , TLS.clientSupported            = def { TLS.supportedCiphers = TLS.ciphersuite_default }
         , TLS.clientDebug                = def
         }
+
+timePrint :: Show a => a -> IO ()
+timePrint x = do
+    tst <- getCurrentTime
+    print (tst, x)
