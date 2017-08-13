@@ -7,10 +7,10 @@ An native-Haskell HTTP2 client library based on `http2` and `tls` packages.
 HTTP2 is a heavy protocol. HTTP2 features pipelining, query and responses
 interleaving, server-pushes, pings, stateful compression and flow-control,
 priorization etc. This library aims at exposing these features so that library
-users can integrate `http2-client` in a variety of applications, so that all
-features are reachable. Hence, the `http2-client` programming interface can
-feel low-level for users with expectations to get an API as simple as in
-HTTP1.x.
+users can integrate `http2-client` in a variety of applications. In short, we'd
+like to expose as many HTTP2 features as possible. Hence, the `http2-client`
+programming interface can feel low-level for users with expectations to get an
+API as simple as in HTTP1.x.
 
 Exposing most HTTP2 primitives as a drawback: the library allows a client to
 behave abnormally with-respect to the HTTP2 spec. That said, we try to prevent
@@ -32,7 +32,13 @@ library design.
 ## Usage
 
 First, make sure you are somewhat familiar with HTTP and HTTP2 standards by
-reading RFCs or Wikipedia pages.
+reading RFCs or Wikipedia pages. If you use the library, feel free to shoot me
+an e-mail (cf. commits) or a tweet @lucasdicioccio .
+
+### Installation
+
+This package is a standard `Stack` project, please also refer to Stack's
+documentation if you have trouble installing or using this package.
 
 ### Opening a stream
 
@@ -70,7 +76,7 @@ something like TCP slow-start).
 
 ** Sent DATA flow control ** A server following the HTTP2 specification
 strictly will kick you for sending too much data. The `http2-client` library
-allows you to be more aggressive than the server allows and you have to be care
+allows you to be more aggressive than the server allows and you have to care
 for your streams. We provide an incoming flow-control context that will allow
 you to call `_withdrawCredit` to wait until some credit is available. At the
 time of this writing, the `sendData` function does not call `_withdrawCredit`
@@ -144,7 +150,12 @@ General mindset to have during code-reviews:
 - be patient
 - surpass egos and bring data if there is a disagreement
 
-## Things that will likely change the API
+## Bugtracker
+
+Most of the following points have their own issues on the issue tracker at
+GitHub: https://github.com/lucasdicioccio/http2-client/issues .
+
+### Things that will likely change the API
 
 I think the fundamental are right but the following needs tweaking:
 
@@ -154,7 +165,7 @@ I think the fundamental are right but the following needs tweaking:
   received so that all DATA frames are accounted for in the flow-control system
 - need a way to hook custom flow-control algorithms
 
-## Support of the HTTP2 standard
+### Support of the HTTP2 standard
 
 The current implementation follows the HTTP2 standard except for the following:
 - does not handle `PRIORITY`
@@ -172,7 +183,7 @@ The current implementation follows the HTTP2 standard except for the following:
   * authority of push promise https://tools.ietf.org/html/draft-ietf-httpbis-http2-17#section-10.1
   * ...
 
-## TODO
+### Various TODO
 
 - modify client SETTINGS only when acknowledged
   * currently make use of new client settings before the server has time to

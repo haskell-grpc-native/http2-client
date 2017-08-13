@@ -1,7 +1,7 @@
 name:                http2-client
 version:             0.1.0.0
 synopsis:            A native HTTP2 client library.
--- description:
+description:         Please read the README.ms at the homepage.
 homepage:            https://github.com/lucasdicioccio/http2-client
 license:             BSD3
 license-file:        LICENSE
