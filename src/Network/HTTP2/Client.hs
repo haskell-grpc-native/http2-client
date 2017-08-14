@@ -30,7 +30,7 @@ import           Control.Concurrent.Async (race)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
-import           Control.Monad (forever, when, forM_)
+import           Control.Monad (forever, void, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
@@ -139,8 +139,11 @@ data Http2Client = Http2Client {
   -- first call to this IO will return if a reply is received. Hence we
   -- recommend wrapping this IO in an Async (e.g., with @race (threadDelay
   -- timeout)@.)
-  , _settings         :: SettingsList -> IO ()
-  -- ^ Sends a SETTINGS.
+  , _settings         :: SettingsList -> IO (IO (FrameHeader, FramePayload))
+  -- ^ Sends a SETTINGS. Returns an IO to wait for a settings reply. No timeout
+  -- is provided. Only the first call to this IO will return if a reply is
+  -- received. Hence we recommend wrapping this IO in an Async (e.g., with
+  -- @race (threadDelay timeout)@.)
   , _goaway           :: ErrorCodeId -> ByteString -> IO ()
   -- ^ Sends a GOAWAY. 
   , _startStream      :: forall a. StreamStarter a
@@ -322,17 +325,22 @@ newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings = 
             sendPingFrame controlStream id dat
             return $ waitFrame (isPingReply dat) pingFrames
     let _settings settslist = do
-            atomicModifyIORef' settings
-                       (\(ConnectionSettings cli srv) ->
-                           (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
+            -- Much like _ping, we need to dupChan before sending the query.
+            pingFrames <- dupChan serverFrames
             sendSettingsFrame controlStream id settslist
+            return $ do
+                ret <- waitFrame isSettingsReply pingFrames
+                atomicModifyIORef' settings
+                    (\(ConnectionSettings cli srv) ->
+                        (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
+                return ret
     let _goaway err errStr = do
             sId <- readIORef maxReceivedStreamId
             sendGTFOFrame controlStream sId err errStr
 
     let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
 
-    _settings initSettings
+    _ <- forkIO . void =<< _settings initSettings
 
     return $ Http2Client{..}
 
@@ -713,6 +721,10 @@ waitFrame test chan =
 isPingReply :: ByteString -> FrameHeader -> FramePayload -> Bool
 isPingReply datSent _ (PingFrame datRcv) = datSent == datRcv
 isPingReply _       _ _                  = False
+
+isSettingsReply :: FrameHeader -> FramePayload -> Bool
+isSettingsReply fh (SettingsFrame _) = HTTP2.testAck (flags fh)
+isSettingsReply _ _                  = False
 
 waitHeadersWithStreamId
   :: StreamId
