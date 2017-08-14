@@ -202,6 +202,7 @@ data Http2Stream = Http2Stream {
   -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
   -- to chunk and send naively according to server\'s preferences. This function
   -- can be useful if you intend to handle the framing yourself.
+  , _waitPushPromise :: PushPromiseHandler () -> IO ()
   }
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
@@ -236,10 +237,8 @@ newHttp2Client :: HostName
                -- ^ The TLS client parameters (e.g., to allow some certificates).
                -> SettingsList
                -- ^ Initial SETTINGS that are sent as first frame.
-               -> PushPromiseHandler a
-               -- ^ Action to perform when a server sends a PUSH_PROMISE.
                -> IO Http2Client
-newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings handlePPStream = do
+newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings = do
     -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
 
@@ -283,13 +282,12 @@ newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings ha
     _outgoingFlowControl <- newOutgoingFlowControl settings 0 creditFrames
     _incomingFlowControl <- newIncomingFlowControl settings controlStream
 
+    serverPushPromises <- newChan
+
     _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
                                           serverHeaders
-                                          hpackEncoder
+                                          serverPushPromises
                                           hpackDecoder
-                                          conn
-                                          settings
-                                          handlePPStream
 
     dataFrames <- dupChan serverFrames
     _ <- forkIO $ creditDataFramesLoop _incomingFlowControl dataFrames
@@ -309,6 +307,7 @@ newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings ha
                                      settings
                                      serverFrames
                                      serverHeaders
+                                     serverPushPromises
                                      hpackEncoder
                                      sid
                                      getWork
@@ -343,17 +342,19 @@ initializeStream
   -> IORef ConnectionSettings
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
+  -> Chan (StreamId, StreamId)
   -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn settings serverFrames serverHeaders hpackEncoder sid getWork = do
+initializeStream conn settings serverFrames serverHeaders serverPushPromises hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
     -- Register interest in frames.
     frames  <- dupChan serverFrames
     credits <- dupChan serverFrames
     headers <- dupChan serverHeaders
+    pushPromises <- dupChan serverPushPromises
 
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl settings frameStream
@@ -377,6 +378,19 @@ initializeStream conn settings serverFrames serverHeaders hpackEncoder sid getWo
     let _sendDataChunk  = sendDataFrame frameStream
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
+    let _waitPushPromise :: PushPromiseHandler () -> IO ()
+        _waitPushPromise ppHandler = do
+            (_,ppSid) <- waitPushPromiseWithParentStreamId sid pushPromises
+            let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream)
+            ppCont <- initializeStream conn
+                                       settings
+                                       serverFrames
+                                       serverHeaders
+                                       serverPushPromises
+                                       hpackEncoder
+                                       ppSid
+                                       mkStreamActions
+            ppCont
 
     let streamActions = getWork $ Http2Stream{..}
 
@@ -454,13 +468,10 @@ incomingHPACKFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> HpackEncoderContext
+  -> Chan (StreamId, StreamId)
   -> DynamicTable
-  -> Http2FrameConnection
-  -> IORef ConnectionSettings
-  -> PushPromiseHandler a
   -> IO ()
-incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings handlePPStream = forever $ do
+incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -469,15 +480,7 @@ incomingHPACKFramesLoop frames headers hpackEncoder hpackDecoder conn settings h
     (sId, pattern) <- case fp of
             PushPromiseFrame sid hbf -> do
                 let parentSid = HTTP2.streamId fh
-                let mkStreamActions stream = StreamDefinition (return CST) (handlePPStream parentSid stream)
-                cont <- initializeStream conn
-                                         settings
-                                         frames
-                                         headers
-                                         hpackEncoder
-                                         sid
-                                         mkStreamActions
-                _ <- cont -- TODO: inline
+                writeChan pushPromises (parentSid, sid)
                 return (sid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
                 return (HTTP2.streamId fh, Right hbf)
@@ -730,4 +733,17 @@ waitHeaders test chan =
         tuple@(fH, sId, headers) <- readChan chan
         if test fH sId headers
         then return tuple
+        else loop
+
+waitPushPromiseWithParentStreamId
+  :: StreamId
+  -> Chan (StreamId, StreamId)
+  -> IO (StreamId, StreamId)
+waitPushPromiseWithParentStreamId sid chan =
+    loop
+  where
+    loop = do
+        pair@(parentSid,_) <- readChan chan
+        if parentSid == sid
+        then return pair
         else loop
