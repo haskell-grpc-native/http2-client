@@ -7,6 +7,7 @@ import qualified Network.HPACK as HPACK
 import           Data.ByteString (ByteString)
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Async (race)
+import           Control.Monad (forever)
 
 import Network.HTTP2.Client
 
@@ -36,3 +37,10 @@ waitStream stream streamFlowControl = do
         else do
             _ <- _updateWindow $ streamFlowControl
             moredata (x:xs)
+
+-- | Sequentially every push-promise with a handler.
+--
+-- This function runs forever and you should wrap it with 'withAsync'.
+onPushPromise :: Http2Stream -> PushPromiseHandler () -> IO ()
+onPushPromise stream handler = forever $ do
+    _waitPushPromise stream handler
