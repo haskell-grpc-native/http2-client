@@ -202,7 +202,7 @@ data Http2Stream = Http2Stream {
   -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
   -- to chunk and send naively according to server\'s preferences. This function
   -- can be useful if you intend to handle the framing yourself.
-  , _waitPushPromise :: PushPromiseHandler () -> IO ()
+  , _waitPushPromise :: PushPromiseHandler -> IO ()
   }
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
@@ -214,8 +214,8 @@ data Http2Stream = Http2Stream {
 -- The StreamId corresponds to the parent stream as PUSH_PROMISEs are tied to a
 -- client-initiated stream. Longer term we may move passing this handler to the
 -- '_startStream' instead of 'newHttp2Client' (as it is for now).
-type PushPromiseHandler a =
-    StreamId -> Http2Stream -> IncomingFlowControl -> OutgoingFlowControl -> IO a
+type PushPromiseHandler =
+    StreamId -> Http2Stream -> IncomingFlowControl -> OutgoingFlowControl -> IO ()
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext {
@@ -378,8 +378,7 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     let _sendDataChunk  = sendDataFrame frameStream
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
-    let _waitPushPromise :: PushPromiseHandler () -> IO ()
-        _waitPushPromise ppHandler = do
+    let _waitPushPromise ppHandler = do
             (_,ppSid) <- waitPushPromiseWithParentStreamId sid pushPromises
             let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream)
             ppCont <- initializeStream conn

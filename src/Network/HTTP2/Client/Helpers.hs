@@ -41,6 +41,6 @@ waitStream stream streamFlowControl = do
 -- | Sequentially every push-promise with a handler.
 --
 -- This function runs forever and you should wrap it with 'withAsync'.
-onPushPromise :: Http2Stream -> PushPromiseHandler () -> IO ()
+onPushPromise :: Http2Stream -> PushPromiseHandler -> IO ()
 onPushPromise stream handler = forever $ do
     _waitPushPromise stream handler
