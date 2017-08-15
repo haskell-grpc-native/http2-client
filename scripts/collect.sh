@@ -8,6 +8,7 @@ query() {
 
   http2-client-exe \
 	--initial-window-kick 10000000 \
+	--delay-before-quitting-ms 2000 \
 	--verb $verb \
 	--host $host \
 	--port $port \
