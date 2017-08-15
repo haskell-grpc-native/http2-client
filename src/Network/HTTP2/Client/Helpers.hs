@@ -11,13 +11,26 @@ import           Control.Monad (forever)
 
 import Network.HTTP2.Client
 
-type PingReply = (UTCTime, UTCTime, Either () (HTTP2.FrameHeader, HTTP2.FramePayload))
+-- | Opaque type to express an action which timed out.
+data TimedOut = TimedOut
+  deriving Show
 
-ping :: Int -> ByteString -> Http2Client -> IO PingReply
-ping timeout msg conn = do
+-- | Result for a 'ping'.
+type PingReply = (UTCTime, UTCTime, Either TimedOut (HTTP2.FrameHeader, HTTP2.FramePayload))
+
+-- | Performs a 'ping' and waits for a reply up to a given timeout (in
+-- microseconds).
+ping :: Http2Client
+     -- ^ client connection
+     -> Int
+     -- ^ timeout in microseconds
+     -> ByteString
+     -- ^ 8-bytes message to uniquely identify the reply
+     -> IO PingReply
+ping conn timeout msg = do
     t0 <- getCurrentTime
     waitPing <- _ping conn msg
-    pingReply <- race (threadDelay timeout) waitPing
+    pingReply <- race (threadDelay timeout >> return TimedOut) waitPing
     t1 <- getCurrentTime
     return $ (t0, t1, pingReply)
 

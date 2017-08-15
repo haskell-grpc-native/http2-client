@@ -134,7 +134,7 @@ client QueryArgs{..} = do
 
     _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
         threadDelay _interPingDelay
-        (t0, t1, pingReply) <- ping _pingTimeout "pingpong" conn
+        (t0, t1, pingReply) <- ping conn _pingTimeout "pingpong"
         timePrint $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
     let go 0 idx = timePrint $ "done worker: " <> show idx
