@@ -351,7 +351,7 @@ initializeStream
   -> IORef ConnectionSettings
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> Chan (StreamId, StreamId)
+  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId)
   -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
@@ -388,11 +388,11 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
     let _waitPushPromise ppHandler = do
-            (_,ppSid) <- waitPushPromiseWithParentStreamId sid pushPromises
+            (_,ppFrames,ppSid) <- waitPushPromiseWithParentStreamId sid pushPromises
             let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream)
             ppCont <- initializeStream conn
                                        settings
-                                       serverFrames
+                                       ppFrames
                                        serverHeaders
                                        serverPushPromises
                                        hpackEncoder
@@ -476,7 +476,7 @@ incomingHPACKFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> Chan (StreamId, StreamId)
+  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId)
   -> DynamicTable
   -> IO ()
 incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
@@ -487,8 +487,11 @@ incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
                                     frames
     (sId, pattern) <- case fp of
             PushPromiseFrame sid hbf -> do
+                -- Important: We duplicate the channel here or we risk losing
+                -- DATA frames sent over the stream.
+                ppChan <- dupChan frames
                 let parentSid = HTTP2.streamId fh
-                writeChan pushPromises (parentSid, sid)
+                writeChan pushPromises (parentSid, ppChan, sid)
                 return (sid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
                 return (HTTP2.streamId fh, Right hbf)
@@ -749,13 +752,13 @@ waitHeaders test chan =
 
 waitPushPromiseWithParentStreamId
   :: StreamId
-  -> Chan (StreamId, StreamId)
-  -> IO (StreamId, StreamId)
+  -> Chan (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId)
+  -> IO (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId)
 waitPushPromiseWithParentStreamId sid chan =
     loop
   where
     loop = do
-        pair@(parentSid,_) <- readChan chan
+        tuple@(parentSid,_,_) <- readChan chan
         if parentSid == sid
-        then return pair
+        then return tuple
         else loop
