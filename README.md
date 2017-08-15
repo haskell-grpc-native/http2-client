@@ -104,8 +104,13 @@ should be applied _before_ ACK-ing the SETTING frame. Meanwhile settings that
 move in the "looser direction" (e.g., more concurrency) should be applied
 _after_ ACK-ing the SETTINGS frame.
 
-For simplicity of implementation, the current design apply SETTINGS:
-- (client prefs) before sending SETTINGS, irrespective of ACK -- we should change this
+The current design apply SETTINGS:
+- (client prefs) after receiving a ACK for sent SETTINGS, you get the choice to
+  wait for an ACK or wait in a thread, but you must wait for an ACK to apply
+  changed settings (the `_settings` function will return an IO to wait for the
+  ACK and apply settings). Note that the initial SETTINGS change frame is
+  waited for in a thread without library's user intervention (if you feel
+  strongly against this choice, please open a bug).
 - (server prefs) immediately after receiving and hence before sending ACK-SETTINGS
 
 Fortunately, changing settings mid-stream is probably a rare behavior and the
@@ -126,8 +131,8 @@ Otherwise, you can ask help by creating an Issue on the bug-tracker.
 
 A number of HTTP2 features are currently hardcoded:
 - PINGs are replied-to immediately (i.e., a server could hog a connection with PINGs)
-- received SETTINGS are acknowledged immediately after being taken into account
-- sent SETTINGS are implemented immediately before sending, and not after acking
+- the initial SETTINGS frame sent to the server is waited-for in a separate
+  thread, settings are applied to the connection when the server ACKs the frame
 - flow-control from DATA frames is decremented immediately when received (in a
   separate thread) rather than when consumed from the client
 - similarly, flow-control re-increment every DATA received as soon as it is
@@ -184,11 +189,7 @@ The current implementation follows the HTTP2 standard except for the following:
 
 ### Various TODO
 
-- modify client SETTINGS only when acknowledged
-  * currently make use of new client settings before the server has time to
-    know them, this can lead to errors due to inconsistent view of settings
-    between sender/receiver
-- consider a beter frame-subscription mechanism than broadcast wake-up
+- consider a better frame-subscription mechanism than broadcast wake-up
   * current system of dupChan everything is prone to errors and may be costly
     CPU/latency-wise if the concurrency is high
 - consider most performant functions for HTTP2.HPACK encoding/decoding
