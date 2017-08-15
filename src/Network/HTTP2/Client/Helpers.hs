@@ -21,8 +21,17 @@ ping timeout msg conn = do
     t1 <- getCurrentTime
     return $ (t0, t1, pingReply)
 
+-- | Result containing the unpacked headers and all frames received in on a
+-- stream. See 'StreamResponse' and 'fromStreamResult' to get a higher-level
+-- utility.
 type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString])
 
+-- | An HTTP2 response, once fully received, is made of headers and a payload.
+type StreamResponse = (HPACK.HeaderList, ByteString)
+
+-- | Wait for a stream until completion.
+--
+-- This function is fine if you don't want to consume results in chunks.
 waitStream :: Http2Stream -> IncomingFlowControl -> IO StreamResult
 waitStream stream streamFlowControl = do
     (_,_,hdrs) <- _waitHeaders stream
@@ -37,6 +46,14 @@ waitStream stream streamFlowControl = do
         else do
             _ <- _updateWindow $ streamFlowControl
             moredata (x:xs)
+
+-- | Converts a StreamResult to a StramResponse, stopping at the first error
+-- using the `Either HTTP2.ErrorCode` monad.
+fromStreamResult :: StreamResult -> Either HTTP2.ErrorCode StreamResponse
+fromStreamResult (headersE, chunksE) = do
+    headers <- headersE
+    chunks <- sequence chunksE
+    return (headers, mconcat chunks)
 
 -- | Sequentially every push-promise with a handler.
 --
