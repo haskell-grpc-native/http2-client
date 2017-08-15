@@ -2,6 +2,8 @@
 
 An native-Haskell HTTP2 client library based on `http2` and `tls` packages.
 
+Hackage: https://hackage.haskell.org/package/http2-client .
+
 ## General design
 
 HTTP2 is a heavy protocol. HTTP2 features pipelining, query and responses
@@ -29,16 +31,36 @@ before returning whereas `Network.HTTP2.Client` users will have to take chunks
 one at a time. We look forward to the linear arrows extension for improving the
 library design.
 
+### Versioning and GHC support
+
+We try to follow https://pvp.haskell.org/ as `a.b.c.d` with the caveat that if
+`a=0` then we are still slightly unhappy with some APIs and we'll break things
+arbitrarily.
+
+We aim at supporting GHC-8.x, contributions to support GHC-7.x are welcome.
+
+### Installation
+
+This package is a standard `Stack` project, please also refer to Stack's
+documentation if you have trouble installing or using this package.  Please
+also have a look at the Hackage Matrix CI:
+https://matrix.hackage.haskell.org/package/http2-client .
+
 ## Usage
 
 First, make sure you are somewhat familiar with HTTP and HTTP2 standards by
 reading RFCs or Wikipedia pages. If you use the library, feel free to shoot me
 an e-mail (cf. commits) or a tweet @lucasdicioccio .
 
-### Installation
+### Help and examples
 
-This package is a standard `Stack` project, please also refer to Stack's
-documentation if you have trouble installing or using this package.
+We currently provide a command-line example client: `http2-client-exe` which I
+use as a test client and you could use to test various flow-control parameters.
+Read `app/Main.hs` and `src/Network/HTTP2/Client/Helpers.hs` to look at how a
+user application is implemented.
+
+The Haddocks should have plenty implementation details, so please have a look.
+Otherwise, you can ask help by creating an Issue on the bug-tracker.
 
 ### Opening a stream
 
@@ -116,16 +138,6 @@ The current design apply SETTINGS:
 Fortunately, changing settings mid-stream is probably a rare behavior and the
 default SETTINGS are large enough to avoid creating fatal errors before
 sending/receiving the initial SETTINGS frames.
-
-## Help and examples
-
-We currently provide a command-line example client: `http2-client-exe` which I
-use as a test client and you could use to test various flow-control parameters.
-Read `app/Main.hs` and `src/Network/HTTP2/Client/Helpers.hs` to look at how a
-user application is implemented.
-
-The Haddocks should have plenty implementation details, so please have a look.
-Otherwise, you can ask help by creating an Issue on the bug-tracker.
 
 ## Things that are hardcoded
 
