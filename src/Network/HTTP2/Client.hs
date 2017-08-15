@@ -10,6 +10,7 @@ module Network.HTTP2.Client (
     -- * Starting streams
     , StreamDefinition(..)
     , StreamStarter
+    , TooMuchConcurrency(..)
     , StreamThread
     , Http2Stream(..)
     -- * Sending data for POSTs.
