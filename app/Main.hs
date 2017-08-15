@@ -111,7 +111,7 @@ client QueryArgs{..} = do
                           , (":authority", ByteString.pack _host)
                           ] <> _extraHeaders
 
-    let onPushPromise _ stream streamFlowControl _ = void $ forkIO $ do
+    let ppHandler _ stream streamFlowControl _ = void $ forkIO $ do
             timePrint ("push stream started" :: String)
             waitStream stream streamFlowControl >>= timePrint
             timePrint ("push stream ended" :: String)
@@ -125,7 +125,7 @@ client QueryArgs{..} = do
                ]
     timePrint conf
 
-    conn <- newHttp2Client _host _port _encoderBufsize _decoderBufsize tlsParams conf onPushPromise
+    conn <- newHttp2Client _host _port _encoderBufsize _decoderBufsize tlsParams conf
     _addCredit (_incomingFlowControl conn) _initialWindowKick
     _ <- forkIO $ forever $ do
             updated <- _updateWindow $ _incomingFlowControl conn
@@ -142,6 +142,7 @@ client QueryArgs{..} = do
             _ <- (_startStream conn $ \stream ->
                     let initStream = _headers stream headersPairs (HTTP2.setEndStream)
                         handler streamFlowControl _ = do
+                            _ <- async $ onPushPromise stream ppHandler
                             timePrint $ "stream started " <> show (idx, n)
                             waitStream stream streamFlowControl >>= timePrint
                             timePrint $ "stream ended " <> show (idx, n)

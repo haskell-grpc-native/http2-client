@@ -160,8 +160,6 @@ GitHub: https://github.com/lucasdicioccio/http2-client/issues .
 
 I think the fundamental are right but the following needs tweaking:
 
-- onPushPromise handlers will be requested when opening new streams rather than
-  when opening new connections
 - function to reset a stream will likely be blocking until a RST/EndStream is
   received so that all DATA frames are accounted for in the flow-control system
 - need a way to hook custom flow-control algorithms
