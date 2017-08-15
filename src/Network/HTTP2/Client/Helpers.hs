@@ -68,7 +68,7 @@ fromStreamResult (headersE, chunksE) = do
     chunks <- sequence chunksE
     return (headers, mconcat chunks)
 
--- | Sequentially every push-promise with a handler.
+-- | Sequentially wait for every push-promise with a handler.
 --
 -- This function runs forever and you should wrap it with 'withAsync'.
 onPushPromise :: Http2Stream -> PushPromiseHandler -> IO ()
