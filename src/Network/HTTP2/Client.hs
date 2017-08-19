@@ -4,10 +4,16 @@
 
 -- | This module defines a set of low-level primitives for starting an HTTP2
 -- session and interacting with a server.
+--
+-- For higher-level primitives, please refer to Network.HTTP2.Client.Helpers .
 module Network.HTTP2.Client (
-    -- * Creating a client
-      Http2Client(..)
-    , newHttp2Client
+    -- * Basics
+      newHttp2Client
+    , withHttp2Stream
+    , headers
+    , sendData
+    -- * Starting streams
+    , Http2Client(..)
     , PushPromiseHandler
     -- * Starting streams
     , StreamDefinition(..)
@@ -15,12 +21,11 @@ module Network.HTTP2.Client (
     , TooMuchConcurrency(..)
     , StreamThread
     , Http2Stream(..)
-    -- * Sending data for POSTs.
-    , sendData
     -- * Flow control
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
     -- * Misc.
+    , FlagSetter
     , wrapFrameClient
     , _gtfo
     -- * Convenience re-exports
@@ -249,6 +254,44 @@ newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings = 
     conn <- newHttp2FrameConnection host port tlsParams
     wrapFrameClient conn encoderBufSize decoderBufSize initSettings
 
+-- | Starts a new stream (i.e., one HTTP request + server-pushes).
+--
+-- You will typically call the returned 'StreamStarter' immediately to define
+-- what you want to do with the Http2Stream.
+--
+-- @ _ <- (withHttp2Stream myClient $ \stream -> StreamDefinition _ _) @
+--
+-- Please refer to 'StreamStarter' and 'StreamDefinition' for more.
+withHttp2Stream :: Http2Client -> StreamStarter a
+withHttp2Stream = _startStream
+
+-- | Type synonym for functions that modify flags.
+--
+-- Typical FlagSetter for library users are HTTP2.setEndHeader when sending
+-- headers HTTP2.setEndStream to signal that there the client is not willing to
+-- send more data.
+--
+-- We might use Endo in the future.
+type FlagSetter = FrameFlags -> FrameFlags
+
+-- | Sends the HTTP2+HTTP headers of your chosing.
+--
+-- You must add HTTP2 pseudo-headers first, followed by your typical HTTP
+-- headers. This function makes no verification of this
+-- ordering/exhaustinevess.
+--
+-- HTTP2 pseudo-headers replace the HTTP verb + parsed url as follows:
+-- ":method" such as "GET",
+-- ":scheme" such as "https",
+-- ":path" such as "/blog/post/1234?foo=bar",
+-- ":authority" such as "haskell.org"
+--
+-- Note that we currently enforce the 'HTTP2.setEndHeader' but this design
+-- choice may change in the future. Hence, we recommend you use
+-- 'HTTP2.setEndHeader' as well.
+headers :: Http2Stream -> HeaderList -> FlagSetter -> IO StreamThread
+headers = _headers
+
 -- | Prepares a client around a frame connection.
 --
 -- This is mostly useful if you want to muck around the Http2FrameConnection
@@ -381,7 +424,7 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     -- Register interest in frames.
     frames  <- dupChan serverFrames
     credits <- dupChan serverFrames
-    headers <- dupChan serverHeaders
+    headersFrames <- dupChan serverHeaders
     pushPromises <- dupChan serverPushPromises
 
     -- Builds a flow-control context.
@@ -392,7 +435,7 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     let _headers headersList flags = do
             splitter <- settingsPayloadSplitter <$> readIORef settings
             sendHeaders frameStream hpackEncoder headersList splitter flags
-    let _waitHeaders  = waitHeadersWithStreamId sid headers
+    let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
@@ -498,7 +541,7 @@ incomingHPACKFramesLoop
   -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId)
   -> DynamicTable
   -> IO ()
-incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
+incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -532,11 +575,11 @@ incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
                         go lastFh (Left err)
                     _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
             else do
-                hdrs <- decodeHeader hpackDecoder buffer
-                writeChan headers (curFh, sId, Right hdrs)
+                newHdrs <- decodeHeader hpackDecoder buffer
+                writeChan hdrs (curFh, sId, Right newHdrs)
 
         go curFh (Left err) =
-                writeChan headers (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
+                writeChan hdrs (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
 
     go fh pattern
 
@@ -616,8 +659,8 @@ sendHeaders
   -> PayloadSplitter
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
-sendHeaders s enc headers blockSplitter flagmod = do
-    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
+sendHeaders s enc hdrs blockSplitter flagmod = do
+    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc hdrs
     let framers           = (HeadersFrame Nothing) : repeat ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
     let modifiersReversed = (HTTP2.setEndHeader . flagmod) : repeat id
@@ -645,7 +688,26 @@ fixedSizeChunks len bstr =
       in
         chunk : fixedSizeChunks len rest
 
-sendData :: Http2Client -> Http2Stream -> (FrameFlags -> FrameFlags) -> ByteString -> IO ()
+-- | Sends data, chunked according to the server's preferred chunk size.
+--
+-- This function does not respect HTTP2 flow-control and send chunks
+-- sequentially. Hence, you should first ensure that you have enough
+-- flow-control credit (with '_withdrawCredit') or risk a connection failure.
+-- When you call _withdrawCredit keep in mind that HTTP2 has flow control at
+-- the stream and at the connection level. If you use `http2-client` in a
+-- multithreaded conext, you should avoid starving the connection-level
+-- flow-control.
+--
+-- If you want to send bytestrings that fit in RAM, you can use
+-- 'Network.HTTP2.Client.Helpers.upload' as a function that implements
+-- flow-control.
+--
+-- This function does not send frames back-to-back, that is, other frames may
+-- get interleaved between two chunks (for instance, to give priority to other
+-- streams, although no priority queue exists in `http2-client` so far).
+--
+-- Please refer to '_sendDataChunk' and '_withdrawCredit' as well.
+sendData :: Http2Client -> Http2Stream -> FlagSetter -> ByteString -> IO ()
 sendData conn stream flagmod dat = do
     splitter <- _paylodSplitter conn
     let chunks = splitter dat
@@ -766,8 +828,8 @@ waitHeaders test chan =
     loop
   where
     loop = do
-        tuple@(fH, sId, headers) <- readChan chan
-        if test fH sId headers
+        tuple@(fH, sId, hdrs) <- readChan chan
+        if test fH sId hdrs
         then return tuple
         else loop
 
