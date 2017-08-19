@@ -21,6 +21,7 @@ module Network.HTTP2.Client (
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
     -- * Misc.
+    , wrapFrameClient
     , _gtfo
     -- * Convenience re-exports
     , module Network.HTTP2.Client.FrameConnection
@@ -47,35 +48,8 @@ import           Network.TLS (ClientParams)
 
 import           Network.HTTP2.Client.FrameConnection
 
-{- $ GET over HTTP2
- 
-> import Network.HTTP2.Client
-> import Network.HTTP2.Client.Helpers
-> 
-> main :: IO ()
-> main = do
->     let requestHeaders = [ (":method", "GET")
->                          , (":scheme", "https")
->                          , (":path", "?q=http2")
->                          , (":authority", "www.google.com")
->                          ]
->     
->     conn <- newHttp2Client "www.google.com" 443 8192 8192 (defaultParamsClient host "") [(HTTP2.SettingsInitialWindowSize,10000000)]
->     let fc = _incomingFlowControl conn
->     _addCredit fc 10000000
->     _updateWindow fc
->     _ <- _startStream conn $ \stream ->
->         let
->           initStream = _headers stream requestHeaders (HTTP2.setEndHeader . HTTP2.setEndStream)
->           handler sfc _ = do
->               waitStream stream sfc >>= print . fromStreamResult
->         in 
->           StreamDefinition initStream handler
->
--}
-
 -- | Offers credit-based flow-control.
--- 
+--
 -- Any mutable changes are atomic and hence work as intended in a multithreaded
 -- setup.
 --
@@ -175,7 +149,7 @@ data Http2Client = Http2Client {
   -- received. Hence we recommend wrapping this IO in an Async (e.g., with
   -- @race (threadDelay timeout)@.)
   , _goaway           :: ErrorCodeId -> ByteString -> IO ()
-  -- ^ Sends a GOAWAY. 
+  -- ^ Sends a GOAWAY.
   , _startStream      :: forall a. StreamStarter a
   -- ^ Spawns new streams. See 'StreamStarter'.
   , _incomingFlowControl :: IncomingFlowControl
@@ -272,9 +246,25 @@ newHttp2Client :: HostName
                -- ^ Initial SETTINGS that are sent as first frame.
                -> IO Http2Client
 newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings = do
-    -- network connection
     conn <- newHttp2FrameConnection host port tlsParams
+    wrapFrameClient conn encoderBufSize decoderBufSize initSettings
 
+-- | Prepares a client around a frame connection.
+--
+-- This is mostly useful if you want to muck around the Http2FrameConnection
+-- (e.g., for tracing frames) as well as for unit testing purposes. If you want
+-- to create a new connection you should likely use 'newHttp2Client' instead.
+wrapFrameClient
+  :: Http2FrameConnection
+  -- ^ A frame connection.
+  -> Int
+  -- ^ The buffersize for the Network.HPACK encoder.
+  -> Int
+  -- ^ The buffersize for the Network.HPACK decoder.
+  -> SettingsList
+  -- ^ Initial SETTINGS that are sent as first frame.
+  -> IO Http2Client
+wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
     -- prepare hpack contexts
     hpackEncoder <- do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
