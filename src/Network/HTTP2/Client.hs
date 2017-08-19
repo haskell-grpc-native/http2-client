@@ -2,6 +2,8 @@
 {-# LANGUAGE RankNTypes         #-}
 {-# LANGUAGE OverloadedStrings  #-}
 
+-- | This module defines a set of low-level primitives for starting an HTTP2
+-- session and interacting with a server.
 module Network.HTTP2.Client (
     -- * Creating a client
       Http2Client(..)
@@ -44,6 +46,33 @@ import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
 
 import           Network.HTTP2.Client.FrameConnection
+
+{- $ GET over HTTP2
+ 
+> import Network.HTTP2.Client
+> import Network.HTTP2.Client.Helpers
+> 
+> main :: IO ()
+> main = do
+>     let requestHeaders = [ (":method", "GET")
+>                          , (":scheme", "https")
+>                          , (":path", "?q=http2")
+>                          , (":authority", "www.google.com")
+>                          ]
+>     
+>     conn <- newHttp2Client "www.google.com" 443 8192 8192 (defaultParamsClient host "") [(HTTP2.SettingsInitialWindowSize,10000000)]
+>     let fc = _incomingFlowControl conn
+>     _addCredit fc 10000000
+>     _updateWindow fc
+>     _ <- _startStream conn $ \stream ->
+>         let
+>           initStream = _headers stream requestHeaders (HTTP2.setEndHeader . HTTP2.setEndStream)
+>           handler sfc _ = do
+>               waitStream stream sfc >>= print . fromStreamResult
+>         in 
+>           StreamDefinition initStream handler
+>
+-}
 
 -- | Offers credit-based flow-control.
 -- 
