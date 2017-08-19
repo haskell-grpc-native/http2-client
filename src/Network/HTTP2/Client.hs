@@ -424,7 +424,7 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     -- Register interest in frames.
     frames  <- dupChan serverFrames
     credits <- dupChan serverFrames
-    headers <- dupChan serverHeaders
+    headersFrames <- dupChan serverHeaders
     pushPromises <- dupChan serverPushPromises
 
     -- Builds a flow-control context.
@@ -435,7 +435,7 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     let _headers headersList flags = do
             splitter <- settingsPayloadSplitter <$> readIORef settings
             sendHeaders frameStream hpackEncoder headersList splitter flags
-    let _waitHeaders  = waitHeadersWithStreamId sid headers
+    let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
@@ -541,7 +541,7 @@ incomingHPACKFramesLoop
   -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId)
   -> DynamicTable
   -> IO ()
-incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
+incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -575,11 +575,11 @@ incomingHPACKFramesLoop frames headers pushPromises hpackDecoder = forever $ do
                         go lastFh (Left err)
                     _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
             else do
-                hdrs <- decodeHeader hpackDecoder buffer
-                writeChan headers (curFh, sId, Right hdrs)
+                newHdrs <- decodeHeader hpackDecoder buffer
+                writeChan hdrs (curFh, sId, Right newHdrs)
 
         go curFh (Left err) =
-                writeChan headers (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
+                writeChan hdrs (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
 
     go fh pattern
 
@@ -659,8 +659,8 @@ sendHeaders
   -> PayloadSplitter
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
-sendHeaders s enc headers blockSplitter flagmod = do
-    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc headers
+sendHeaders s enc hdrs blockSplitter flagmod = do
+    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc hdrs
     let framers           = (HeadersFrame Nothing) : repeat ContinuationFrame
     let frames            = zipWith ($) framers headerBlockFragments
     let modifiersReversed = (HTTP2.setEndHeader . flagmod) : repeat id
@@ -828,8 +828,8 @@ waitHeaders test chan =
     loop
   where
     loop = do
-        tuple@(fH, sId, headers) <- readChan chan
-        if test fH sId headers
+        tuple@(fH, sId, hdrs) <- readChan chan
+        if test fH sId hdrs
         then return tuple
         else loop
 

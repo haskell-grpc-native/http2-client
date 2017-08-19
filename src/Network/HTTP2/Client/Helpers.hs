@@ -134,9 +134,9 @@ waitStream stream streamFlowControl = do
 -- using the `Either HTTP2.ErrorCode` monad.
 fromStreamResult :: StreamResult -> Either HTTP2.ErrorCode StreamResponse
 fromStreamResult (headersE, chunksE) = do
-    headers <- headersE
+    hdrs <- headersE
     chunks <- sequence chunksE
-    return (headers, mconcat chunks)
+    return (hdrs, mconcat chunks)
 
 -- | Sequentially wait for every push-promise with a handler.
 --
