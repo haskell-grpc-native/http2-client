@@ -22,6 +22,13 @@ import Network.HTTP2.Client.Helpers
 type Path = ByteString
 type Verb = ByteString
 
+data PostData = PostBytestring !ByteString | PostFileContent FilePath
+  deriving Show
+
+postDataForString :: String -> PostData
+postDataForString ('@':filepath) = PostFileContent filepath
+postDataForString content        = PostBytestring (ByteString.pack content)
+
 data ServerPushSwitch = PushEnabled | PushDisabled
   deriving Show
 
@@ -31,6 +38,7 @@ data QueryArgs = QueryArgs {
   , _verb                    :: !Verb
   , _path                    :: !Path
   , _extraHeaders            :: ![(ByteString, ByteString)]
+  , _postData                :: !(Maybe PostData)
   , _interPingDelay          :: !Int
   , _pingTimeout             :: !Int
   , _interFlowControlUpdates :: !Int
@@ -56,6 +64,7 @@ clientArgs =
         <*> verb
         <*> path
         <*> extraHeaders
+        <*> postData
         <*> milliseconds "inter-ping-delay-ms" 0
         <*> milliseconds "ping-timeout-ms" 5000
         <*> milliseconds "inter-flow-control-updates-ms" 1000
@@ -81,6 +90,7 @@ clientArgs =
     port = option auto (long "port" <> value 443)
     verb = bstrOption (long "verb" <> value "GET")
     extraHeaders = many (fmap keyval $ bstrOption (short 'H'))
+    postData = optional (fmap postDataForString (strOption (short 'd')))
     concurrency = option auto (long "max-concurrency" <> value 100)
     allowPush = flag PushEnabled PushDisabled (long "disable-server-push")
     frameBytes = option auto (long "max-frame-size" <> value 1048576)
@@ -101,9 +111,49 @@ main = execParser opts >>= client
       , header "http2-client-exe: a CLI HTTP2 client written in Haskell"
       ])
 
+upload :: ByteString
+       -> Http2Client
+       -> OutgoingFlowControl
+       -> Http2Stream
+       -> OutgoingFlowControl
+       -> IO ()
+upload "" conn _ stream _ = do
+    sendData conn stream HTTP2.setEndStream ""
+upload dat conn connectionFlowControl stream streamFlowControl = do
+    let wanted = ByteString.length dat
+
+    gotStream <- _withdrawCredit streamFlowControl wanted
+    got       <- _withdrawCredit connectionFlowControl gotStream
+    -- Recredit the stream flow control with the excedent we cannot spend on
+    -- the the connection.
+    _receiveCredit streamFlowControl (gotStream - got)
+
+    let uploadChunks flagMod = sendData conn stream flagMod (ByteString.take got dat)
+
+    if got == wanted
+    then uploadChunks HTTP2.setEndStream
+    else do
+        uploadChunks id
+        upload (ByteString.drop got dat) conn connectionFlowControl stream streamFlowControl
+
 client :: QueryArgs -> IO ()
 client QueryArgs{..} = do
     hSetBuffering stdout LineBuffering
+
+    -- If we need to post data then we prepare an upload function.
+    -- Otherwise the function does nothing but we tell the server that we are
+    -- finished with the stream after HTTP headers.
+    --
+    -- Note that this implementation reads the body from files and into memory
+    -- (better for testing concurrency, worse for large uploads).
+    (headersFlags, dataPostFunction) <- case _postData of
+        (Just (PostBytestring dataPayload)) ->
+            return $ (id, upload dataPayload)
+        (Just (PostFileContent filepath))   -> do
+            dataPayload <- ByteString.readFile filepath
+            return $ (id, upload dataPayload)
+        Nothing ->
+            return $ (HTTP2.setEndStream, \_ _ _ _ -> return ())
 
     let headersPairs    = [ (":method", _verb)
                           , (":scheme", "https")
@@ -140,11 +190,15 @@ client QueryArgs{..} = do
     let go 0 idx = timePrint $ "done worker: " <> show idx
         go n idx = do
             _ <- (_startStream conn $ \stream ->
-                    let initStream = _headers stream headersPairs (HTTP2.setEndStream)
-                        handler streamFlowControl _ = do
+                    let initStream = _headers stream headersPairs headersFlags
+                        handler streamINFlowControl streamOUTFlowControl = do
                             _ <- async $ onPushPromise stream ppHandler
                             timePrint $ "stream started " <> show (idx, n)
-                            waitStream stream streamFlowControl >>= timePrint . fromStreamResult
+                            _ <- async $ dataPostFunction conn
+                                                          (_outgoingFlowControl conn)
+                                                          stream
+                                                          streamOUTFlowControl
+                            waitStream stream streamINFlowControl >>= timePrint . fromStreamResult
                             timePrint $ "stream ended " <> show (idx, n)
                     in StreamDefinition initStream handler)
             go (n - 1) idx
