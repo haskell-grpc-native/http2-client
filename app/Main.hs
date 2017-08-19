@@ -164,8 +164,8 @@ client QueryArgs{..} = do
 
     let go 0 idx = timePrint $ "done worker: " <> show idx
         go n idx = do
-            _ <- (_startStream conn $ \stream ->
-                    let initStream = _headers stream headersPairs headersFlags
+            _ <- (withHttp2Stream conn $ \stream ->
+                    let initStream = headers stream headersPairs headersFlags
                         handler streamINFlowControl streamOUTFlowControl = do
                             _ <- async $ onPushPromise stream ppHandler
                             timePrint $ "stream started " <> show (idx, n)
