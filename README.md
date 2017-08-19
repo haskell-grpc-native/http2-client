@@ -54,10 +54,12 @@ an e-mail (cf. commits) or a tweet @lucasdicioccio .
 
 ### Help and examples
 
-We currently provide a command-line example client: `http2-client-exe` which I
-use as a test client and you could use to test various flow-control parameters.
-Read `app/Main.hs` and `src/Network/HTTP2/Client/Helpers.hs` to look at how a
-user application is implemented.
+Please see some literate Haskell documents in the `examples/` directory.  For
+a more involved usage, we currently provide a command-line example client:
+`http2-client-exe` which I use as a test client and you could use to test
+various flow-control parameters.  Read `app/Main.hs` and
+`src/Network/HTTP2/Client/Helpers.hs` to look at how a user application is
+implemented.
 
 The Haddocks should have plenty implementation details, so please have a look.
 Otherwise, you can ask help by creating an Issue on the bug-tracker.
