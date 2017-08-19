@@ -54,7 +54,7 @@ initialize the stream then we wait for a reply (i.e., we handle the reply).  If
 you were sending an HTTP POST you would be sending data from the client to the
 server, which requires outbound flow-control too.
 
->     _ <- _startStream conn $ \stream ->
+>     _ <- withHttp2Stream conn $ \stream ->
 >         let
 
 For a simple HTTP GET, the headers constitute the whole query. We don't plan to
@@ -63,7 +63,7 @@ the headers are sent (so that the server can start generating a response). We
 also tell the server that we're not gonna send more data with the setEndStream
 flag.
 
->           initStream = _headers stream requestHeaders (setEndHeader . setEndStream)
+>           initStream = headers stream requestHeaders (setEndHeader . setEndStream)
 
 The handler uses the high-level waitStream, which blocks and waits for the
 whole query result. The fromStreamResult coalesces every single frames from the
