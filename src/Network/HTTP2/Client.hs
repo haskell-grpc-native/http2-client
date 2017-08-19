@@ -559,7 +559,8 @@ newOutgoingFlowControl ::
 newOutgoingFlowControl settings sid frames = do
     credit <- newIORef 0
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
-    let withdraw n = do
+    let withdraw 0 = return 0
+        withdraw n = do
             base <- initialWindowSize . _serverSettings <$> readIORef settings
             got <- atomicModifyIORef' credit (\c ->
                     if base + c >= n
