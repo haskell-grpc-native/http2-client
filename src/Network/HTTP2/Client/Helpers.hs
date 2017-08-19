@@ -1,6 +1,25 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Network.HTTP2.Client.Helpers where
+-- | A toolbox with high-level functions to interact with an established HTTP2
+-- conection.
+--
+-- These helpers make the assumption that you want to work in a multi-threaded
+-- environment and that you want to send and receiving whole HTTP requests at
+-- once (i.e., you do not care about streaming individual HTTP
+-- requests/responses but want to make many requests).
+module Network.HTTP2.Client.Helpers (
+  -- * Sending and receiving HTTP body
+    upload
+  , waitStream
+  , fromStreamResult 
+  , onPushPromise
+  , StreamResult
+  , StreamResponse
+  -- * Diagnostics
+  , ping
+  , TimedOut
+  , PingReply
+  ) where
 
 import           Data.Time.Clock (UTCTime, getCurrentTime)
 import qualified Network.HTTP2 as HTTP2
@@ -93,7 +112,9 @@ upload dat conn connectionFlowControl stream streamFlowControl = do
 
 -- | Wait for a stream until completion.
 --
--- This function is fine if you don't want to consume results in chunks.
+-- This function is fine if you don't want to consume results in chunks.  See
+-- 'fromStreamResult' to collect the complicated 'StreamResult' into a simpler
+-- 'StramResponse'.
 waitStream :: Http2Stream -> IncomingFlowControl -> IO StreamResult
 waitStream stream streamFlowControl = do
     (_,_,hdrs) <- _waitHeaders stream
