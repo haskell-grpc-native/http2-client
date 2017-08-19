@@ -128,10 +128,12 @@ upload dat conn connectionFlowControl stream streamFlowControl = do
     -- the the connection.
     _receiveCredit streamFlowControl (gotStream - got)
 
-    let uploadChunks flagMod = sendData conn stream flagMod (ByteString.take got dat)
+    let uploadChunks flagMod =
+            sendData conn stream flagMod (ByteString.take got dat)
 
     if got == wanted
-    then uploadChunks HTTP2.setEndStream
+    then
+        uploadChunks HTTP2.setEndStream
     else do
         uploadChunks id
         upload (ByteString.drop got dat) conn connectionFlowControl stream streamFlowControl

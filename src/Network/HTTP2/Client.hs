@@ -630,6 +630,7 @@ sendData conn stream flagmod dat = do
     splitter <- _paylodSplitter conn
     let chunks = splitter dat
     let pairs  = reverse $ zip (flagmod : repeat id) (reverse chunks)
+    when (null chunks) $ _sendDataChunk stream flagmod ""
     forM_ pairs $ \(flags, chunk) -> _sendDataChunk stream flags chunk
 
 sendDataFrame
