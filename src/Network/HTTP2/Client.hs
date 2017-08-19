@@ -559,7 +559,8 @@ newOutgoingFlowControl ::
 newOutgoingFlowControl settings sid frames = do
     credit <- newIORef 0
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
-    let withdraw n = do
+    let withdraw 0 = return 0
+        withdraw n = do
             base <- initialWindowSize . _serverSettings <$> readIORef settings
             got <- atomicModifyIORef' credit (\c ->
                     if base + c >= n
@@ -630,6 +631,7 @@ sendData conn stream flagmod dat = do
     splitter <- _paylodSplitter conn
     let chunks = splitter dat
     let pairs  = reverse $ zip (flagmod : repeat id) (reverse chunks)
+    when (null chunks) $ _sendDataChunk stream flagmod ""
     forM_ pairs $ \(flags, chunk) -> _sendDataChunk stream flags chunk
 
 sendDataFrame
