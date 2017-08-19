@@ -3,9 +3,10 @@
 {-# LANGUAGE RankNTypes  #-}
 
 module Network.HTTP2.Client.FrameConnection (
-      Http2FrameConnection
+      Http2FrameConnection(..)
     , newHttp2FrameConnection
     -- * Interact at the Frame level.
+    , Http2ServerStream(..)
     , Http2FrameClientStream(..)
     , makeFrameClientStream
     , sendOne
