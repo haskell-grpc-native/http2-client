@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 
 module Network.HTTP2.Client.Helpers where
 
@@ -5,6 +6,7 @@ import           Data.Time.Clock (UTCTime, getCurrentTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.HPACK as HPACK
 import           Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Async (race)
 import           Control.Monad (forever)
@@ -41,6 +43,53 @@ type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.Erro
 
 -- | An HTTP2 response, once fully received, is made of headers and a payload.
 type StreamResponse = (HPACK.HeaderList, ByteString)
+
+-- | Uploads a whole HTTP body at a time.
+--
+-- This function should be called at most once per stream.  This function
+-- closes the stream with HTTP2.setEndStream chunk at the end.  If you want to
+-- post data (e.g., streamed chunks) your way to avoid loading a whole
+-- bytestring in RAM, please study the source code of this function first.
+--
+-- This function sends one chunk at a time respecting by preference:
+-- - server's flow control desires
+-- - server's chunking preference
+--
+-- Uploading an empty bytestring will send a single DATA frame with
+-- setEndStream and no payload.
+upload :: ByteString
+       -- ^ HTTP body.
+       -> Http2Client
+       -- ^ The client.
+       -> OutgoingFlowControl
+       -- ^ The outgoing flow control for this client. (We might remove this
+       -- argument in the future because we can get it from the previous
+       -- argument.
+       -> Http2Stream
+       -- ^ The corresponding HTTP stream.
+       -> OutgoingFlowControl
+       -- ^ The flow control for this stream.
+       -> IO ()
+upload "" conn _ stream _ = do
+    sendData conn stream HTTP2.setEndStream ""
+upload dat conn connectionFlowControl stream streamFlowControl = do
+    let wanted = ByteString.length dat
+
+    gotStream <- _withdrawCredit streamFlowControl wanted
+    got       <- _withdrawCredit connectionFlowControl gotStream
+    -- Recredit the stream flow control with the excedent we cannot spend on
+    -- the connection.
+    _receiveCredit streamFlowControl (gotStream - got)
+
+    let uploadChunks flagMod =
+            sendData conn stream flagMod (ByteString.take got dat)
+
+    if got == wanted
+    then
+        uploadChunks HTTP2.setEndStream
+    else do
+        uploadChunks id
+        upload (ByteString.drop got dat) conn connectionFlowControl stream streamFlowControl
 
 -- | Wait for a stream until completion.
 --

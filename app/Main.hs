@@ -111,33 +111,6 @@ main = execParser opts >>= client
       , header "http2-client-exe: a CLI HTTP2 client written in Haskell"
       ])
 
-upload :: ByteString
-       -> Http2Client
-       -> OutgoingFlowControl
-       -> Http2Stream
-       -> OutgoingFlowControl
-       -> IO ()
-upload "" conn _ stream _ = do
-    sendData conn stream HTTP2.setEndStream ""
-upload dat conn connectionFlowControl stream streamFlowControl = do
-    let wanted = ByteString.length dat
-
-    gotStream <- _withdrawCredit streamFlowControl wanted
-    got       <- _withdrawCredit connectionFlowControl gotStream
-    -- Recredit the stream flow control with the excedent we cannot spend on
-    -- the the connection.
-    _receiveCredit streamFlowControl (gotStream - got)
-
-    let uploadChunks flagMod =
-            sendData conn stream flagMod (ByteString.take got dat)
-
-    if got == wanted
-    then
-        uploadChunks HTTP2.setEndStream
-    else do
-        uploadChunks id
-        upload (ByteString.drop got dat) conn connectionFlowControl stream streamFlowControl
-
 client :: QueryArgs -> IO ()
 client QueryArgs{..} = do
     hSetBuffering stdout LineBuffering
