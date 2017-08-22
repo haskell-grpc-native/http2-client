@@ -2,12 +2,13 @@
 {-# LANGUAGE RecordWildCards   #-}
 module Main where
 
-import           Control.Monad (forever, when, void)
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel)
+import           Control.Monad (forever, when, void)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
+import           Data.Maybe (fromMaybe)
 import           Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.TLS as TLS
@@ -33,27 +34,28 @@ data ServerPushSwitch = PushEnabled | PushDisabled
   deriving Show
 
 data QueryArgs = QueryArgs {
-    _host                    :: !HostName
-  , _port                    :: !PortNumber
-  , _verb                    :: !Verb
-  , _path                    :: !Path
-  , _extraHeaders            :: ![(ByteString, ByteString)]
-  , _postData                :: !(Maybe PostData)
-  , _interPingDelay          :: !Int
-  , _pingTimeout             :: !Int
-  , _interFlowControlUpdates :: !Int
-  , _settingsMaxConcurrency  :: !Int
-  , _settingsAllowServerPush :: !ServerPushSwitch
+    _host                       :: !HostName
+  , _port                       :: !PortNumber
+  , _verb                       :: !Verb
+  , _path                       :: !Path
+  , _extraHeaders               :: ![(ByteString, ByteString)]
+  , _postData                   :: !(Maybe PostData)
+  , _interPingDelay             :: !Int
+  , _pingTimeout                :: !Int
+  , _interFlowControlUpdates    :: !Int
+  , _settingsMaxConcurrency     :: !Int
+  , _settingsAllowServerPush    :: !ServerPushSwitch
   , _settingsMaxFrameSize       :: !Int
   , _settingsMaxHeaderBlockSize :: !Int
   , _settingsInitialWindowSize  :: !Int
   , _initialWindowKick          :: !Int
   , _concurrentQueriesCount     :: !Int
   , _numberQueries              :: !Int
-  , _finalDelay                :: !Int
-  , _finalMessage              :: !ByteString
-  , _encoderBufsize :: !Int
-  , _decoderBufsize :: !Int
+  , _finalDelay                 :: !Int
+  , _finalMessage               :: !ByteString
+  , _encoderBufsize             :: !Int
+  , _decoderBufsize             :: !Int
+  , _downloadPrefix             :: !FilePath
   } deriving Show
 
 clientArgs :: Parser QueryArgs
@@ -80,6 +82,7 @@ clientArgs =
         <*> kthxByeMessage
         <*> encoderBufSize
         <*> decoderBufSize
+        <*> downloadPrefix
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -102,6 +105,7 @@ clientArgs =
     kthxByeMessage = bstrOption (long "exit-greeting" <> value "kthxbye (>;_;<)")
     encoderBufSize = option auto (long "hpack-encoder-buffer-size" <> value 4096)
     decoderBufSize = option auto (long "hpack-decoder-buffer-size" <> value 4096)
+    downloadPrefix = strOption (long "push-files-prefix" <> value ":stdout-pp")
 
 main :: IO ()
 main = execParser opts >>= client
@@ -136,9 +140,11 @@ client QueryArgs{..} = do
                           , (":authority", ByteString.pack _host)
                           ] <> _extraHeaders
 
-    let ppHandler _ stream ppHdrs streamFlowControl _ = void $ forkIO $ do
-            timePrint ("push stream started" :: String, ppHdrs)
-            waitStream stream streamFlowControl >>= timePrint . fromStreamResult
+    let ppHandler n idx _ stream ppHdrs streamFlowControl _ = void $ forkIO $ do
+            let pushpath = fromMaybe "unspecified-path" (lookup ":path" ppHdrs)
+            timePrint ("push stream started" :: String, pushpath)
+            ret <- fromStreamResult <$> waitStream stream streamFlowControl
+            either (\e -> timePrint e) (dump PushPromiseFile pushpath n idx _downloadPrefix) ret
             timePrint ("push stream ended" :: String)
 
     let conf = [ (HTTP2.SettingsMaxFrameSize, _settingsMaxFrameSize)
@@ -165,15 +171,17 @@ client QueryArgs{..} = do
     let go 0 idx = timePrint $ "done worker: " <> show idx
         go n idx = do
             _ <- (withHttp2Stream conn $ \stream ->
-                    let initStream = headers stream headersPairs headersFlags
+                    let initStream = do
+                            _ <- async $ onPushPromise stream (ppHandler n idx)
+                            headers stream headersPairs headersFlags
                         handler streamINFlowControl streamOUTFlowControl = do
-                            _ <- async $ onPushPromise stream ppHandler
                             timePrint $ "stream started " <> show (idx, n)
                             _ <- async $ dataPostFunction conn
                                                           (_outgoingFlowControl conn)
                                                           stream
                                                           streamOUTFlowControl
-                            waitStream stream streamINFlowControl >>= timePrint . fromStreamResult
+                            ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
+                            either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
                             timePrint $ "stream ended " <> show (idx, n)
                     in StreamDefinition initStream handler)
             go (n - 1) idx
@@ -198,7 +206,35 @@ client QueryArgs{..} = do
         , TLS.clientDebug                = def
         }
 
+data DumpType = MainFile | PushPromiseFile
+
+dump :: DumpType -> Path -> Int -> Int -> FilePath -> StreamResponse -> IO ()
+dump MainFile _ _ _ ":stdout" (hdrs, body) = do
+    timePrint hdrs
+    ByteString.putStrLn body
+dump PushPromiseFile _ _ _ ":stdout" (hdrs, _) = do
+    timePrint hdrs
+dump MainFile _ _ _ ":stdout-pp" (hdrs, body) = do
+    timePrint hdrs
+    ByteString.putStrLn body
+dump PushPromiseFile _ _ _ ":stdout-pp" (hdrs, body) = do
+    timePrint hdrs
+    ByteString.putStrLn body
+dump _ querystring nquery nthread prefix (hdrs, body) = do
+    timePrint hdrs
+    ByteString.writeFile filepath body
+  where
+    filepath = mconcat [ prefix
+                       , "/" 
+                       , show nquery
+                       , "."
+                       , show nthread
+                       , ByteString.unpack $ cleanPath querystring
+                       ]
+    cleanPath = ByteString.takeWhile (/= '?')
+              . ByteString.map (\c -> if c == '/' then '_' else c)
+
 timePrint :: Show a => a -> IO ()
 timePrint x = do
     tst <- getCurrentTime
-    print (tst, x)
+    ByteString.hPutStrLn stderr $ ByteString.pack $ show (tst, x)
