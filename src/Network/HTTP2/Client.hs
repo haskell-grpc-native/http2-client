@@ -227,7 +227,7 @@ data Http2Stream = Http2Stream {
 -- client-initiated stream. Longer term we may move passing this handler to the
 -- '_startStream' instead of 'newHttp2Client' (as it is for now).
 type PushPromiseHandler =
-    StreamId -> Http2Stream -> IncomingFlowControl -> OutgoingFlowControl -> IO ()
+    StreamId -> Http2Stream -> HeaderList -> IncomingFlowControl -> OutgoingFlowControl -> IO ()
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext {
@@ -413,7 +413,7 @@ initializeStream
   -> IORef ConnectionSettings
   -> Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId)
+  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId, HeaderList)
   -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
@@ -450,8 +450,8 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
     let _waitPushPromise ppHandler = do
-            (_,ppFrames,ppSid) <- waitPushPromiseWithParentStreamId sid pushPromises
-            let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream)
+            (_,ppFrames,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
+            let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream ppHeaders)
             ppCont <- initializeStream conn
                                        settings
                                        ppFrames
@@ -534,11 +534,15 @@ creditDataFramesLoop flowControl frames = forever $ do
     _ <- _consumeCredit flowControl (HTTP2.payloadLength fh)
     _addCredit flowControl (HTTP2.payloadLength fh)
 
+data HPACKLoopDecision =
+    ForwardHeader !StreamId
+  | OpenPushPromise !StreamId !StreamId
+
 incomingHPACKFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
   -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId)
+  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId, HeaderList)
   -> DynamicTable
   -> IO ()
 incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
@@ -547,18 +551,14 @@ incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
                                     , FrameHeaders
                                     ]
                                     frames
-    (sId, pattern) <- case fp of
-            PushPromiseFrame sid hbf -> do
-                -- Important: We duplicate the channel here or we risk losing
-                -- DATA frames sent over the stream.
-                ppChan <- dupChan frames
-                let parentSid = HTTP2.streamId fh
-                writeChan pushPromises (parentSid, ppChan, sid)
-                return (sid, Right hbf)
+    let sid = HTTP2.streamId fh
+    (decision, pattern) <- case fp of
+            PushPromiseFrame ppSid hbf -> do
+                return (OpenPushPromise sid ppSid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
-                return (HTTP2.streamId fh, Right hbf)
+                return (ForwardHeader sid, Right hbf)
             RSTStreamFrame err       ->
-                return (HTTP2.streamId fh, Left err)
+                return (ForwardHeader sid, Left err)
             _                        -> error "wrong TypeId"
 
     let go curFh (Right buffer) =
@@ -576,10 +576,17 @@ incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
                     _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
             else do
                 newHdrs <- decodeHeader hpackDecoder buffer
-                writeChan hdrs (curFh, sId, Right newHdrs)
+                case decision of
+                    ForwardHeader sId ->
+                        writeChan hdrs (curFh, sId, Right newHdrs)
+                    OpenPushPromise parentSid newSid -> do
+                        -- Important: We duplicate the channel here or we risk losing
+                        -- DATA frames sent over the stream.
+                        ppChan <- dupChan frames
+                        writeChan pushPromises (parentSid, ppChan, newSid, newHdrs)
 
         go curFh (Left err) =
-                writeChan hdrs (curFh, sId, (Left $ HTTP2.fromErrorCodeId err))
+                writeChan hdrs (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
 
     go fh pattern
 
@@ -835,13 +842,13 @@ waitHeaders test chan =
 
 waitPushPromiseWithParentStreamId
   :: StreamId
-  -> Chan (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId)
-  -> IO (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId)
+  -> Chan (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId, HeaderList)
+  -> IO (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId, HeaderList)
 waitPushPromiseWithParentStreamId sid chan =
     loop
   where
     loop = do
-        tuple@(parentSid,_,_) <- readChan chan
+        tuple@(parentSid,_,_,_) <- readChan chan
         if parentSid == sid
         then return tuple
         else loop

@@ -136,8 +136,8 @@ client QueryArgs{..} = do
                           , (":authority", ByteString.pack _host)
                           ] <> _extraHeaders
 
-    let ppHandler _ stream streamFlowControl _ = void $ forkIO $ do
-            timePrint ("push stream started" :: String)
+    let ppHandler _ stream ppHdrs streamFlowControl _ = void $ forkIO $ do
+            timePrint ("push stream started" :: String, ppHdrs)
             waitStream stream streamFlowControl >>= timePrint . fromStreamResult
             timePrint ("push stream ended" :: String)
 
