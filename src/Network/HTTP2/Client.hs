@@ -411,9 +411,9 @@ initializeStream
   :: Exception e
   => Http2FrameConnection
   -> IORef ConnectionSettings
-  -> Chan (FrameHeader, Either e FramePayload)
-  -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId, HeaderList)
+  -> FramesChan e
+  -> HeadersChan
+  -> PushPromisesChan e
   -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
@@ -450,12 +450,12 @@ initializeStream conn settings serverFrames serverHeaders serverPushPromises hpa
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
     let _waitPushPromise ppHandler = do
-            (_,ppFrames,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
-            let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream ppHeaders)
+            (_,ppFrames,ppHeaders,ppSid,ppReadHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
+            let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream ppReadHeaders)
             ppCont <- initializeStream conn
                                        settings
                                        ppFrames
-                                       serverHeaders
+                                       ppHeaders
                                        serverPushPromises
                                        hpackEncoder
                                        ppSid
@@ -538,11 +538,16 @@ data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
 
+type FramesChan e = Chan (FrameHeader, Either e FramePayload)
+type HeadersChan = Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
+type PushPromisesChanContent e = (StreamId, FramesChan e, HeadersChan, StreamId, HeaderList)
+type PushPromisesChan e = Chan (PushPromisesChanContent e)
+
 incomingHPACKFramesLoop
   :: Exception e
-  => Chan (FrameHeader, Either e FramePayload)
-  -> Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -> Chan (StreamId, Chan (FrameHeader, Either e FramePayload), StreamId, HeaderList)
+  => FramesChan e
+  -> HeadersChan
+  -> PushPromisesChan e
   -> DynamicTable
   -> IO ()
 incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
@@ -580,10 +585,16 @@ incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
                     ForwardHeader sId ->
                         writeChan hdrs (curFh, sId, Right newHdrs)
                     OpenPushPromise parentSid newSid -> do
-                        -- Important: We duplicate the channel here or we risk losing
-                        -- DATA frames sent over the stream.
+                        -- Important: We duplicate the channel here or we risk
+                        -- losing DATA or HEADERS+CONTINUATION frames sent over
+                        -- the main stream because even though
+                        -- 'initializeStream' dupes frame channels, this
+                        -- function will has no guarantee that the parent
+                        -- stream and the push-promise handler that will
+                        -- initiate the new stream are synchronous.
                         ppChan <- dupChan frames
-                        writeChan pushPromises (parentSid, ppChan, newSid, newHdrs)
+                        ppHeaders <- dupChan hdrs
+                        writeChan pushPromises (parentSid, ppChan, ppHeaders, newSid, newHdrs)
 
         go curFh (Left err) =
                 writeChan hdrs (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
@@ -842,13 +853,13 @@ waitHeaders test chan =
 
 waitPushPromiseWithParentStreamId
   :: StreamId
-  -> Chan (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId, HeaderList)
-  -> IO (StreamId, Chan (FrameHeader, Either e0 FramePayload), StreamId, HeaderList)
+  -> PushPromisesChan e
+  -> IO (PushPromisesChanContent e)
 waitPushPromiseWithParentStreamId sid chan =
     loop
   where
     loop = do
-        tuple@(parentSid,_,_,_) <- readChan chan
+        tuple@(parentSid,_,_,_,_) <- readChan chan
         if parentSid == sid
         then return tuple
         else loop
