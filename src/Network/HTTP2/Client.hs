@@ -606,12 +606,15 @@ newIncomingFlowControl
   -> Http2FrameClientStream
   -> IO IncomingFlowControl
 newIncomingFlowControl settings stream = do
+    let getBase = if _getStreamId stream == 0
+                  then return HTTP2.defaultInitialWindowSize
+                  else initialWindowSize . _clientSettings <$> readIORef settings
     creditAdded <- newIORef 0
     creditConsumed <- newIORef 0
     let _addCredit n = atomicModifyIORef' creditAdded (\c -> (c + n, ()))
     let _consumeCredit n = do
             conso <- atomicModifyIORef' creditConsumed (\c -> (c + n, c + n))
-            base <- initialWindowSize . _clientSettings <$> readIORef settings
+            base <- getBase
             extra <- readIORef creditAdded
             return $ base + extra - conso
     let _updateWindow = do
@@ -638,10 +641,13 @@ newOutgoingFlowControl ::
   -> IO OutgoingFlowControl
 newOutgoingFlowControl settings sid frames = do
     credit <- newIORef 0
+    let getBase = if sid == 0
+                  then return HTTP2.defaultInitialWindowSize
+                  else initialWindowSize . _serverSettings <$> readIORef settings
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
     let withdraw 0 = return 0
         withdraw n = do
-            base <- initialWindowSize . _serverSettings <$> readIORef settings
+            base <- getBase
             got <- atomicModifyIORef' credit (\c ->
                     if base + c >= n
                     then (c - n, n)
