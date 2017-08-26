@@ -240,6 +240,8 @@ client QueryArgs{..} = do
 data DumpType = MainFile | PushPromiseFile
 
 dump :: DumpType -> Path -> Int -> Int -> FilePath -> StreamResponse -> IO ()
+dump MainFile _ _ _ ":none" (hdrs, _) = do
+    timePrint hdrs
 dump MainFile _ _ _ ":stdout" (hdrs, body) = do
     timePrint hdrs
     ByteString.putStrLn body
