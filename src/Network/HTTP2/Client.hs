@@ -539,7 +539,8 @@ data HPACKLoopDecision =
   | OpenPushPromise !StreamId !StreamId
 
 type FramesChan e = Chan (FrameHeader, Either e FramePayload)
-type HeadersChan = Chan (FrameHeader, StreamId, Either ErrorCode HeaderList)
+type HeadersChanContent = (FrameHeader, StreamId, Either ErrorCode HeaderList)
+type HeadersChan = Chan HeadersChanContent
 type PushPromisesChanContent e = (StreamId, FramesChan e, HeadersChan, StreamId, HeaderList)
 type PushPromisesChan e = Chan (PushPromisesChanContent e)
 
@@ -795,21 +796,24 @@ sendPriorityFrame s p = do
     return ()
 
 waitFrameWithStreamId
-  :: Exception e =>
-     StreamId -> Chan (FrameHeader, Either e FramePayload) -> IO (FrameHeader, FramePayload)
+  :: Exception e
+  => StreamId
+  -> FramesChan e
+  -> IO (FrameHeader, FramePayload)
 waitFrameWithStreamId sid = waitFrame (\h _ -> streamId h == sid)
 
 waitFrameWithTypeId
   :: (Exception e)
   => [FrameTypeId]
-  -> Chan (FrameHeader, Either e FramePayload) -> IO (FrameHeader, FramePayload)
+  -> FramesChan e
+  -> IO (FrameHeader, FramePayload)
 waitFrameWithTypeId tids = waitFrame (\_ p -> HTTP2.framePayloadToFrameTypeId p `elem` tids)
 
 waitFrameWithTypeIdForStreamId
   :: (Exception e)
   => StreamId
   -> [FrameTypeId]
-  -> Chan (FrameHeader, Either e FramePayload)
+  -> FramesChan e
   -> IO (FrameHeader, FramePayload)
 waitFrameWithTypeIdForStreamId sid tids =
     waitFrame (\h p -> streamId h == sid && HTTP2.framePayloadToFrameTypeId p `elem` tids)
@@ -817,7 +821,7 @@ waitFrameWithTypeIdForStreamId sid tids =
 waitFrame
   :: Exception e
   => (FrameHeader -> FramePayload -> Bool)
-  -> Chan (FrameHeader, Either e FramePayload)
+  -> FramesChan e
   -> IO (FrameHeader, FramePayload)
 waitFrame test chan =
     loop
@@ -839,15 +843,15 @@ isSettingsReply _ _                  = False
 
 waitHeadersWithStreamId
   :: StreamId
-  -> Chan (FrameHeader, StreamId, t)
-  -> IO (FrameHeader, StreamId, t)
+  -> HeadersChan
+  -> IO HeadersChanContent
 waitHeadersWithStreamId sid =
     waitHeaders (\_ s _ -> s == sid)
 
 waitHeaders
-  :: (FrameHeader -> StreamId -> t -> Bool)
-  -> Chan (FrameHeader, StreamId, t)
-  -> IO (FrameHeader, StreamId, t)
+  :: (FrameHeader -> StreamId -> Either ErrorCode HeaderList -> Bool)
+  -> HeadersChan
+  -> IO HeadersChanContent
 waitHeaders test chan =
     loop
   where
