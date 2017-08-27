@@ -33,6 +33,9 @@ postDataForString content        = PostBytestring (ByteString.pack content)
 data ServerPushSwitch = PushEnabled | PushDisabled
   deriving Show
 
+data Verbosity = Verbose | NonVerbose
+  deriving Show
+
 data QueryArgs = QueryArgs {
     _host                       :: !HostName
   , _port                       :: !PortNumber
@@ -56,6 +59,7 @@ data QueryArgs = QueryArgs {
   , _encoderBufsize             :: !Int
   , _decoderBufsize             :: !Int
   , _downloadPrefix             :: !FilePath
+  , _verboseDebug               :: !Verbosity
   } deriving Show
 
 clientArgs :: Parser QueryArgs
@@ -83,6 +87,7 @@ clientArgs =
         <*> encoderBufSize
         <*> decoderBufSize
         <*> downloadPrefix
+        <*> verboseDebug
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -106,6 +111,7 @@ clientArgs =
     encoderBufSize = option auto (long "hpack-encoder-buffer-size" <> value 4096)
     decoderBufSize = option auto (long "hpack-decoder-buffer-size" <> value 4096)
     downloadPrefix = strOption (long "push-files-prefix" <> value ":stdout-pp")
+    verboseDebug = flag NonVerbose Verbose (long "verbose")
 
 main :: IO ()
 main = execParser opts >>= client
@@ -156,7 +162,32 @@ client QueryArgs{..} = do
                ]
     timePrint conf
 
-    conn <- newHttp2Client _host _port _encoderBufsize _decoderBufsize tlsParams conf
+    frameConn <- newHttp2FrameConnection _host _port tlsParams
+    let wrappedFrameConn = frameConn {
+            _makeFrameClientStream = \sid ->
+                let frameClient = (_makeFrameClientStream frameConn) sid
+                in frameClient {
+                       _sendFrames = \xs -> do
+                           print $ (">>> ", _getStreamId frameClient, map snd xs)
+                           _sendFrames frameClient xs
+                   }
+          , _serverStream =
+              let
+                currentServerStrean = _serverStream frameConn
+              in
+                currentServerStrean {
+                  _nextHeaderAndFrame = do
+                      hdrFrame@(hdr,_) <- _nextHeaderAndFrame currentServerStrean
+                      print ("<<< ", HTTP2.streamId hdr, hdrFrame)
+                      return hdrFrame
+                }
+          }
+    conn <- case _verboseDebug of
+        Verbose ->
+            wrapFrameClient wrappedFrameConn _encoderBufsize _decoderBufsize conf
+        NonVerbose ->
+            wrapFrameClient frameConn _encoderBufsize _decoderBufsize conf
+
     _addCredit (_incomingFlowControl conn) _initialWindowKick
     _ <- forkIO $ forever $ do
             updated <- _updateWindow $ _incomingFlowControl conn
@@ -209,6 +240,8 @@ client QueryArgs{..} = do
 data DumpType = MainFile | PushPromiseFile
 
 dump :: DumpType -> Path -> Int -> Int -> FilePath -> StreamResponse -> IO ()
+dump MainFile _ _ _ ":none" (hdrs, _) = do
+    timePrint hdrs
 dump MainFile _ _ _ ":stdout" (hdrs, body) = do
     timePrint hdrs
     ByteString.putStrLn body
