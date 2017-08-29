@@ -168,7 +168,7 @@ client QueryArgs{..} = do
                 let frameClient = (_makeFrameClientStream frameConn) sid
                 in frameClient {
                        _sendFrames = \xs -> do
-                           print $ (">>> ", _getStreamId frameClient, map snd xs)
+                           print $ (">>> "::String, _getStreamId frameClient, map snd xs)
                            _sendFrames frameClient xs
                    }
           , _serverStream =
@@ -178,7 +178,7 @@ client QueryArgs{..} = do
                 currentServerStrean {
                   _nextHeaderAndFrame = do
                       hdrFrame@(hdr,_) <- _nextHeaderAndFrame currentServerStrean
-                      print ("<<< ", HTTP2.streamId hdr, hdrFrame)
+                      print ("<<< "::String, HTTP2.streamId hdr, hdrFrame)
                       return hdrFrame
                 }
           }
@@ -187,7 +187,7 @@ client QueryArgs{..} = do
             wrapFrameClient wrappedFrameConn _encoderBufsize _decoderBufsize conf
         NonVerbose ->
             wrapFrameClient frameConn _encoderBufsize _decoderBufsize conf
-
+    linkHttp2Client conn
     _addCredit (_incomingFlowControl conn) _initialWindowKick
     _ <- forkIO $ forever $ do
             updated <- _updateWindow $ _incomingFlowControl conn

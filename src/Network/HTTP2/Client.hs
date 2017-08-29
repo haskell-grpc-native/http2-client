@@ -24,8 +24,11 @@ module Network.HTTP2.Client (
     -- * Flow control
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
+    -- * Exceptions
+    , linkHttp2Client
     -- * Misc.
     , FlagSetter
+    , Http2ClientAsyncs(..)
     , wrapFrameClient
     , _gtfo
     -- * Convenience re-exports
@@ -35,11 +38,11 @@ module Network.HTTP2.Client (
     ) where
 
 import           Control.Exception (bracket, throw)
-import           Control.Concurrent.Async (race)
+import           Control.Concurrent.Async (Async, async, race, link)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
-import           Control.Concurrent (forkIO, threadDelay)
+import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
-import           Control.Monad (forever, void, when, forM_)
+import           Control.Monad (forever, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
@@ -165,7 +168,44 @@ data Http2Client = Http2Client {
   -- connection.
   , _paylodSplitter :: IO PayloadSplitter
   -- ^ Returns a function to split a payload.
+  , _asyncs         :: !Http2ClientAsyncs
+  -- ^ Asynchronous operations threads.
   }
+
+-- | Set of Async threads running an Http2Client.
+--
+-- If you add other asyncs here, you should also modify
+-- 'linkHttp2Client'.
+data Http2ClientAsyncs = Http2ClientAsyncs {
+    _waitSettingsAsync   :: Async (FrameHeader, FramePayload)
+  -- ^ Async waiting for the initial settings ACK.
+  , _creditFlowsAsync    :: Async ()
+  -- ^ Async responsible for crediting the connection incoming flow control.
+  -- See 'creditDataFramesLoop'.
+  , _HPACKAsync          :: Async ()
+  -- ^ Async responsible for serializing every HEADERS/PUSH_PROMISE/CONTINUATION.
+  -- See 'incomingHPACKFramesLoop'.
+  , _controlFramesAsync  :: Async ()
+  -- ^ Async responsible for handling control frames (e.g., PING).
+  -- See 'incomingControlFramesLoop'.
+  , _incomingFramesAsync :: Async ()
+  -- ^ Async responsible for ingesting all frames, increasing the
+  -- maximum-received streamID and starting the frame dispatch. See
+  -- 'incomingFramesLoop'.
+  }
+
+-- | Links all asyncs threads of a client to the current thread.
+--
+-- See 'link'.
+linkHttp2Client :: Http2Client -> IO ()
+linkHttp2Client client = 
+    let Http2ClientAsyncs{..} = _asyncs client
+    in do
+        link _waitSettingsAsync
+        link _creditFlowsAsync
+        link _HPACKAsync
+        link _controlFramesAsync
+        link _incomingFramesAsync
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {
@@ -329,12 +369,12 @@ wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
     -- Initial thread receiving server frames.
     maxReceivedStreamId  <- newIORef 0
     serverFrames <- newChan
-    _ <- forkIO $ incomingFramesLoop conn serverFrames maxReceivedStreamId
+    aIncoming <- async $ incomingFramesLoop conn serverFrames maxReceivedStreamId
 
     -- Thread handling control frames.
     settings  <- newIORef defaultConnectionSettings
     controlFrames <- dupChan serverFrames
-    _ <- forkIO $ incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings
+    aControl <- async $ incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings
 
     -- Thread handling push-promises and headers frames serializing the buffers.
     serverStreamFrames <- dupChan serverFrames
@@ -350,13 +390,13 @@ wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
 
     serverPushPromises <- newChan
 
-    _ <- forkIO $ incomingHPACKFramesLoop serverStreamFrames
-                                          serverHeaders
-                                          serverPushPromises
-                                          hpackDecoder
+    aHPACK <- async $ incomingHPACKFramesLoop serverStreamFrames
+                                              serverHeaders
+                                              serverPushPromises
+                                              hpackDecoder
 
     dataFrames <- dupChan serverFrames
-    _ <- forkIO $ creditDataFramesLoop _incomingFlowControl dataFrames
+    aCredit <- async $ creditDataFramesLoop _incomingFlowControl dataFrames
 
     conccurentStreams <- newIORef 0
     let _startStream getWork = do
@@ -403,7 +443,9 @@ wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
 
     let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
 
-    _ <- forkIO . void =<< _settings initSettings
+    aSettings <- async =<< _settings initSettings
+
+    let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aControl aIncoming
 
     return $ Http2Client{..}
 
