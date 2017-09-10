@@ -51,6 +51,7 @@ import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
+import           System.IO (hPutStrLn, stderr)
 
 import           Network.HTTP2.Client.FrameConnection
 
@@ -523,7 +524,7 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
         (GoAwayFrame lastSid errCode reason)  ->
              throwIO $ RemoteSentGoAwayFrame lastSid errCode reason
 
-        _                   -> putStrLn ("UNHANDLED frame: " <> show controlFrame)
+        _                   -> hPutStrLn stderr ("UNHANDLED frame: " <> show controlFrame)
 
   where
     ignore :: String -> IO ()
