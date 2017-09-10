@@ -37,7 +37,7 @@ module Network.HTTP2.Client (
     , module Network.TLS
     ) where
 
-import           Control.Exception (bracket, throw)
+import           Control.Exception (bracket, throwIO)
 import           Control.Concurrent.Async (Async, async, race, link)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
@@ -552,11 +552,19 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
                 ignore "PingFrame replies waited for in the requestor thread"
         (WindowUpdateFrame _ )  ->
                 ignore "connection-wide WindowUpdateFrame waited for in OutgoingFlowControl threads"
+        (GoAwayFrame lastSid errCode reason)  ->
+             throwIO $ RemoteSentGoAwayFrame lastSid errCode reason
+
         _                   -> putStrLn ("UNHANDLED frame: " <> show controlFrame)
 
   where
     ignore :: String -> IO ()
     ignore _ = return ()
+
+-- | An exception thrown when the server sends a GoAwayFrame.
+data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteString
+  deriving Show
+instance Exception RemoteSentGoAwayFrame
 
 -- | We currently need a specific loop for crediting streams because a client
 -- user may programmatically reset and stop listening for a stream and stop
@@ -870,7 +878,7 @@ waitFrame test chan =
   where
     loop = do
         (fHead, fPayload) <- readChan chan
-        let dat = either throw id fPayload
+        dat <- either throwIO pure fPayload
         if test fHead dat
         then return (fHead, dat)
         else loop
