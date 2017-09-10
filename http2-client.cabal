@@ -1,5 +1,5 @@
 name:                http2-client
-version:             0.3.0.2
+version:             0.3.0.3
 synopsis:            A native HTTP2 client library.
 description:         Please read the README.md at the homepage.
 homepage:            https://github.com/lucasdicioccio/http2-client
