@@ -170,6 +170,8 @@ data Http2Client = Http2Client {
   -- ^ Returns a function to split a payload.
   , _asyncs         :: !Http2ClientAsyncs
   -- ^ Asynchronous operations threads.
+  , _close           :: IO ()
+  -- ^ Closes the network connection.
   }
 
 -- | Set of Async threads running an Http2Client.
@@ -446,6 +448,8 @@ wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
     aSettings <- async =<< _settings initSettings
 
     let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aControl aIncoming
+
+    let _close = closeConnection conn
 
     return $ Http2Client{..}
 
