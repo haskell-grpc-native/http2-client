@@ -182,50 +182,49 @@ client QueryArgs{..} = do
                       return hdrFrame
                 }
           }
-    conn <- case _verboseDebug of
-        Verbose ->
-            wrapFrameClient wrappedFrameConn _encoderBufsize _decoderBufsize conf
-        NonVerbose ->
-            wrapFrameClient frameConn _encoderBufsize _decoderBufsize conf
-    linkHttp2Client conn
-    _addCredit (_incomingFlowControl conn) _initialWindowKick
-    _ <- forkIO $ forever $ do
-            updated <- _updateWindow $ _incomingFlowControl conn
-            when updated $ timePrint ("sending flow-control update" :: String)
-            threadDelay _interFlowControlUpdates
+    let withConn = case _verboseDebug of
+            Verbose ->
+                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf
+            NonVerbose ->
+                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf
 
-    _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
-        threadDelay _interPingDelay
-        (t0, t1, pingReply) <- ping conn _pingTimeout "pingpong"
-        timePrint $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
+    withConn $ \conn -> do
+      _addCredit (_incomingFlowControl conn) _initialWindowKick
+      _ <- forkIO $ forever $ do
+              updated <- _updateWindow $ _incomingFlowControl conn
+              when updated $ timePrint ("sending flow-control update" :: String)
+              threadDelay _interFlowControlUpdates
 
-    let go 0 idx = timePrint $ "done worker: " <> show idx
-        go n idx = do
-            _ <- (withHttp2Stream conn $ \stream ->
-                    let initStream = do
-                            _ <- async $ onPushPromise stream (ppHandler n idx)
-                            headers stream headersPairs headersFlags
-                        handler streamINFlowControl streamOUTFlowControl = do
-                            timePrint $ "stream started " <> show (idx, n)
-                            _ <- async $ dataPostFunction conn
-                                                          (_outgoingFlowControl conn)
-                                                          stream
-                                                          streamOUTFlowControl
-                            ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
-                            either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
-                            timePrint $ "stream ended " <> show (idx, n)
-                    in StreamDefinition initStream handler)
-            go (n - 1) idx
+      _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
+          threadDelay _interPingDelay
+          (t0, t1, pingReply) <- ping conn _pingTimeout "pingpong"
+          timePrint $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
-    _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
+      let go 0 idx = timePrint $ "done worker: " <> show idx
+          go n idx = do
+              _ <- (withHttp2Stream conn $ \stream ->
+                      let initStream = do
+                              _ <- async $ onPushPromise stream (ppHandler n idx)
+                              headers stream headersPairs headersFlags
+                          handler streamINFlowControl streamOUTFlowControl = do
+                              timePrint $ "stream started " <> show (idx, n)
+                              _ <- async $ dataPostFunction conn
+                                                            (_outgoingFlowControl conn)
+                                                            stream
+                                                            streamOUTFlowControl
+                              ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
+                              either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
+                              timePrint $ "stream ended " <> show (idx, n)
+                      in StreamDefinition initStream handler)
+              go (n - 1) idx
 
-    when (_finalDelay > 0) (threadDelay _finalDelay)
+      _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
 
-    _gtfo conn HTTP2.NoError _finalMessage
+      when (_finalDelay > 0) (threadDelay _finalDelay)
 
-    _close conn
 
-    return ()
+      _gtfo conn HTTP2.NoError _finalMessage
+      _close conn
   where
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
