@@ -25,6 +25,7 @@ module Network.HTTP2.Client (
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
     -- * Exceptions
+    , RemoteSentGoAwayFrame(..)
     , linkHttp2Client
     -- * Misc.
     , FlagSetter
