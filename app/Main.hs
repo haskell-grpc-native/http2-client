@@ -184,9 +184,9 @@ client QueryArgs{..} = do
           }
     let withConn = case _verboseDebug of
             Verbose ->
-                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf
+                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler
             NonVerbose ->
-                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf
+                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler
 
     withConn $ \conn -> do
       _addCredit (_incomingFlowControl conn) _initialWindowKick

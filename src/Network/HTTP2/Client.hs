@@ -26,6 +26,8 @@ module Network.HTTP2.Client (
     , OutgoingFlowControl(..)
     -- * Exceptions
     , RemoteSentGoAwayFrame(..)
+    , GoAwayHandler
+    , defaultGoAwayHandler
     -- * Misc.
     , FlagSetter
     , Http2ClientAsyncs(..)
@@ -315,12 +317,13 @@ runHttp2Client
   -- ^ The buffersize for the Network.HPACK decoder.
   -> SettingsList
   -- ^ Initial SETTINGS that are sent as first frame.
+  -> GoAwayHandler
+  -- ^ Actions to run when the remote sends a GoAwayFrame
   -> (Http2Client -> IO a)
   -- ^ Actions to run on the client.
   -> IO a
-runHttp2Client conn encoderBufSize decoderBufSize initSettings mainHandler = do
+runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler mainHandler = do
     let _close = closeConnection conn
-
     -- prepare hpack contexts
     hpackEncoder <- do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
@@ -348,7 +351,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings mainHandler = do
       -- Thread handling control frames.
       settings  <- newIORef defaultConnectionSettings
       controlFrames <- dupChan serverFrames
-      let controlLoop = incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings
+      let controlLoop = incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings goAwayHandler
       withAsync controlLoop $ \aControl -> do
         -- Thread handling push-promises and headers frames serializing the buffers.
         serverStreamFrames <- dupChan serverFrames
@@ -500,8 +503,9 @@ incomingControlFramesLoop
   -> HpackEncoderContext
   -> (ByteString -> IO ())
   -> IO ()
+  -> GoAwayHandler
   -> IO ()
-incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = forever $ do
+incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings goAwayHandler = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
         (SettingsFrame settsList)
@@ -523,13 +527,20 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
         (WindowUpdateFrame _ )  ->
                 ignore "connection-wide WindowUpdateFrame waited for in OutgoingFlowControl threads"
         (GoAwayFrame lastSid errCode reason)  ->
-             throwIO $ RemoteSentGoAwayFrame lastSid errCode reason
+             goAwayHandler $ RemoteSentGoAwayFrame lastSid errCode reason
 
         _                   -> hPutStrLn stderr ("UNHANDLED frame: " <> show controlFrame)
 
   where
     ignore :: String -> IO ()
     ignore _ = return ()
+
+-- | A Handler for exceptional circumstances.
+type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
+
+-- | Default GoAwayHandler throws a 'RemoteSentGoAwayFrame'.
+defaultGoAwayHandler :: GoAwayHandler
+defaultGoAwayHandler = throwIO
 
 -- | An exception thrown when the server sends a GoAwayFrame.
 data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteString
