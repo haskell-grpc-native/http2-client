@@ -29,6 +29,8 @@ module Network.HTTP2.Client (
     , GoAwayHandler
     , defaultGoAwayHandler
     -- * Misc.
+    , FallBackFrameHandler
+    , ignoreFallbackHandler
     , FlagSetter
     , Http2ClientAsyncs(..)
     , _gtfo
@@ -48,13 +50,11 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import           Data.Maybe (fromMaybe)
-import           Data.Monoid ((<>))
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
-import           System.IO (hPutStrLn, stderr)
 
 import           Network.HTTP2.Client.FrameConnection
 
@@ -319,10 +319,13 @@ runHttp2Client
   -- ^ Initial SETTINGS that are sent as first frame.
   -> GoAwayHandler
   -- ^ Actions to run when the remote sends a GoAwayFrame
+  -> FallBackFrameHandler
+  -- ^ Actions to run when a control frame is not yet handled in http2-client
+  -- lib (e.g., PRIORITY frames).
   -> (Http2Client -> IO a)
   -- ^ Actions to run on the client.
   -> IO a
-runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler mainHandler = do
+runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler mainHandler = do
     let _close = closeConnection conn
     -- prepare hpack contexts
     hpackEncoder <- do
@@ -351,7 +354,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler mai
       -- Thread handling control frames.
       settings  <- newIORef defaultConnectionSettings
       controlFrames <- dupChan serverFrames
-      let controlLoop = incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings goAwayHandler
+      let controlLoop = incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler
       withAsync controlLoop $ \aControl -> do
         -- Thread handling push-promises and headers frames serializing the buffers.
         serverStreamFrames <- dupChan serverFrames
@@ -504,8 +507,9 @@ incomingControlFramesLoop
   -> (ByteString -> IO ())
   -> IO ()
   -> GoAwayHandler
+  -> FallBackFrameHandler
   -> IO ()
-incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings goAwayHandler = forever $ do
+incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
         (SettingsFrame settsList)
@@ -529,11 +533,19 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings goAwa
         (GoAwayFrame lastSid errCode reason)  ->
              goAwayHandler $ RemoteSentGoAwayFrame lastSid errCode reason
 
-        _                   -> hPutStrLn stderr ("UNHANDLED frame: " <> show controlFrame)
+        _                   ->
+             fallbackHandler controlFrame
 
   where
     ignore :: String -> IO ()
     ignore _ = return ()
+
+-- | A fallback handler for frames.
+type FallBackFrameHandler = (FrameHeader, FramePayload) -> IO ()
+
+-- | Default FallBackFrameHandler that ignores frames.
+ignoreFallbackHandler :: FallBackFrameHandler
+ignoreFallbackHandler = const $ pure ()
 
 -- | A Handler for exceptional circumstances.
 type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()

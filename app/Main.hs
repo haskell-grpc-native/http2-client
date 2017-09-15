@@ -9,12 +9,12 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
 import           Data.Maybe (fromMaybe)
+import           Data.Monoid ((<>))
 import           Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
 import           Options.Applicative
-import           Data.Monoid ((<>))
 import           System.IO
 
 import Network.HTTP2.Client
@@ -184,9 +184,9 @@ client QueryArgs{..} = do
           }
     let withConn = case _verboseDebug of
             Verbose ->
-                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler
+                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler printUnhandledFrame
             NonVerbose ->
-                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler
+                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler ignoreFallbackHandler
 
     withConn $ \conn -> do
       _addCredit (_incomingFlowControl conn) _initialWindowKick
@@ -272,3 +272,6 @@ timePrint :: Show a => a -> IO ()
 timePrint x = do
     tst <- getCurrentTime
     ByteString.hPutStrLn stderr $ ByteString.pack $ show (tst, x)
+
+printUnhandledFrame :: FallBackFrameHandler
+printUnhandledFrame (fh,fp) = timePrint ("UNHANDLED:"::String, fh, fp)
