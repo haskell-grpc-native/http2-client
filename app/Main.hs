@@ -2,7 +2,7 @@
 {-# LANGUAGE RecordWildCards   #-}
 module Main where
 
-import           Control.Concurrent (forkIO, threadDelay)
+import           Control.Concurrent (forkIO, myThreadId, throwTo, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Control.Monad (forever, when, void)
 import           Data.ByteString (ByteString)
@@ -182,11 +182,12 @@ client QueryArgs{..} = do
                       return hdrFrame
                 }
           }
+    parentThread <- myThreadId
     let withConn = case _verboseDebug of
             Verbose ->
                 runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler printUnhandledFrame
             NonVerbose ->
-                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler ignoreFallbackHandler
+                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf (throwTo parentThread) ignoreFallbackHandler
 
     withConn $ \conn -> do
       _addCredit (_incomingFlowControl conn) _initialWindowKick

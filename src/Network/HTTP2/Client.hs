@@ -550,7 +550,16 @@ ignoreFallbackHandler = const $ pure ()
 -- | A Handler for exceptional circumstances.
 type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 
--- | Default GoAwayHandler throws a 'RemoteSentGoAwayFrame'.
+-- | Default GoAwayHandler throws a 'RemoteSentGoAwayFrame' in the current
+-- thread.
+--
+-- A probably sharper handler if you want to abruptly stop any operation is to
+-- get the 'ThreadId' of the main client thread and using
+-- 'Control.Exception.Base.throwTo'.
+--
+-- There's an inherent race condition when receiving a GoAway frame because the
+-- server will likely close the connection which will lead to TCP errors as
+-- well.
 defaultGoAwayHandler :: GoAwayHandler
 defaultGoAwayHandler = throwIO
 
