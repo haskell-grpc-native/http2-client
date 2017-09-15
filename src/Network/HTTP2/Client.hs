@@ -25,6 +25,7 @@ module Network.HTTP2.Client (
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
     -- * Exceptions
+    , linkAsyncs
     , RemoteSentGoAwayFrame(..)
     , GoAwayHandler
     , defaultGoAwayHandler
@@ -40,8 +41,8 @@ module Network.HTTP2.Client (
     , module Network.TLS
     ) where
 
-import           Control.Exception (bracket, throwIO)
-import           Control.Concurrent.Async (Async, race, withAsync)
+import           Control.Concurrent.Async (Async, race, withAsync, link)
+import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
@@ -179,6 +180,8 @@ data Http2Client = Http2Client {
 -- | Set of Async threads running an Http2Client.
 --
 -- This asyncs are linked to the thread where the Http2Client is created.
+-- If you modify this structure to add more Async, please also modify
+-- 'linkAsyncs' accordingly.
 data Http2ClientAsyncs = Http2ClientAsyncs {
     _waitSettingsAsync   :: Async (FrameHeader, FramePayload)
   -- ^ Async waiting for the initial settings ACK.
@@ -196,6 +199,16 @@ data Http2ClientAsyncs = Http2ClientAsyncs {
   -- maximum-received streamID and starting the frame dispatch. See
   -- 'incomingFramesLoop'.
   }
+
+-- | Links all client's asyncs to current thread.
+linkAsyncs :: Http2Client -> IO ()
+linkAsyncs client =
+   let Http2ClientAsyncs{..} = _asyncs client in do
+           link _waitSettingsAsync
+           link _creditFlowsAsync
+           link _HPACKAsync
+           link _controlFramesAsync
+           link _incomingFramesAsync
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {
@@ -493,11 +506,30 @@ incomingFramesLoop
   -> Chan (FrameHeader, Either HTTP2Error FramePayload)
   -> IORef StreamId
   -> IO ()
-incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
+incomingFramesLoop conn frames maxReceivedStreamId = delayException $ forever $ do
     frame@(fh, _) <- next conn
     -- Remember highest streamId.
     atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
     writeChan frames frame
+
+-- | Runs an action, rethrowing exception 50ms later.
+--
+-- In a context where asynchronous are likely to occur this function gives a
+-- chance to other threads to do some work before Async linking reaps them all.
+--
+-- In particular, servers are likely to close their TCP connection soon after
+-- sending a GoAwayFrame and we want to give a better chance to clients to
+-- observe the GoAwayFrame in their handlers to distinguish GoAwayFrames
+-- followed by TCP disconnection and plain TCP resets. As a result, this
+-- function is mostly used to delay 'incomingFramesLoop'. A more involved
+-- and future design will be to inline the various loop-processes for
+-- incomingFramesLoop and GoAwayHandlers in a same thread (e.g., using
+-- pipe/conduit to retain composability).
+delayException :: IO a -> IO a
+delayException act = act `catch` slowdown
+  where
+    slowdown :: SomeException -> IO a
+    slowdown e = threadDelay 50000 >> throwIO e
 
 incomingControlFramesLoop
   :: Exception e

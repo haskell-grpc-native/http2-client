@@ -190,6 +190,7 @@ client QueryArgs{..} = do
                 runHttp2Client frameConn _encoderBufsize _decoderBufsize conf (throwTo parentThread) ignoreFallbackHandler
 
     withConn $ \conn -> do
+      linkAsyncs conn
       _addCredit (_incomingFlowControl conn) _initialWindowKick
       _ <- forkIO $ forever $ do
               updated <- _updateWindow $ _incomingFlowControl conn
