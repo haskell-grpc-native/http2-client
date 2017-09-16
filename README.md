@@ -177,7 +177,7 @@ GitHub: https://github.com/lucasdicioccio/http2-client/issues .
 
 ### Things that will likely change the API
 
-I think the fundamental are right but the following needs tweaking:
+I think the fundamentals are right but the following needs tweaking:
 
 - function to reset a stream will likely be blocking until a RST/EndStream is
   received so that all DATA frames are accounted for in the flow-control system
@@ -208,6 +208,3 @@ The current implementation follows the HTTP2 standard except for the following:
     CPU/latency-wise if the concurrency is high
 - consider most performant functions for HTTP2.HPACK encoding/decoding
   * currently using naive function 'Network.HPACK.encodeHeader'
-- consider using a typeclass or a way to change the frame client
-- we need a story for IO exceptions
-- we need a story for instrumentation

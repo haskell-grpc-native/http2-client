@@ -8,7 +8,7 @@
 -- For higher-level primitives, please refer to Network.HTTP2.Client.Helpers .
 module Network.HTTP2.Client (
     -- * Basics
-      newHttp2Client
+      runHttp2Client
     , withHttp2Stream
     , headers
     , sendData
@@ -25,11 +25,15 @@ module Network.HTTP2.Client (
     , IncomingFlowControl(..)
     , OutgoingFlowControl(..)
     -- * Exceptions
-    , linkHttp2Client
+    , linkAsyncs
+    , RemoteSentGoAwayFrame(..)
+    , GoAwayHandler
+    , defaultGoAwayHandler
     -- * Misc.
+    , FallBackFrameHandler
+    , ignoreFallbackHandler
     , FlagSetter
     , Http2ClientAsyncs(..)
-    , wrapFrameClient
     , _gtfo
     -- * Convenience re-exports
     , module Network.HTTP2.Client.FrameConnection
@@ -37,8 +41,8 @@ module Network.HTTP2.Client (
     , module Network.TLS
     ) where
 
-import           Control.Exception (bracket, throw)
-import           Control.Concurrent.Async (Async, async, race, link)
+import           Control.Concurrent.Async (Async, race, withAsync, link)
+import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
@@ -47,7 +51,6 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import           Data.Maybe (fromMaybe)
-import           Data.Monoid ((<>))
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -176,8 +179,9 @@ data Http2Client = Http2Client {
 
 -- | Set of Async threads running an Http2Client.
 --
--- If you add other asyncs here, you should also modify
--- 'linkHttp2Client'.
+-- This asyncs are linked to the thread where the Http2Client is created.
+-- If you modify this structure to add more Async, please also modify
+-- 'linkAsyncs' accordingly.
 data Http2ClientAsyncs = Http2ClientAsyncs {
     _waitSettingsAsync   :: Async (FrameHeader, FramePayload)
   -- ^ Async waiting for the initial settings ACK.
@@ -196,18 +200,15 @@ data Http2ClientAsyncs = Http2ClientAsyncs {
   -- 'incomingFramesLoop'.
   }
 
--- | Links all asyncs threads of a client to the current thread.
---
--- See 'link'.
-linkHttp2Client :: Http2Client -> IO ()
-linkHttp2Client client = 
-    let Http2ClientAsyncs{..} = _asyncs client
-    in do
-        link _waitSettingsAsync
-        link _creditFlowsAsync
-        link _HPACKAsync
-        link _controlFramesAsync
-        link _incomingFramesAsync
+-- | Links all client's asyncs to current thread.
+linkAsyncs :: Http2Client -> IO ()
+linkAsyncs client =
+   let Http2ClientAsyncs{..} = _asyncs client in do
+           link _waitSettingsAsync
+           link _creditFlowsAsync
+           link _HPACKAsync
+           link _controlFramesAsync
+           link _incomingFramesAsync
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {
@@ -277,25 +278,6 @@ data HpackEncoderContext = HpackEncoderContext {
   , _applySettings    :: Int -> IO ()
   }
 
--- | Starts a new Http2Client with a remote Host/Port. TLS ClientParams are
--- mandatory because we only support TLS-protected streams for now.
-newHttp2Client :: HostName
-               -- ^ Host to connect to.
-               -> PortNumber
-               -- ^ Port number to connect to (usually 443 on the web).
-               -> Int
-               -- ^ The buffersize for the Network.HPACK encoder.
-               -> Int
-               -- ^ The buffersize for the Network.HPACK decoder.
-               -> ClientParams
-               -- ^ The TLS client parameters (e.g., to allow some certificates).
-               -> SettingsList
-               -- ^ Initial SETTINGS that are sent as first frame.
-               -> IO Http2Client
-newHttp2Client host port encoderBufSize decoderBufSize tlsParams initSettings = do
-    conn <- newHttp2FrameConnection host port tlsParams
-    wrapFrameClient conn encoderBufSize decoderBufSize initSettings
-
 -- | Starts a new stream (i.e., one HTTP request + server-pushes).
 --
 -- You will typically call the returned 'StreamStarter' immediately to define
@@ -334,12 +316,12 @@ type FlagSetter = FrameFlags -> FrameFlags
 headers :: Http2Stream -> HeaderList -> FlagSetter -> IO StreamThread
 headers = _headers
 
--- | Prepares a client around a frame connection.
+-- | Starts a new Http2Client around a frame connection.
 --
 -- This is mostly useful if you want to muck around the Http2FrameConnection
 -- (e.g., for tracing frames) as well as for unit testing purposes. If you want
 -- to create a new connection you should likely use 'newHttp2Client' instead.
-wrapFrameClient
+runHttp2Client
   :: Http2FrameConnection
   -- ^ A frame connection.
   -> Int
@@ -348,8 +330,16 @@ wrapFrameClient
   -- ^ The buffersize for the Network.HPACK decoder.
   -> SettingsList
   -- ^ Initial SETTINGS that are sent as first frame.
-  -> IO Http2Client
-wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
+  -> GoAwayHandler
+  -- ^ Actions to run when the remote sends a GoAwayFrame
+  -> FallBackFrameHandler
+  -- ^ Actions to run when a control frame is not yet handled in http2-client
+  -- lib (e.g., PRIORITY frames).
+  -> (Http2Client -> IO a)
+  -- ^ Actions to run on the client.
+  -> IO a
+runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler mainHandler = do
+    let _close = closeConnection conn
     -- prepare hpack contexts
     hpackEncoder <- do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
@@ -371,87 +361,82 @@ wrapFrameClient conn encoderBufSize decoderBufSize initSettings = do
     -- Initial thread receiving server frames.
     maxReceivedStreamId  <- newIORef 0
     serverFrames <- newChan
-    aIncoming <- async $ incomingFramesLoop conn serverFrames maxReceivedStreamId
+    let incomingLoop = incomingFramesLoop conn serverFrames maxReceivedStreamId
+    withAsync incomingLoop $ \aIncoming -> do
 
-    -- Thread handling control frames.
-    settings  <- newIORef defaultConnectionSettings
-    controlFrames <- dupChan serverFrames
-    aControl <- async $ incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings
+      -- Thread handling control frames.
+      settings  <- newIORef defaultConnectionSettings
+      controlFrames <- dupChan serverFrames
+      let controlLoop = incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler
+      withAsync controlLoop $ \aControl -> do
+        -- Thread handling push-promises and headers frames serializing the buffers.
+        serverStreamFrames <- dupChan serverFrames
+        serverHeaders <- newChan
+        hpackDecoder <- do
+            dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize decoderBufSize
+            return dt
 
-    -- Thread handling push-promises and headers frames serializing the buffers.
-    serverStreamFrames <- dupChan serverFrames
-    serverHeaders <- newChan
-    hpackDecoder <- do
-        dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize decoderBufSize
-        return dt
+        creditFrames <- dupChan serverFrames
 
-    creditFrames <- dupChan serverFrames
+        _outgoingFlowControl <- newOutgoingFlowControl settings 0 creditFrames
+        _incomingFlowControl <- newIncomingFlowControl settings controlStream
 
-    _outgoingFlowControl <- newOutgoingFlowControl settings 0 creditFrames
-    _incomingFlowControl <- newIncomingFlowControl settings controlStream
+        serverPushPromises <- newChan
 
-    serverPushPromises <- newChan
+        let hpackLoop = incomingHPACKFramesLoop serverStreamFrames serverHeaders serverPushPromises hpackDecoder
+        withAsync hpackLoop $ \aHPACK -> do
+          dataFrames <- dupChan serverFrames
+          let creditLoop = creditDataFramesLoop _incomingFlowControl dataFrames
+          withAsync creditLoop $ \aCredit -> do
+            conccurentStreams <- newIORef 0
+            let _startStream getWork = do
+                    maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings
+                       <$> readIORef settings
+                    roomNeeded <- atomicModifyIORef' conccurentStreams
+                        (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
+                    if roomNeeded > 0
+                    then
+                        return $ Left $ TooMuchConcurrency roomNeeded
+                    else do
+                        cont <- withClientStreamId $ \sid -> do
+                            initializeStream conn
+                                             settings
+                                             serverFrames
+                                             serverHeaders
+                                             serverPushPromises
+                                             hpackEncoder
+                                             sid
+                                             getWork
+                        v <- cont
+                        atomicModifyIORef' conccurentStreams (\n -> (n - 1, ()))
+                        return $ Right v
 
-    aHPACK <- async $ incomingHPACKFramesLoop serverStreamFrames
-                                              serverHeaders
-                                              serverPushPromises
-                                              hpackDecoder
+            let _ping dat = do
+                    -- Need to dupChan before sending the query to avoid missing a fast
+                    -- answer if the network is fast.
+                    pingFrames <- dupChan serverFrames
+                    sendPingFrame controlStream id dat
+                    return $ waitFrame (isPingReply dat) pingFrames
+            let _settings settslist = do
+                    -- Much like _ping, we need to dupChan before sending the query.
+                    pingFrames <- dupChan serverFrames
+                    sendSettingsFrame controlStream id settslist
+                    return $ do
+                        ret <- waitFrame isSettingsReply pingFrames
+                        atomicModifyIORef' settings
+                            (\(ConnectionSettings cli srv) ->
+                                (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
+                        return ret
+            let _goaway err errStr = do
+                    sId <- readIORef maxReceivedStreamId
+                    sendGTFOFrame controlStream sId err errStr
 
-    dataFrames <- dupChan serverFrames
-    aCredit <- async $ creditDataFramesLoop _incomingFlowControl dataFrames
+            let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
 
-    conccurentStreams <- newIORef 0
-    let _startStream getWork = do
-            maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings
-               <$> readIORef settings
-            roomNeeded <- atomicModifyIORef' conccurentStreams
-                (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
-            if roomNeeded > 0
-            then
-                return $ Left $ TooMuchConcurrency roomNeeded
-            else do
-                cont <- withClientStreamId $ \sid -> do
-                    initializeStream conn
-                                     settings
-                                     serverFrames
-                                     serverHeaders
-                                     serverPushPromises
-                                     hpackEncoder
-                                     sid
-                                     getWork
-                v <- cont
-                atomicModifyIORef' conccurentStreams (\n -> (n - 1, ()))
-                return $ Right v
-
-    let _ping dat = do
-            -- Need to dupChan before sending the query to avoid missing a fast
-            -- answer if the network is fast.
-            pingFrames <- dupChan serverFrames
-            sendPingFrame controlStream id dat
-            return $ waitFrame (isPingReply dat) pingFrames
-    let _settings settslist = do
-            -- Much like _ping, we need to dupChan before sending the query.
-            pingFrames <- dupChan serverFrames
-            sendSettingsFrame controlStream id settslist
-            return $ do
-                ret <- waitFrame isSettingsReply pingFrames
-                atomicModifyIORef' settings
-                    (\(ConnectionSettings cli srv) ->
-                        (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
-                return ret
-    let _goaway err errStr = do
-            sId <- readIORef maxReceivedStreamId
-            sendGTFOFrame controlStream sId err errStr
-
-    let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
-
-    aSettings <- async =<< _settings initSettings
-
-    let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aControl aIncoming
-
-    let _close = closeConnection conn
-
-    return $ Http2Client{..}
+            settsIO <- _settings initSettings
+            withAsync settsIO $ \aSettings -> do
+                let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aControl aIncoming
+                mainHandler $ Http2Client{..}
 
 initializeStream
   :: Exception e
@@ -521,11 +506,30 @@ incomingFramesLoop
   -> Chan (FrameHeader, Either HTTP2Error FramePayload)
   -> IORef StreamId
   -> IO ()
-incomingFramesLoop conn frames maxReceivedStreamId = forever $ do
+incomingFramesLoop conn frames maxReceivedStreamId = delayException $ forever $ do
     frame@(fh, _) <- next conn
     -- Remember highest streamId.
     atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
     writeChan frames frame
+
+-- | Runs an action, rethrowing exception 50ms later.
+--
+-- In a context where asynchronous are likely to occur this function gives a
+-- chance to other threads to do some work before Async linking reaps them all.
+--
+-- In particular, servers are likely to close their TCP connection soon after
+-- sending a GoAwayFrame and we want to give a better chance to clients to
+-- observe the GoAwayFrame in their handlers to distinguish GoAwayFrames
+-- followed by TCP disconnection and plain TCP resets. As a result, this
+-- function is mostly used to delay 'incomingFramesLoop'. A more involved
+-- and future design will be to inline the various loop-processes for
+-- incomingFramesLoop and GoAwayHandlers in a same thread (e.g., using
+-- pipe/conduit to retain composability).
+delayException :: IO a -> IO a
+delayException act = act `catch` slowdown
+  where
+    slowdown :: SomeException -> IO a
+    slowdown e = threadDelay 50000 >> throwIO e
 
 incomingControlFramesLoop
   :: Exception e
@@ -534,8 +538,10 @@ incomingControlFramesLoop
   -> HpackEncoderContext
   -> (ByteString -> IO ())
   -> IO ()
+  -> GoAwayHandler
+  -> FallBackFrameHandler
   -> IO ()
-incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = forever $ do
+incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
         (SettingsFrame settsList)
@@ -556,11 +562,43 @@ incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings = for
                 ignore "PingFrame replies waited for in the requestor thread"
         (WindowUpdateFrame _ )  ->
                 ignore "connection-wide WindowUpdateFrame waited for in OutgoingFlowControl threads"
-        _                   -> putStrLn ("UNHANDLED frame: " <> show controlFrame)
+        (GoAwayFrame lastSid errCode reason)  ->
+             goAwayHandler $ RemoteSentGoAwayFrame lastSid errCode reason
+
+        _                   ->
+             fallbackHandler controlFrame
 
   where
     ignore :: String -> IO ()
     ignore _ = return ()
+
+-- | A fallback handler for frames.
+type FallBackFrameHandler = (FrameHeader, FramePayload) -> IO ()
+
+-- | Default FallBackFrameHandler that ignores frames.
+ignoreFallbackHandler :: FallBackFrameHandler
+ignoreFallbackHandler = const $ pure ()
+
+-- | A Handler for exceptional circumstances.
+type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
+
+-- | Default GoAwayHandler throws a 'RemoteSentGoAwayFrame' in the current
+-- thread.
+--
+-- A probably sharper handler if you want to abruptly stop any operation is to
+-- get the 'ThreadId' of the main client thread and using
+-- 'Control.Exception.Base.throwTo'.
+--
+-- There's an inherent race condition when receiving a GoAway frame because the
+-- server will likely close the connection which will lead to TCP errors as
+-- well.
+defaultGoAwayHandler :: GoAwayHandler
+defaultGoAwayHandler = throwIO
+
+-- | An exception thrown when the server sends a GoAwayFrame.
+data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteString
+  deriving Show
+instance Exception RemoteSentGoAwayFrame
 
 -- | We currently need a specific loop for crediting streams because a client
 -- user may programmatically reset and stop listening for a stream and stop
@@ -874,7 +912,7 @@ waitFrame test chan =
   where
     loop = do
         (fHead, fPayload) <- readChan chan
-        let dat = either throw id fPayload
+        dat <- either throwIO pure fPayload
         if test fHead dat
         then return (fHead, dat)
         else loop

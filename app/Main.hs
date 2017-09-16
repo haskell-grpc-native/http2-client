@@ -2,19 +2,19 @@
 {-# LANGUAGE RecordWildCards   #-}
 module Main where
 
-import           Control.Concurrent (forkIO, threadDelay)
+import           Control.Concurrent (forkIO, myThreadId, throwTo, threadDelay)
 import           Control.Concurrent.Async (async, waitAnyCancel)
 import           Control.Monad (forever, when, void)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import           Data.Default.Class (def)
 import           Data.Maybe (fromMaybe)
+import           Data.Monoid ((<>))
 import           Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Network.HTTP2 as HTTP2
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra.Cipher as TLS
 import           Options.Applicative
-import           Data.Monoid ((<>))
 import           System.IO
 
 import Network.HTTP2.Client
@@ -182,50 +182,51 @@ client QueryArgs{..} = do
                       return hdrFrame
                 }
           }
-    conn <- case _verboseDebug of
-        Verbose ->
-            wrapFrameClient wrappedFrameConn _encoderBufsize _decoderBufsize conf
-        NonVerbose ->
-            wrapFrameClient frameConn _encoderBufsize _decoderBufsize conf
-    linkHttp2Client conn
-    _addCredit (_incomingFlowControl conn) _initialWindowKick
-    _ <- forkIO $ forever $ do
-            updated <- _updateWindow $ _incomingFlowControl conn
-            when updated $ timePrint ("sending flow-control update" :: String)
-            threadDelay _interFlowControlUpdates
+    parentThread <- myThreadId
+    let withConn = case _verboseDebug of
+            Verbose ->
+                runHttp2Client wrappedFrameConn _encoderBufsize _decoderBufsize conf defaultGoAwayHandler printUnhandledFrame
+            NonVerbose ->
+                runHttp2Client frameConn _encoderBufsize _decoderBufsize conf (throwTo parentThread) ignoreFallbackHandler
 
-    _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
-        threadDelay _interPingDelay
-        (t0, t1, pingReply) <- ping conn _pingTimeout "pingpong"
-        timePrint $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
+    withConn $ \conn -> do
+      linkAsyncs conn
+      _addCredit (_incomingFlowControl conn) _initialWindowKick
+      _ <- forkIO $ forever $ do
+              updated <- _updateWindow $ _incomingFlowControl conn
+              when updated $ timePrint ("sending flow-control update" :: String)
+              threadDelay _interFlowControlUpdates
 
-    let go 0 idx = timePrint $ "done worker: " <> show idx
-        go n idx = do
-            _ <- (withHttp2Stream conn $ \stream ->
-                    let initStream = do
-                            _ <- async $ onPushPromise stream (ppHandler n idx)
-                            headers stream headersPairs headersFlags
-                        handler streamINFlowControl streamOUTFlowControl = do
-                            timePrint $ "stream started " <> show (idx, n)
-                            _ <- async $ dataPostFunction conn
-                                                          (_outgoingFlowControl conn)
-                                                          stream
-                                                          streamOUTFlowControl
-                            ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
-                            either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
-                            timePrint $ "stream ended " <> show (idx, n)
-                    in StreamDefinition initStream handler)
-            go (n - 1) idx
+      _ <- forkIO $ when (_interPingDelay > 0) $ forever $ do
+          threadDelay _interPingDelay
+          (t0, t1, pingReply) <- ping conn _pingTimeout "pingpong"
+          timePrint $ ("ping-reply:" :: String, pingReply, diffUTCTime t1 t0)
 
-    _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
+      let go 0 idx = timePrint $ "done worker: " <> show idx
+          go n idx = do
+              _ <- (withHttp2Stream conn $ \stream ->
+                      let initStream = do
+                              _ <- async $ onPushPromise stream (ppHandler n idx)
+                              headers stream headersPairs headersFlags
+                          handler streamINFlowControl streamOUTFlowControl = do
+                              timePrint $ "stream started " <> show (idx, n)
+                              _ <- async $ dataPostFunction conn
+                                                            (_outgoingFlowControl conn)
+                                                            stream
+                                                            streamOUTFlowControl
+                              ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
+                              either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
+                              timePrint $ "stream ended " <> show (idx, n)
+                      in StreamDefinition initStream handler)
+              go (n - 1) idx
 
-    when (_finalDelay > 0) (threadDelay _finalDelay)
+      _ <- waitAnyCancel =<< traverse (async . go _numberQueries) [1 .. _concurrentQueriesCount]
 
-    _gtfo conn HTTP2.NoError _finalMessage
+      when (_finalDelay > 0) (threadDelay _finalDelay)
 
-    _close conn
 
-    return ()
+      _gtfo conn HTTP2.NoError _finalMessage
+      _close conn
   where
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
@@ -273,3 +274,6 @@ timePrint :: Show a => a -> IO ()
 timePrint x = do
     tst <- getCurrentTime
     ByteString.hPutStrLn stderr $ ByteString.pack $ show (tst, x)
+
+printUnhandledFrame :: FallBackFrameHandler
+printUnhandledFrame (fh,fp) = timePrint ("UNHANDLED:"::String, fh, fp)
