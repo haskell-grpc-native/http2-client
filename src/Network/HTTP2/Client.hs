@@ -12,7 +12,7 @@ module Network.HTTP2.Client (
     , withHttp2Stream
     , headers
     , sendData
-    -- * Starting streams
+    -- * Starting clients
     , Http2Client(..)
     , PushPromiseHandler
     -- * Starting streams
@@ -317,10 +317,6 @@ headers :: Http2Stream -> HeaderList -> FlagSetter -> IO StreamThread
 headers = _headers
 
 -- | Starts a new Http2Client around a frame connection.
---
--- This is mostly useful if you want to muck around the Http2FrameConnection
--- (e.g., for tracing frames) as well as for unit testing purposes. If you want
--- to create a new connection you should likely use 'newHttp2Client' instead.
 runHttp2Client
   :: Http2FrameConnection
   -- ^ A frame connection.
