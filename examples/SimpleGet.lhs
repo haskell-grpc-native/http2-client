@@ -21,14 +21,21 @@ First, create a connection, you need to specify the host and port you want to
 connect to. Unlike HTTP, HTTP2 proposes to use TLS, hence, the port should
 almost always be 443 instead of 80.
 
-The 8k values corresponds to header sizes for sending/receiving. If you expect
-to receive or send queries with more than 8MB of sent/received buffers, then
-you should tune these values.
+>     frameConn <- newHttp2FrameConnection "www.google.com" 443 tlsParams 
 
-The settings at the list gives the server a warrant to send more bytes as soon
-as the server is ready to send queries (cf. HTTP2 flow control).
+The 'runHttp2Client' function takes control of the current thread so that we
+never leave an internal thread leaking, even in presence of asynchronous
+exceptions (likely in networked systems). Hence, the body of the logic we want
+to perform is passed as a callback to 'runHttp2Client'. This callback is the
+last argument for synctactic reason.
 
->     conn <- newHttp2Client "www.google.com" 443 8192 8192 tlsParams [(SettingsInitialWindowSize,10000000)]
+We also need to give more arguments to 'runHttp2Client'. The 8k values
+corresponds to header sizes for sending/receiving. If you expect to receive or
+send queries with more than 8MB of sent/received buffers, then you should tune
+these values. The settings at the list gives the server a warrant to send more
+bytes as soon as the server is ready to send queries (cf. HTTP2 flow control).
+
+>     runHttp2Client frameConn 8192 8192 [(SettingsInitialWindowSize,10000000)] defaultGoAwayHandler ignoreFallbackHandler $ \conn -> do
 
 We need to update the flow-control window for a snappy experience, so add
 credit to the whole connection (else the SettingsInitialWindowSize would be

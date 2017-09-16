@@ -1,5 +1,5 @@
 name:                http2-client
-version:             0.3.0.3
+version:             0.4.0.0
 synopsis:            A native HTTP2 client library.
 description:         Please read the README.md at the homepage.
 homepage:            https://github.com/lucasdicioccio/http2-client
@@ -33,7 +33,7 @@ library
 executable http2-client-exe
   hs-source-dirs:      app
   main-is:             Main.hs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N
+  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -O2
   build-depends:       base
                      , async
                      , bytestring
