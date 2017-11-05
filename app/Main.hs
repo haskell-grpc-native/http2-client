@@ -162,7 +162,7 @@ client QueryArgs{..} = do
                ]
     timePrint conf
 
-    frameConn <- newHttp2FrameConnection _host _port tlsParams
+    frameConn <- newHttp2FrameConnection _host _port (Just tlsParams)
     let wrappedFrameConn = frameConn {
             _makeFrameClientStream = \sid ->
                 let frameClient = (_makeFrameClientStream frameConn) sid

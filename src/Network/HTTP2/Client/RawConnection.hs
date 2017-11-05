@@ -30,11 +30,11 @@ newRawHttp2Connection :: HostName
                       -- ^ Server's hostname.
                       -> PortNumber
                       -- ^ Server's port to connect to.
-                      -> TLS.ClientParams
+                      -> Maybe TLS.ClientParams
                       -- ^ TLS parameters. The 'TLS.onSuggestALPN' hook is
                       -- overwritten to always return ["h2", "h2-17"].
                       -> IO RawHttp2Connection
-newRawHttp2Connection host port params = do
+newRawHttp2Connection host port mparams = do
     -- Connects to SSL.
     ctx <- initConnectionContext
     conn <- connectTo ctx connParams
@@ -49,8 +49,8 @@ newRawHttp2Connection host port params = do
 
     return $ RawHttp2Connection putRaw getRaw doClose
   where
-    overwrittenALPNHook = (TLS.clientHooks params) {
+    overwriteALPNHook params = (TLS.clientHooks params) {
         TLS.onSuggestALPN = return $ Just [ "h2", "h2-17" ]
       }
-    modifiedParams = params { TLS.clientHooks = overwrittenALPNHook }
-    connParams = ConnectionParams host port (Just . TLSSettings $ modifiedParams) Nothing
+    modifyParams params = params { TLS.clientHooks = overwriteALPNHook params }
+    connParams = ConnectionParams host port (TLSSettings . modifyParams <$> mparams) Nothing

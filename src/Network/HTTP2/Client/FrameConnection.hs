@@ -71,7 +71,7 @@ next = _nextHeaderAndFrame . _serverStream
 -- | Creates a new 'Http2FrameConnection' to a given host for a frame-to-frame communication.
 newHttp2FrameConnection :: HostName
                         -> PortNumber
-                        -> TLS.ClientParams
+                        -> Maybe TLS.ClientParams
                         -> IO Http2FrameConnection
 newHttp2FrameConnection host port params = do
     -- Spawns an HTTP2 connection.
