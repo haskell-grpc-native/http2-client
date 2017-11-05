@@ -12,7 +12,7 @@ module Network.HTTP2.Client (
     , withHttp2Stream
     , headers
     , sendData
-    -- * Starting streams
+    -- * Starting clients
     , Http2Client(..)
     , PushPromiseHandler
     -- * Starting streams
@@ -45,7 +45,6 @@ import           Control.Concurrent.Async (Async, race, withAsync, link)
 import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
-import           Control.Concurrent.Chan (Chan, newChan, dupChan, readChan, writeChan)
 import           Control.Monad (forever, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -57,6 +56,7 @@ import           Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
 
+import           Network.HTTP2.Client.Channels
 import           Network.HTTP2.Client.FrameConnection
 
 -- | Offers credit-based flow-control.
@@ -317,10 +317,6 @@ headers :: Http2Stream -> HeaderList -> FlagSetter -> IO StreamThread
 headers = _headers
 
 -- | Starts a new Http2Client around a frame connection.
---
--- This is mostly useful if you want to muck around the Http2FrameConnection
--- (e.g., for tracing frames) as well as for unit testing purposes. If you want
--- to create a new connection you should likely use 'newHttp2Client' instead.
 runHttp2Client
   :: Http2FrameConnection
   -- ^ A frame connection.
@@ -622,12 +618,6 @@ data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
 
-type FramesChan e = Chan (FrameHeader, Either e FramePayload)
-type HeadersChanContent = (FrameHeader, StreamId, Either ErrorCode HeaderList)
-type HeadersChan = Chan HeadersChanContent
-type PushPromisesChanContent e = (StreamId, FramesChan e, HeadersChan, StreamId, HeaderList)
-type PushPromisesChan e = Chan (PushPromisesChanContent e)
-
 incomingHPACKFramesLoop
   :: Exception e
   => FramesChan e
@@ -878,82 +868,3 @@ sendPriorityFrame s p = do
     let payload = PriorityFrame p
     sendOne s id payload
     return ()
-
-waitFrameWithStreamId
-  :: Exception e
-  => StreamId
-  -> FramesChan e
-  -> IO (FrameHeader, FramePayload)
-waitFrameWithStreamId sid = waitFrame (\h _ -> streamId h == sid)
-
-waitFrameWithTypeId
-  :: (Exception e)
-  => [FrameTypeId]
-  -> FramesChan e
-  -> IO (FrameHeader, FramePayload)
-waitFrameWithTypeId tids = waitFrame (\_ p -> HTTP2.framePayloadToFrameTypeId p `elem` tids)
-
-waitFrameWithTypeIdForStreamId
-  :: (Exception e)
-  => StreamId
-  -> [FrameTypeId]
-  -> FramesChan e
-  -> IO (FrameHeader, FramePayload)
-waitFrameWithTypeIdForStreamId sid tids =
-    waitFrame (\h p -> streamId h == sid && HTTP2.framePayloadToFrameTypeId p `elem` tids)
-
-waitFrame
-  :: Exception e
-  => (FrameHeader -> FramePayload -> Bool)
-  -> FramesChan e
-  -> IO (FrameHeader, FramePayload)
-waitFrame test chan =
-    loop
-  where
-    loop = do
-        (fHead, fPayload) <- readChan chan
-        dat <- either throwIO pure fPayload
-        if test fHead dat
-        then return (fHead, dat)
-        else loop
-
-isPingReply :: ByteString -> FrameHeader -> FramePayload -> Bool
-isPingReply datSent _ (PingFrame datRcv) = datSent == datRcv
-isPingReply _       _ _                  = False
-
-isSettingsReply :: FrameHeader -> FramePayload -> Bool
-isSettingsReply fh (SettingsFrame _) = HTTP2.testAck (flags fh)
-isSettingsReply _ _                  = False
-
-waitHeadersWithStreamId
-  :: StreamId
-  -> HeadersChan
-  -> IO HeadersChanContent
-waitHeadersWithStreamId sid =
-    waitHeaders (\_ s _ -> s == sid)
-
-waitHeaders
-  :: (FrameHeader -> StreamId -> Either ErrorCode HeaderList -> Bool)
-  -> HeadersChan
-  -> IO HeadersChanContent
-waitHeaders test chan =
-    loop
-  where
-    loop = do
-        tuple@(fH, sId, hdrs) <- readChan chan
-        if test fH sId hdrs
-        then return tuple
-        else loop
-
-waitPushPromiseWithParentStreamId
-  :: StreamId
-  -> PushPromisesChan e
-  -> IO (PushPromisesChanContent e)
-waitPushPromiseWithParentStreamId sid chan =
-    loop
-  where
-    loop = do
-        tuple@(parentSid,_,_,_,_) <- readChan chan
-        if parentSid == sid
-        then return tuple
-        else loop
