@@ -395,10 +395,12 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                         return $ Left $ TooMuchConcurrency roomNeeded
                     else do
                         cont <- withClientStreamId $ \sid -> do
+                            streamHeaders <- dupChan serverHeaders
+                            streamFrames <- dupChan serverFrames
                             initializeStream conn
                                              settings
-                                             serverFrames
-                                             serverHeaders
+                                             streamFrames
+                                             streamHeaders
                                              serverPushPromises
                                              hpackEncoder
                                              sid
@@ -445,13 +447,11 @@ initializeStream
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn settings serverFrames serverHeaders serverPushPromises hpackEncoder sid getWork = do
+initializeStream conn settings frames headersFrames serverPushPromises hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
 
     -- Register interest in frames.
-    frames  <- dupChan serverFrames
-    credits <- dupChan serverFrames
-    headersFrames <- dupChan serverHeaders
+    credits <- dupChan frames
     pushPromises <- dupChan serverPushPromises
 
     -- Builds a flow-control context.
