@@ -141,6 +141,10 @@ fromStreamResult (headersE, chunksE) = do
 -- | Sequentially wait for every push-promise with a handler.
 --
 -- This function runs forever and you should wrap it with 'withAsync'.
+-- This function immediately returns if run on a stream that has no PushPromise
+-- handler (i.e., server-streams when already waiting for push promises).
 onPushPromise :: Http2Stream -> PushPromiseHandler -> IO ()
-onPushPromise stream handler = forever $ do
-    _waitPushPromise stream handler
+onPushPromise stream handler =
+    case _waitPushPromise stream of
+        Nothing -> pure ()
+        Just w  -> forever $ w handler

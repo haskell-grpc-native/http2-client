@@ -257,7 +257,7 @@ data Http2Stream = Http2Stream {
   -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
   -- to chunk and send naively according to server\'s preferences. This function
   -- can be useful if you intend to handle the framing yourself.
-  , _waitPushPromise :: PushPromiseHandler -> IO ()
+  , _waitPushPromise :: Maybe (PushPromiseHandler -> IO ())
   }
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
@@ -397,11 +397,12 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                         cont <- withClientStreamId $ \sid -> do
                             streamHeaders <- dupChan serverHeaders
                             streamFrames <- dupChan serverFrames
+                            streamPP <- dupChan serverPushPromises
                             initializeStream conn
                                              settings
                                              streamFrames
                                              streamHeaders
-                                             serverPushPromises
+                                             (Just streamPP)
                                              hpackEncoder
                                              sid
                                              getWork
@@ -442,17 +443,17 @@ initializeStream
   -> IORef ConnectionSettings
   -> FramesChan e
   -> HeadersChan
-  -> PushPromisesChan e
+  -> Maybe (PushPromisesChan e)
+  -- ^ Just some PushPromiseChan for new client streams. Nothing for server
+  -- streams.
   -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn settings frames headersFrames serverPushPromises hpackEncoder sid getWork = do
+initializeStream conn settings frames headersFrames mPushPromises hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
-
     -- Register interest in frames.
     credits <- dupChan frames
-    pushPromises <- dupChan serverPushPromises
 
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl settings frameStream
@@ -476,18 +477,19 @@ initializeStream conn settings frames headersFrames serverPushPromises hpackEnco
     let _sendDataChunk  = sendDataFrame frameStream
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
-    let _waitPushPromise ppHandler = do
+    let makeWaitPushPromise pushPromises ppHandler = do
             (_,ppFrames,ppHeaders,ppSid,ppReadHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
             let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream ppReadHeaders)
             ppCont <- initializeStream conn
                                        settings
                                        ppFrames
                                        ppHeaders
-                                       serverPushPromises
+                                       Nothing
                                        hpackEncoder
                                        ppSid
                                        mkStreamActions
             ppCont
+    let _waitPushPromise = fmap makeWaitPushPromise mPushPromises
 
     let streamActions = getWork $ Http2Stream{..}
 
