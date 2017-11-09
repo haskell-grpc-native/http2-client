@@ -5,6 +5,7 @@ query() {
   local host=$2
   local port=$3
   local path=$4
+  local ppprefix=$5
 
   http2-client-exe \
 	--initial-window-kick 10000000 \
@@ -12,7 +13,8 @@ query() {
 	--verb $verb \
 	--host $host \
 	--port $port \
-	--path $path
+	--path $path \
+	--push-files-prefix $ppprefix
 }
 
 commit=`git rev-parse HEAD | head -c 8`
@@ -20,8 +22,9 @@ commit=`git rev-parse HEAD | head -c 8`
 mkdir -p $commit
 
 for host in `grep -v '^#' $1`; do
-	path="${commit}/${host}"
+	dir="${commit}/${host}"
 	echo "**************************************"
 	echo $host
-        query GET $host 443 / > $path
+	mkdir $dir
+        query GET $host 443 / $dir
 done
