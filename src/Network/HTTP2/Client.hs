@@ -505,16 +505,14 @@ delayException act = act `catch` slowdown
     slowdown e = threadDelay 50000 >> throwIO e
 
 dispatchControlFramesLoop
-  :: Exception e
-  => Chan (FrameHeader, Either e FramePayload)
+  :: DispatchChan
   -> DispatchControl
   -> IO ()
 dispatchControlFramesLoop c d =
     forever $ dispatchControlFramesStep c d
 
 dispatchControlFramesStep
-  :: Exception e
-  => Chan (FrameHeader, Either e FramePayload)
+  :: DispatchChan
   -> DispatchControl
   -> IO ()
 dispatchControlFramesStep frames (DispatchControl{..}) = do
@@ -555,9 +553,8 @@ dispatchControlFramesStep frames (DispatchControl{..}) = do
 -- TODO: modify the '_rst' function to wait and credit all the remaining data
 -- that could have been sent in flight
 creditDataFramesLoop
-  :: Exception e
-  => IncomingFlowControl
-  -> Chan (FrameHeader, Either e FramePayload)
+  :: IncomingFlowControl
+  -> DispatchChan
   -> IO ()
 creditDataFramesLoop flowControl frames = forever $ do
     (fh,_) <- waitFrameWithTypeId [FrameData] frames
@@ -571,17 +568,15 @@ data HPACKLoopDecision =
   | OpenPushPromise !StreamId !StreamId
 
 dispatchHPACKFramesLoop
-  :: Exception e
-  => FramesChan e
-  -> DispatchHPACK e
+  :: DispatchChan
+  -> DispatchHPACK
   -> IO ()
 dispatchHPACKFramesLoop c d =
     forever $ dispatchHPACKFramesStep c d
 
 dispatchHPACKFramesStep
-  :: Exception e
-  => FramesChan e
-  -> DispatchHPACK e
+  :: DispatchChan
+  -> DispatchHPACK
   -> IO ()
 dispatchHPACKFramesStep frames (DispatchHPACK{..}) = do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream

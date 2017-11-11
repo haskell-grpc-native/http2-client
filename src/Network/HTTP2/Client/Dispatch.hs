@@ -10,8 +10,7 @@ import           Network.HTTP2 as HTTP2
 
 import           Network.HTTP2.Client.Channels
 
-type DispatchChan = Chan (FrameHeader, Either HTTP2Error FramePayload)
--- type DispatchChan = FramesChan HTTP2Error
+type DispatchChan = FramesChan HTTP2Error
 
 -- | A fallback handler for frames.
 type FallBackFrameHandler = (FrameHeader, FramePayload) -> IO ()
@@ -108,13 +107,13 @@ data HpackEncoderContext = HpackEncoderContext {
   , _applySettings    :: Size -> IO ()
   }
 
-data DispatchHPACK e = DispatchHPACK {
+data DispatchHPACK = DispatchHPACK {
     _dispatchHPACKWriteHeadersChan      :: !HeadersChan
-  , _dispatchHPACKWritePushPromisesChan :: !(PushPromisesChan e)
+  , _dispatchHPACKWritePushPromisesChan :: !(PushPromisesChan HTTP2Error)
   , _dispatchHPACKDynamicTable          :: !DynamicTable
   }
 
-newDispatchHPACKIO :: Size -> IO (DispatchHPACK e)
+newDispatchHPACKIO :: Size -> IO DispatchHPACK
 newDispatchHPACKIO decoderBufSize =
     DispatchHPACK <$> newChan <*> newChan <*> newDecoder
   where
@@ -122,10 +121,10 @@ newDispatchHPACKIO decoderBufSize =
         HPACK.defaultDynamicTableSize
         decoderBufSize
 
-newDispatchHPACKReadHeadersChanIO :: DispatchHPACK e -> IO HeadersChan
+newDispatchHPACKReadHeadersChanIO :: DispatchHPACK -> IO HeadersChan
 newDispatchHPACKReadHeadersChanIO =
     dupChan . _dispatchHPACKWriteHeadersChan
 
-newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK e -> IO (PushPromisesChan e)
+newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK -> IO (PushPromisesChan HTTP2Error)
 newDispatchHPACKReadPushPromisesChanIO =
     dupChan . _dispatchHPACKWritePushPromisesChan
