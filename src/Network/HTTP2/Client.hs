@@ -328,64 +328,63 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
     let incomingLoop = dispatchLoop conn dispatch dispatchControl _incomingFlowControl dispatchHPACK
 
     withAsync incomingLoop $ \aIncoming -> do
+        conccurentStreams <- newIORef 0
+        -- prepare client streams
+        clientStreamIdMutex <- newMVar 0
+        let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
+                (putMVar clientStreamIdMutex . succ)
+                (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
 
-            conccurentStreams <- newIORef 0
-            -- prepare client streams
-            clientStreamIdMutex <- newMVar 0
-            let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
-                    (putMVar clientStreamIdMutex . succ)
-                    (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
+        let _startStream getWork = do
+                maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
+                roomNeeded <- atomicModifyIORef' conccurentStreams
+                    (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
+                if roomNeeded > 0
+                then
+                    return $ Left $ TooMuchConcurrency roomNeeded
+                else Right <$> do
+                    cont <- withClientStreamId $ \sid -> do
+                        streamHeaders <- newDispatchHPACKReadHeadersChanIO dispatchHPACK
+                        streamFrames <- newDispatchReadChanIO dispatch
+                        streamPP <- newDispatchHPACKReadPushPromisesChanIO dispatchHPACK
+                        initializeStream conn
+                                         dispatchControl
+                                         streamFrames
+                                         streamHeaders
+                                         (Just streamPP)
+                                         sid
+                                         getWork
+                    v <- cont
+                    atomicModifyIORef' conccurentStreams (\n -> (n - 1, ()))
+                    pure v
 
-            let _startStream getWork = do
-                    maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
-                    roomNeeded <- atomicModifyIORef' conccurentStreams
-                        (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
-                    if roomNeeded > 0
-                    then
-                        return $ Left $ TooMuchConcurrency roomNeeded
-                    else do
-                        cont <- withClientStreamId $ \sid -> do
-                            streamHeaders <- newDispatchHPACKReadHeadersChanIO dispatchHPACK
-                            streamFrames <- newDispatchReadChanIO dispatch
-                            streamPP <- newDispatchHPACKReadPushPromisesChanIO dispatchHPACK
-                            initializeStream conn
-                                             dispatchControl
-                                             streamFrames
-                                             streamHeaders
-                                             (Just streamPP)
-                                             sid
-                                             getWork
-                        v <- cont
-                        atomicModifyIORef' conccurentStreams (\n -> (n - 1, ()))
-                        return $ Right v
+        let _ping dat = do
+                -- Need to dupChan before sending the query to avoid missing a fast
+                -- answer if the network is fast.
+                pingFrames <- newDispatchReadChanIO dispatch
+                sendPingFrame controlStream id dat
+                return $ waitFrame (isPingReply dat) pingFrames
+        let _settings settslist = do
+                -- Much like _ping, we need to dupChan before sending the query.
+                settingsFrames <- newDispatchReadChanIO dispatch
+                sendSettingsFrame controlStream id settslist
+                return $ do
+                    ret <- waitFrame isSettingsReply settingsFrames
+                    modifySettings dispatchControl
+                        (\(ConnectionSettings cli srv) ->
+                            (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
+                    return ret
+        let _goaway err errStr = do
+                sId <- readMaxReceivedStreamIdIO dispatch
+                sendGTFOFrame controlStream sId err errStr
 
-            let _ping dat = do
-                    -- Need to dupChan before sending the query to avoid missing a fast
-                    -- answer if the network is fast.
-                    pingFrames <- newDispatchReadChanIO dispatch
-                    sendPingFrame controlStream id dat
-                    return $ waitFrame (isPingReply dat) pingFrames
-            let _settings settslist = do
-                    -- Much like _ping, we need to dupChan before sending the query.
-                    pingFrames <- newDispatchReadChanIO dispatch
-                    sendSettingsFrame controlStream id settslist
-                    return $ do
-                        ret <- waitFrame isSettingsReply pingFrames
-                        modifySettings dispatchControl
-                            (\(ConnectionSettings cli srv) ->
-                                (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
-                        return ret
-            let _goaway err errStr = do
-                    sId <- readMaxReceivedStreamIdIO dispatch
-                    sendGTFOFrame controlStream sId err errStr
+        let _paylodSplitter = settingsPayloadSplitter <$> readSettings dispatchControl
 
-            let _paylodSplitter = settingsPayloadSplitter <$> readSettings dispatchControl
-
-            settsIO <- _settings initSettings
-            withAsync settsIO $ \aSettings -> do
-                let _asyncs = Http2ClientAsyncs aSettings aIncoming
-                let _close = closeConnection conn
-                mainHandler $ Http2Client{..}
+        settsIO <- _settings initSettings
+        withAsync settsIO $ \aSettings -> do
+            let _asyncs = Http2ClientAsyncs aSettings aIncoming
+            let _close = closeConnection conn
+            mainHandler $ Http2Client{..}
 
 initializeStream
   :: Exception e
