@@ -464,9 +464,13 @@ dispatchLoop conn d dc inFlowControl dh = do
         whenFrame (hasTypeId [FrameData]) frame $ \got ->
             creditDataFramesStep inFlowControl got
         whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
-            let hpackLoop (FinishedWithHeaders act) = act
-                hpackLoop (WaitContinuation act)    = getNextFrame >>= act >>= hpackLoop
-            hpackLoop (dispatchHPACKFramesStep d got dh)
+            let hpackLoop (FinishedWithHeaders act)     =
+                    act
+                hpackLoop (FinishedWithPushPromise act) = do
+                    newDispatchReadChanIO d >>= act
+                hpackLoop (WaitContinuation act)        =
+                    getNextFrame >>= act >>= hpackLoop
+            hpackLoop (dispatchHPACKFramesStep got dh)
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -534,13 +538,13 @@ data HPACKLoopDecision =
 data HPACKStepResult =
     WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> IO HPACKStepResult)
   | FinishedWithHeaders !(IO ())
+  | FinishedWithPushPromise !(DispatchChan -> IO ())
 
 dispatchHPACKFramesStep
-  :: Dispatch
-  -> (FrameHeader, FramePayload)
+  :: (FrameHeader, FramePayload)
   -> DispatchHPACK
   -> HPACKStepResult
-dispatchHPACKFramesStep d (fh,fp) (DispatchHPACK{..}) =
+dispatchHPACKFramesStep (fh,fp) (DispatchHPACK{..}) =
     let (decision, pattern) = case fp of
             PushPromiseFrame ppSid hbf -> do
                 (OpenPushPromise sid ppSid, Right hbf)
@@ -571,22 +575,21 @@ dispatchHPACKFramesStep d (fh,fp) (DispatchHPACK{..}) =
                         return $ go lastFh decision (Left err)
                     _                     ->
                         error "continued frame has invalid type")
-        else FinishedWithHeaders $ do
-            newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
-            case decision of
-                ForwardHeader sId ->
-                    writeChan _dispatchHPACKWriteHeadersChan (curFh, sId, Right newHdrs)
-                OpenPushPromise parentSid newSid -> do
-                    -- Important: We duplicate the channel here or we risk
-                    -- losing DATA or HEADERS+CONTINUATION frames sent over
-                    -- the main stream because even though
-                    -- 'initializeStream' dupes frame channels, this
-                    -- function will has no guarantee that the parent
-                    -- stream and the push-promise handler that will
-                    -- initiate the new stream are synchronous.
-                    ppChan <- newDispatchReadChanIO d
-                    ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
-                    writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
+        else case decision of
+            ForwardHeader sId -> FinishedWithHeaders $ do
+                newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
+                writeChan _dispatchHPACKWriteHeadersChan (curFh, sId, Right newHdrs)
+            OpenPushPromise parentSid newSid -> FinishedWithPushPromise $ \ppChan -> do
+                newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
+                -- Important: We duplicate the channel here or we risk
+                -- losing DATA or HEADERS+CONTINUATION frames sent over
+                -- the main stream because even though
+                -- 'initializeStream' dupes frame channels, this
+                -- function will has no guarantee that the parent
+                -- stream and the push-promise handler that will
+                -- initiate the new stream are synchronous.
+                ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
+                writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
 
     go curFh _ (Left err) = FinishedWithHeaders $
         writeChan _dispatchHPACKWriteHeadersChan (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
