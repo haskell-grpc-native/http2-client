@@ -57,6 +57,7 @@ import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
 
 import           Network.HTTP2.Client.Channels
+import           Network.HTTP2.Client.Dispatch
 import           Network.HTTP2.Client.FrameConnection
 
 -- | Offers credit-based flow-control.
@@ -210,16 +211,6 @@ linkAsyncs client =
            link _controlFramesAsync
            link _incomingFramesAsync
 
--- | Couples client and server settings together.
-data ConnectionSettings = ConnectionSettings {
-    _clientSettings :: !Settings
-  , _serverSettings :: !Settings
-  }
-
-defaultConnectionSettings :: ConnectionSettings
-defaultConnectionSettings =
-    ConnectionSettings defaultSettings defaultSettings
-
 -- | Synonym of '_goaway'.
 --
 -- https://github.com/http2/http2-spec/pull/366
@@ -271,12 +262,6 @@ data Http2Stream = Http2Stream {
 -- '_startStream' instead of 'newHttp2Client' (as it is for now).
 type PushPromiseHandler =
     StreamId -> Http2Stream -> HeaderList -> IncomingFlowControl -> OutgoingFlowControl -> IO ()
-
--- | Helper to carry around the HPACK encoder for outgoing header blocks..
-data HpackEncoderContext = HpackEncoderContext {
-    _encodeHeaders    :: HeaderList -> IO HeaderBlockFragment
-  , _applySettings    :: Int -> IO ()
-  }
 
 -- | Starts a new stream (i.e., one HTTP request + server-pushes).
 --
@@ -492,22 +477,6 @@ initializeStream conn settings frames headersFrames mPushPromises hpackEncoder s
     -- Returns 2nd action.
     return $ _handleStream streamActions incomingStreamFlowControl outgoingStreamFlowControl
 
-type DispatchChan = Chan (FrameHeader, Either HTTP2Error FramePayload)
-
-data Dispatch = Dispatch {
-    _dispatchWriteChan   :: !DispatchChan
-  , _dispatchMaxStreamId :: !(IORef StreamId)
-  }
-
-newDispatchIO :: IO Dispatch
-newDispatchIO = Dispatch <$> newChan <*> newIORef 0
-
-newDispatchReadChanIO :: Dispatch -> IO DispatchChan
-newDispatchReadChanIO = dupChan . _dispatchWriteChan
-
-readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
-readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId
-
 dispatchFramesLoop
   :: Http2FrameConnection
   -> Dispatch
@@ -536,15 +505,6 @@ delayException act = act `catch` slowdown
   where
     slowdown :: SomeException -> IO a
     slowdown e = threadDelay 50000 >> throwIO e
-
-data DispatchControl = DispatchControl {
-    _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
-  , _dispatchControlHpackEncoder        :: !HpackEncoderContext
-  , _dispatchControlAckPing             :: !(ByteString -> IO ())
-  , _dispatchControlAckSettings         :: !(IO ())
-  , _dispatchControlOnGoAway            :: !GoAwayHandler
-  , _dispatchControlOnFallback          :: !FallBackFrameHandler
-  }
 
 incomingControlFramesLoop
   :: Exception e
@@ -582,34 +542,6 @@ incomingControlFramesLoop frames (DispatchControl{..}) = forever $ do
     ignore :: String -> IO ()
     ignore _ = return ()
 
--- | A fallback handler for frames.
-type FallBackFrameHandler = (FrameHeader, FramePayload) -> IO ()
-
--- | Default FallBackFrameHandler that ignores frames.
-ignoreFallbackHandler :: FallBackFrameHandler
-ignoreFallbackHandler = const $ pure ()
-
--- | A Handler for exceptional circumstances.
-type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
-
--- | Default GoAwayHandler throws a 'RemoteSentGoAwayFrame' in the current
--- thread.
---
--- A probably sharper handler if you want to abruptly stop any operation is to
--- get the 'ThreadId' of the main client thread and using
--- 'Control.Exception.Base.throwTo'.
---
--- There's an inherent race condition when receiving a GoAway frame because the
--- server will likely close the connection which will lead to TCP errors as
--- well.
-defaultGoAwayHandler :: GoAwayHandler
-defaultGoAwayHandler = throwIO
-
--- | An exception thrown when the server sends a GoAwayFrame.
-data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteString
-  deriving Show
-instance Exception RemoteSentGoAwayFrame
-
 -- | We currently need a specific loop for crediting streams because a client
 -- user may programmatically reset and stop listening for a stream and stop
 -- calling waitData (which credits streams).
@@ -631,28 +563,6 @@ creditDataFramesLoop flowControl frames = forever $ do
 data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
-
-data DispatchHPACK e = DispatchHPACK {
-    _dispatchHPACKWriteHeadersChan      :: !HeadersChan
-  , _dispatchHPACKWritePushPromisesChan :: !(PushPromisesChan e)
-  , _dispatchHPACKDynamicTable          :: !DynamicTable
-  }
-
-newDispatchHPACKIO :: Int -> IO (DispatchHPACK e)
-newDispatchHPACKIO decoderBufSize =
-    DispatchHPACK <$> newChan <*> newChan <*> newDecoder
-  where
-    newDecoder = newDynamicTableForDecoding
-        HPACK.defaultDynamicTableSize
-        decoderBufSize
-
-newDispatchHPACKReadHeadersChanIO :: DispatchHPACK e -> IO HeadersChan
-newDispatchHPACKReadHeadersChanIO =
-    dupChan . _dispatchHPACKWriteHeadersChan
-
-newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK e -> IO (PushPromisesChan e)
-newDispatchHPACKReadPushPromisesChanIO =
-    dupChan . _dispatchHPACKWritePushPromisesChan
 
 incomingHPACKFramesLoop
   :: Exception e
