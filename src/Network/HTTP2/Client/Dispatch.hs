@@ -3,7 +3,7 @@ module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
 import           Data.ByteString (ByteString)
-import           Data.IORef (IORef, newIORef, readIORef)
+import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -73,6 +73,27 @@ data DispatchControl = DispatchControl {
   , _dispatchControlOnGoAway            :: !GoAwayHandler
   , _dispatchControlOnFallback          :: !FallBackFrameHandler
   }
+
+newDispatchControlIO
+  :: HpackEncoderContext
+  -> (ByteString -> IO ())
+  -> (IO ())
+  -> GoAwayHandler
+  -> FallBackFrameHandler
+  -> IO DispatchControl
+newDispatchControlIO hpack ackPing ackSetts onGoAway onFallback =
+    DispatchControl <$> newIORef defaultConnectionSettings
+                    <*> pure hpack
+                    <*> pure ackPing
+                    <*> pure ackSetts
+                    <*> pure onGoAway
+                    <*> pure onFallback
+
+readSettings :: DispatchControl -> IO ConnectionSettings
+readSettings = readIORef . _dispatchControlConnectionSettings
+
+modifySettings :: DispatchControl -> (ConnectionSettings -> (ConnectionSettings, a)) -> IO a
+modifySettings d = atomicModifyIORef' (_dispatchControlConnectionSettings d)
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext {

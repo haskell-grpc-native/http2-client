@@ -48,7 +48,7 @@ import           Control.Concurrent (threadDelay)
 import           Control.Monad (forever, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
+import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
 import           Data.Maybe (fromMaybe)
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
@@ -343,18 +343,21 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
     dispatch  <- newDispatchIO
     let incomingLoop = dispatchFramesLoop conn dispatch
     withAsync incomingLoop $ \aIncoming -> do
-
       -- Thread handling control frames.
-      settings  <- newIORef defaultConnectionSettings
       controlFrames <- newDispatchReadChanIO dispatch
-      let controlLoop = dispatchControlFramesLoop controlFrames (DispatchControl settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler)
+      dispatchControl <- newDispatchControlIO hpackEncoder
+                                              ackPing
+                                              ackSettings
+                                              goAwayHandler
+                                              fallbackHandler
+      let controlLoop = dispatchControlFramesLoop controlFrames dispatchControl
       withAsync controlLoop $ \aControl -> do
         -- Thread handling push-promises and headers frames serializing the buffers.
         serverStreamFrames <- newDispatchReadChanIO dispatch
         creditFrames <- newDispatchReadChanIO dispatch
 
-        _outgoingFlowControl <- newOutgoingFlowControl settings 0 creditFrames
-        _incomingFlowControl <- newIncomingFlowControl settings controlStream
+        _outgoingFlowControl <- newOutgoingFlowControl dispatchControl 0 creditFrames
+        _incomingFlowControl <- newIncomingFlowControl dispatchControl controlStream
 
         dispatchHPACK <- newDispatchHPACKIO decoderBufSize
         let hpackLoop = dispatchHPACKFramesLoop serverStreamFrames dispatchHPACK
@@ -364,8 +367,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
           withAsync creditLoop $ \aCredit -> do
             conccurentStreams <- newIORef 0
             let _startStream getWork = do
-                    maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings
-                       <$> readIORef settings
+                    maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
                     roomNeeded <- atomicModifyIORef' conccurentStreams
                         (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
                     if roomNeeded > 0
@@ -377,7 +379,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                             streamFrames <- newDispatchReadChanIO dispatch
                             streamPP <- newDispatchHPACKReadPushPromisesChanIO dispatchHPACK
                             initializeStream conn
-                                             settings
+                                             dispatchControl
                                              streamFrames
                                              streamHeaders
                                              (Just streamPP)
@@ -400,7 +402,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                     sendSettingsFrame controlStream id settslist
                     return $ do
                         ret <- waitFrame isSettingsReply pingFrames
-                        atomicModifyIORef' settings
+                        modifySettings dispatchControl
                             (\(ConnectionSettings cli srv) ->
                                 (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
                         return ret
@@ -408,7 +410,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                     sId <- readMaxReceivedStreamIdIO dispatch
                     sendGTFOFrame controlStream sId err errStr
 
-            let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
+            let _paylodSplitter = settingsPayloadSplitter <$> readSettings dispatchControl
 
             settsIO <- _settings initSettings
             withAsync settsIO $ \aSettings -> do
@@ -418,7 +420,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
 initializeStream
   :: Exception e
   => Http2FrameConnection
-  -> IORef ConnectionSettings
+  -> DispatchControl
   -> FramesChan e
   -> HeadersChan
   -> Maybe (PushPromisesChan e)
@@ -428,18 +430,18 @@ initializeStream
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn settings frames headersFrames mPushPromises hpackEncoder sid getWork = do
+initializeStream conn control frames headersFrames mPushPromises hpackEncoder sid getWork = do
     let frameStream = makeFrameClientStream conn sid
     -- Register interest in frames.
     credits <- dupChan frames
 
     -- Builds a flow-control context.
-    incomingStreamFlowControl <- newIncomingFlowControl settings frameStream
-    outgoingStreamFlowControl <- newOutgoingFlowControl settings sid credits
+    incomingStreamFlowControl <- newIncomingFlowControl control frameStream
+    outgoingStreamFlowControl <- newOutgoingFlowControl control sid credits
 
     -- Prepare handlers.
     let _headers headersList flags = do
-            splitter <- settingsPayloadSplitter <$> readIORef settings
+            splitter <- settingsPayloadSplitter <$> readSettings control
             sendHeaders frameStream hpackEncoder headersList splitter flags
     let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
     let _waitData     = do
@@ -459,7 +461,7 @@ initializeStream conn settings frames headersFrames mPushPromises hpackEncoder s
             (_,ppFrames,ppHeaders,ppSid,ppReadHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
             let mkStreamActions stream = StreamDefinition (return CST) (ppHandler sid stream ppReadHeaders)
             ppCont <- initializeStream conn
-                                       settings
+                                       control
                                        ppFrames
                                        ppHeaders
                                        Nothing
@@ -644,13 +646,13 @@ dispatchHPACKFramesStep frames (DispatchHPACK{..}) = do
     go fh pattern
 
 newIncomingFlowControl
-  :: IORef ConnectionSettings
+  :: DispatchControl
   -> Http2FrameClientStream
   -> IO IncomingFlowControl
-newIncomingFlowControl settings stream = do
+newIncomingFlowControl control stream = do
     let getBase = if _getStreamId stream == 0
                   then return HTTP2.defaultInitialWindowSize
-                  else initialWindowSize . _clientSettings <$> readIORef settings
+                  else initialWindowSize . _clientSettings <$> readSettings control
     creditAdded <- newIORef 0
     creditConsumed <- newIORef 0
     let _addCredit n = atomicModifyIORef' creditAdded (\c -> (c + n, ()))
@@ -660,7 +662,7 @@ newIncomingFlowControl settings stream = do
             extra <- readIORef creditAdded
             return $ base + extra - conso
     let _updateWindow = do
-            base <- initialWindowSize . _clientSettings <$> readIORef settings
+            base <- initialWindowSize . _clientSettings <$> readSettings control
             added <- readIORef creditAdded
             consumed <- readIORef creditConsumed
 
@@ -677,15 +679,15 @@ newIncomingFlowControl settings stream = do
 
 newOutgoingFlowControl ::
      Exception e
-  => IORef ConnectionSettings
+  => DispatchControl
   -> StreamId
   -> Chan (FrameHeader, Either e FramePayload)
   -> IO OutgoingFlowControl
-newOutgoingFlowControl settings sid frames = do
+newOutgoingFlowControl control sid frames = do
     credit <- newIORef 0
     let getBase = if sid == 0
                   then return HTTP2.defaultInitialWindowSize
-                  else initialWindowSize . _serverSettings <$> readIORef settings
+                  else initialWindowSize . _serverSettings <$> readSettings control
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
     let withdraw 0 = return 0
         withdraw n = do
@@ -710,7 +712,7 @@ newOutgoingFlowControl settings sid frames = do
     -- an hasted client asks for X > initialWindowSize before the server has
     -- sent its initial SETTINGS frame.
     waitSettingsChange prev = do
-            new <- initialWindowSize . _serverSettings <$> readIORef settings
+            new <- initialWindowSize . _serverSettings <$> readSettings control
             if new == prev then threadDelay 1000000 >> waitSettingsChange prev else return ()
     waitSomeCredit = do
         (_, fp) <- waitFrameWithTypeIdForStreamId sid [FrameWindowUpdate] frames
