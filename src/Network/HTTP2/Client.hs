@@ -186,9 +186,6 @@ data Http2Client = Http2Client {
 data Http2ClientAsyncs = Http2ClientAsyncs {
     _waitSettingsAsync   :: Async (FrameHeader, FramePayload)
   -- ^ Async waiting for the initial settings ACK.
-  , _HPACKAsync          :: Async ()
-  -- ^ Async responsible for serializing every HEADERS/PUSH_PROMISE/CONTINUATION.
-  -- See 'dispatchHPACKFramesLoop'.
   , _incomingFramesAsync :: Async ()
   -- ^ Async responsible for ingesting all frames, increasing the
   -- maximum-received streamID and starting the frame dispatch. See
@@ -200,7 +197,6 @@ linkAsyncs :: Http2Client -> IO ()
 linkAsyncs client =
    let Http2ClientAsyncs{..} = _asyncs client in do
            link _waitSettingsAsync
-           link _HPACKAsync
            link _incomingFramesAsync
 
 -- | Synonym of '_goaway'.
@@ -325,19 +321,13 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                                             goAwayHandler
                                             fallbackHandler
 
-
-    {- Thread handling serialized push-promises and headers frames . -}
-    serverStreamFrames <- newDispatchReadChanIO dispatch
     creditFrames <- newDispatchReadChanIO dispatch
     _outgoingFlowControl <- newOutgoingFlowControl dispatchControl 0 creditFrames
     _incomingFlowControl <- newIncomingFlowControl dispatchControl controlStream
     dispatchHPACK <- newDispatchHPACKIO decoderBufSize
-
-    let incomingLoop = dispatchLoop conn dispatch dispatchControl _incomingFlowControl
-    let hpackLoop = dispatchHPACKFramesLoop serverStreamFrames dispatchHPACK
+    let incomingLoop = dispatchLoop conn dispatch dispatchControl _incomingFlowControl dispatchHPACK
 
     withAsync incomingLoop $ \aIncoming -> do
-        withAsync hpackLoop $ \aHPACK -> do
 
             conccurentStreams <- newIORef 0
             -- prepare client streams
@@ -393,7 +383,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
 
             settsIO <- _settings initSettings
             withAsync settsIO $ \aSettings -> do
-                let _asyncs = Http2ClientAsyncs aSettings aHPACK aIncoming
+                let _asyncs = Http2ClientAsyncs aSettings aIncoming
                 let _close = closeConnection conn
                 mainHandler $ Http2Client{..}
 
@@ -462,21 +452,25 @@ dispatchLoop
   -> Dispatch
   -> DispatchControl
   -> IncomingFlowControl
+  -> DispatchHPACK
   -> IO ()
-dispatchLoop conn d dc inFlowControl =
+dispatchLoop conn d dc inFlowControl dh = do
+    let getNextFrame = next conn
     delayException . forever $ do
-      frame <- next conn
-      dispatchFramesStep frame d
-      whenFrame (hasStreamId 0) frame $ \got ->
-          dispatchControlFramesStep got dc
-      whenFrame (hasTypeId [FrameData]) frame $ \got ->
-          creditDataFramesStep inFlowControl got
-  where
-    hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
-    hasStreamId sid h _ = streamId h == sid
+        frame <- getNextFrame
+        dispatchFramesStep frame d
+        whenFrame (hasStreamId 0) frame $ \got ->
+            dispatchControlFramesStep got dc
+        whenFrame (hasTypeId [FrameData]) frame $ \got ->
+            creditDataFramesStep inFlowControl got
+        whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
+            dispatchHPACKFramesSubLoop getNextFrame d got dh
 
-    hasTypeId :: [FrameTypeId] -> FrameHeader -> FramePayload -> Bool
-    hasTypeId tids _ p = HTTP2.framePayloadToFrameTypeId p `elem` tids
+hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
+hasStreamId sid h _ = streamId h == sid
+
+hasTypeId :: [FrameTypeId] -> FrameHeader -> FramePayload -> Bool
+hasTypeId tids _ p = HTTP2.framePayloadToFrameTypeId p `elem` tids
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -560,67 +554,64 @@ data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
 
-dispatchHPACKFramesLoop
-  :: DispatchChan
+dispatchHPACKFramesSubLoop
+  :: IO (FrameHeader, Either HTTP2Error FramePayload)
+  -> Dispatch
+  -> (FrameHeader, FramePayload)
   -> DispatchHPACK
   -> IO ()
-dispatchHPACKFramesLoop c d =
-    forever $ dispatchHPACKFramesStep c d
-
-dispatchHPACKFramesStep
-  :: DispatchChan
-  -> DispatchHPACK
-  -> IO ()
-dispatchHPACKFramesStep frames (DispatchHPACK{..}) = do
-    (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
-                                    , FramePushPromise
-                                    , FrameHeaders
-                                    ]
-                                    frames
-    let sid = HTTP2.streamId fh
-    (decision, pattern) <- case fp of
+dispatchHPACKFramesSubLoop getNextFrame d (fh,fp) (DispatchHPACK{..}) = do
+    let (decision, pattern) = case fp of
             PushPromiseFrame ppSid hbf -> do
-                return (OpenPushPromise sid ppSid, Right hbf)
+                (OpenPushPromise sid ppSid, Right hbf)
             HeadersFrame _ hbf       -> -- TODO: handle priority
-                return (ForwardHeader sid, Right hbf)
+                (ForwardHeader sid, Right hbf)
             RSTStreamFrame err       ->
-                return (ForwardHeader sid, Left err)
-            _                        -> error "wrong TypeId"
+                (ForwardHeader sid, Left err)
+            _                        ->
+                error "wrong TypeId"
+    go fh decision pattern
+  where
+    sid :: StreamId
+    sid = HTTP2.streamId fh
+    go :: FrameHeader -> HPACKLoopDecision -> Either ErrorCodeId ByteString -> IO ()
+    go curFh decision (Right buffer) =
+        if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
+        then do
+            frame <- getNextFrame
+            let interrupted fh2 fp2 =
+                    not $ hasTypeId [ FrameRSTStream , FrameContinuation ] fh2 fp2
+            whenFrame interrupted frame $ \_ ->
+                error "invalid frame type while waiting for CONTINUATION"
 
-    let go curFh (Right buffer) =
-            if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
-            then do
-                (lastFh, lastFp) <- waitFrameWithTypeId [ FrameRSTStream
-                                                        , FrameContinuation
-                                                        ]
-                                                        frames
+            whenFrame (\_ _ -> True) frame $ \(lastFh, lastFp) ->
                 case lastFp of
                     ContinuationFrame chbf ->
-                        go lastFh (Right (ByteString.append buffer chbf))
+                        go lastFh decision (Right (ByteString.append buffer chbf))
                     RSTStreamFrame err     ->
-                        go lastFh (Left err)
-                    _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
-            else do
-                newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
-                case decision of
-                    ForwardHeader sId ->
-                        writeChan _dispatchHPACKWriteHeadersChan (curFh, sId, Right newHdrs)
-                    OpenPushPromise parentSid newSid -> do
-                        -- Important: We duplicate the channel here or we risk
-                        -- losing DATA or HEADERS+CONTINUATION frames sent over
-                        -- the main stream because even though
-                        -- 'initializeStream' dupes frame channels, this
-                        -- function will has no guarantee that the parent
-                        -- stream and the push-promise handler that will
-                        -- initiate the new stream are synchronous.
-                        ppChan <- dupChan frames
-                        ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
-                        writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
+                        go lastFh decision (Left err)
+                    _                     ->
+                        error "continued frame has invalid type"
+        else do
+            newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
+            case decision of
+                ForwardHeader sId ->
+                    writeChan _dispatchHPACKWriteHeadersChan (curFh, sId, Right newHdrs)
+                OpenPushPromise parentSid newSid -> do
+                    -- Important: We duplicate the channel here or we risk
+                    -- losing DATA or HEADERS+CONTINUATION frames sent over
+                    -- the main stream because even though
+                    -- 'initializeStream' dupes frame channels, this
+                    -- function will has no guarantee that the parent
+                    -- stream and the push-promise handler that will
+                    -- initiate the new stream are synchronous.
+                    ppChan <- newDispatchReadChanIO d
+                    ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
+                    writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
 
-        go curFh (Left err) =
-                writeChan _dispatchHPACKWriteHeadersChan (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
+    go curFh _ (Left err) =
+        writeChan _dispatchHPACKWriteHeadersChan (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
 
-    go fh pattern
 
 newIncomingFlowControl
   :: DispatchControl
