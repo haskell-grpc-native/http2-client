@@ -12,6 +12,10 @@ module Network.HTTP2.Client.Channels (
  , waitFrameWithTypeIdForStreamId
  , isPingReply
  , isSettingsReply
+ , hasStreamId
+ , hasTypeId
+ , whenFrame
+ , whenFrameElse
  , module Control.Concurrent.Chan
  ) where
 
@@ -68,6 +72,37 @@ waitFrame test chan =
         if test fHead dat
         then return (fHead, dat)
         else loop
+
+whenFrame
+  :: Exception e
+  => (FrameHeader -> FramePayload -> Bool)
+  -> (FrameHeader, Either e FramePayload)
+  -> ((FrameHeader, FramePayload) -> IO ())
+  -> IO ()
+whenFrame test (fHead, fPayload) handle = do
+    dat <- either throwIO pure fPayload
+    if test fHead dat
+    then handle (fHead, dat)
+    else pure ()
+
+whenFrameElse
+  :: Exception e
+  => (FrameHeader -> FramePayload -> Bool)
+  -> (FrameHeader, Either e FramePayload)
+  -> ((FrameHeader, FramePayload) -> IO a)
+  -> ((FrameHeader, FramePayload) -> IO a)
+  -> IO a
+whenFrameElse test (fHead, fPayload) handleTrue handleFalse = do
+    dat <- either throwIO pure fPayload
+    if test fHead dat
+    then handleTrue (fHead, dat)
+    else handleFalse (fHead, dat)
+
+hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
+hasStreamId sid h _ = streamId h == sid
+
+hasTypeId :: [FrameTypeId] -> FrameHeader -> FramePayload -> Bool
+hasTypeId tids _ p = HTTP2.framePayloadToFrameTypeId p `elem` tids
 
 isPingReply :: ByteString -> FrameHeader -> FramePayload -> Bool
 isPingReply datSent _ (PingFrame datRcv) = datSent == datRcv

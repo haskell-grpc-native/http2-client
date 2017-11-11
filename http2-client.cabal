@@ -1,5 +1,5 @@
 name:                http2-client
-version:             0.4.0.1
+version:             0.5.0.0
 synopsis:            A native HTTP2 client library.
 description:         Please read the README.md at the homepage.
 homepage:            https://github.com/lucasdicioccio/http2-client
@@ -20,6 +20,7 @@ library
                      , Network.HTTP2.Client.Helpers
                      , Network.HTTP2.Client.RawConnection
   other-modules:       Network.HTTP2.Client.Channels
+                     , Network.HTTP2.Client.Dispatch
   build-depends:       base >= 4.7 && < 5
                      , async
                      , bytestring
