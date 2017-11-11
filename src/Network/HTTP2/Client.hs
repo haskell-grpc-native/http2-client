@@ -186,9 +186,6 @@ data Http2Client = Http2Client {
 data Http2ClientAsyncs = Http2ClientAsyncs {
     _waitSettingsAsync   :: Async (FrameHeader, FramePayload)
   -- ^ Async waiting for the initial settings ACK.
-  , _creditFlowsAsync    :: Async ()
-  -- ^ Async responsible for crediting the connection incoming flow control.
-  -- See 'creditDataFramesLoop'.
   , _HPACKAsync          :: Async ()
   -- ^ Async responsible for serializing every HEADERS/PUSH_PROMISE/CONTINUATION.
   -- See 'dispatchHPACKFramesLoop'.
@@ -203,7 +200,6 @@ linkAsyncs :: Http2Client -> IO ()
 linkAsyncs client =
    let Http2ClientAsyncs{..} = _asyncs client in do
            link _waitSettingsAsync
-           link _creditFlowsAsync
            link _HPACKAsync
            link _incomingFramesAsync
 
@@ -321,7 +317,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
     let ackPing = sendPingFrame controlStream HTTP2.setAck
     let ackSettings = sendSettingsFrame controlStream HTTP2.setAck []
 
-    -- Initial thread receiving server frames.
+    {- Initial thread receiving server frames. -}
     dispatch  <- newDispatchIO
     dispatchControl <- newDispatchControlIO encoderBufSize
                                             ackPing
@@ -329,21 +325,20 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                                             goAwayHandler
                                             fallbackHandler
 
-    let incomingLoop = dispatchLoop conn dispatch dispatchControl
+
+    {- Thread handling serialized push-promises and headers frames . -}
+    serverStreamFrames <- newDispatchReadChanIO dispatch
+    creditFrames <- newDispatchReadChanIO dispatch
+    _outgoingFlowControl <- newOutgoingFlowControl dispatchControl 0 creditFrames
+    _incomingFlowControl <- newIncomingFlowControl dispatchControl controlStream
+    dispatchHPACK <- newDispatchHPACKIO decoderBufSize
+
+    let incomingLoop = dispatchLoop conn dispatch dispatchControl _incomingFlowControl
+    let hpackLoop = dispatchHPACKFramesLoop serverStreamFrames dispatchHPACK
+
     withAsync incomingLoop $ \aIncoming -> do
-        -- Thread handling push-promises and headers frames serializing the buffers.
-        serverStreamFrames <- newDispatchReadChanIO dispatch
-        creditFrames <- newDispatchReadChanIO dispatch
-
-        _outgoingFlowControl <- newOutgoingFlowControl dispatchControl 0 creditFrames
-        _incomingFlowControl <- newIncomingFlowControl dispatchControl controlStream
-
-        dispatchHPACK <- newDispatchHPACKIO decoderBufSize
-        let hpackLoop = dispatchHPACKFramesLoop serverStreamFrames dispatchHPACK
         withAsync hpackLoop $ \aHPACK -> do
-          dataFrames <- newDispatchReadChanIO dispatch
-          let creditLoop = creditDataFramesLoop _incomingFlowControl dataFrames
-          withAsync creditLoop $ \aCredit -> do
+
             conccurentStreams <- newIORef 0
             -- prepare client streams
             clientStreamIdMutex <- newMVar 0
@@ -398,7 +393,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
 
             settsIO <- _settings initSettings
             withAsync settsIO $ \aSettings -> do
-                let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aIncoming
+                let _asyncs = Http2ClientAsyncs aSettings aHPACK aIncoming
                 let _close = closeConnection conn
                 mainHandler $ Http2Client{..}
 
@@ -466,16 +461,22 @@ dispatchLoop
   :: Http2FrameConnection
   -> Dispatch
   -> DispatchControl
+  -> IncomingFlowControl
   -> IO ()
-dispatchLoop conn d dc =
+dispatchLoop conn d dc inFlowControl =
     delayException . forever $ do
       frame <- next conn
       dispatchFramesStep frame d
       whenFrame (hasStreamId 0) frame $ \got ->
           dispatchControlFramesStep got dc
+      whenFrame (hasTypeId [FrameData]) frame $ \got ->
+          creditDataFramesStep inFlowControl got
   where
     hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
     hasStreamId sid h _ = streamId h == sid
+
+    hasTypeId :: [FrameTypeId] -> FrameHeader -> FramePayload -> Bool
+    hasTypeId tids _ p = HTTP2.framePayloadToFrameTypeId p `elem` tids
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -539,20 +540,19 @@ dispatchControlFramesStep controlFrame@(fh, payload) (DispatchControl{..}) = do
     ignore :: String -> IO ()
     ignore _ = return ()
 
--- | We currently need a specific loop for crediting streams because a client
--- user may programmatically reset and stop listening for a stream and stop
--- calling waitData (which credits streams).
+-- | We currently need a specific step in the main loop for crediting streams
+-- because a client user may programmatically reset and stop listening for a
+-- stream and stop calling waitData (which credits streams).
 --
 -- TODO: modify the '_rst' function to wait and credit all the remaining data
 -- that could have been sent in flight
-creditDataFramesLoop
+creditDataFramesStep
   :: IncomingFlowControl
-  -> DispatchChan
+  -> (FrameHeader, FramePayload)
   -> IO ()
-creditDataFramesLoop flowControl frames = forever $ do
-    (fh,_) <- waitFrameWithTypeId [FrameData] frames
-    -- TODO: error if detect over-run, current implementation credits
-    -- everything back so that should never happen
+creditDataFramesStep flowControl (fh,_) = do
+    -- TODO: error if detect over-run. Current implementation credits
+    -- everything back. Hence, over-run should never happen.
     _ <- _consumeCredit flowControl (HTTP2.payloadLength fh)
     _addCredit flowControl (HTTP2.payloadLength fh)
 
