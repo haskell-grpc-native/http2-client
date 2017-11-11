@@ -472,15 +472,16 @@ dispatchFramesLoop
   :: Http2FrameConnection
   -> Dispatch
   -> IO ()
-dispatchFramesLoop c d =
-    delayException . forever $ dispatchFramesStep c d
+dispatchFramesLoop conn d =
+    delayException . forever $ do
+      frame <- next conn
+      dispatchFramesStep frame d
 
 dispatchFramesStep
-  :: Http2FrameConnection
+  :: (FrameHeader, Either HTTP2Error FramePayload)
   -> Dispatch
   -> IO ()
-dispatchFramesStep conn (Dispatch{..}) = do
-    frame@(fh, _) <- next conn
+dispatchFramesStep frame@(fh,_) (Dispatch{..}) = do
     -- Remember highest streamId.
     atomicModifyIORef' _dispatchMaxStreamId (\n -> (max n (streamId fh), ()))
     writeChan _dispatchWriteChan frame
@@ -508,15 +509,16 @@ dispatchControlFramesLoop
   :: DispatchChan
   -> DispatchControl
   -> IO ()
-dispatchControlFramesLoop c d =
-    forever $ dispatchControlFramesStep c d
+dispatchControlFramesLoop chan d =
+    forever $ do
+      controlFrame <- waitFrameWithStreamId 0 chan
+      dispatchControlFramesStep controlFrame d
 
 dispatchControlFramesStep
-  :: DispatchChan
+  :: (FrameHeader, FramePayload)
   -> DispatchControl
   -> IO ()
-dispatchControlFramesStep frames (DispatchControl{..}) = do
-    controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
+dispatchControlFramesStep controlFrame@(fh, payload) (DispatchControl{..}) = do
     case payload of
         (SettingsFrame settsList)
             | not . testAck . flags $ fh -> do
