@@ -464,13 +464,9 @@ dispatchLoop conn d dc inFlowControl dh = do
         whenFrame (hasTypeId [FrameData]) frame $ \got ->
             creditDataFramesStep inFlowControl got
         whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
-            dispatchHPACKFramesSubLoop getNextFrame d got dh
-
-hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
-hasStreamId sid h _ = streamId h == sid
-
-hasTypeId :: [FrameTypeId] -> FrameHeader -> FramePayload -> Bool
-hasTypeId tids _ p = HTTP2.framePayloadToFrameTypeId p `elem` tids
+            let hpackLoop (FinishedWithHeaders act) = act
+                hpackLoop (WaitContinuation act)    = getNextFrame >>= act >>= hpackLoop
+            hpackLoop (dispatchHPACKFramesStep d got dh)
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -480,25 +476,6 @@ dispatchFramesStep frame@(fh,_) (Dispatch{..}) = do
     -- Remember highest streamId.
     atomicModifyIORef' _dispatchMaxStreamId (\n -> (max n (streamId fh), ()))
     writeChan _dispatchWriteChan frame
-
--- | Runs an action, rethrowing exception 50ms later.
---
--- In a context where asynchronous are likely to occur this function gives a
--- chance to other threads to do some work before Async linking reaps them all.
---
--- In particular, servers are likely to close their TCP connection soon after
--- sending a GoAwayFrame and we want to give a better chance to clients to
--- observe the GoAwayFrame in their handlers to distinguish GoAwayFrames
--- followed by TCP disconnection and plain TCP resets. As a result, this
--- function is mostly used to delay 'dispatchFrames'. A more involved
--- and future design will be to inline the various loop-processes for
--- dispatchFrames and GoAwayHandlers in a same thread (e.g., using
--- pipe/conduit to retain composability).
-delayException :: IO a -> IO a
-delayException act = act `catch` slowdown
-  where
-    slowdown :: SomeException -> IO a
-    slowdown e = threadDelay 50000 >> throwIO e
 
 dispatchControlFramesStep
   :: (FrameHeader, FramePayload)
@@ -554,13 +531,16 @@ data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
 
-dispatchHPACKFramesSubLoop
-  :: IO (FrameHeader, Either HTTP2Error FramePayload)
-  -> Dispatch
+data HPACKStepResult =
+    WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> IO HPACKStepResult)
+  | FinishedWithHeaders !(IO ())
+
+dispatchHPACKFramesStep
+  :: Dispatch
   -> (FrameHeader, FramePayload)
   -> DispatchHPACK
-  -> IO ()
-dispatchHPACKFramesSubLoop getNextFrame d (fh,fp) (DispatchHPACK{..}) = do
+  -> HPACKStepResult
+dispatchHPACKFramesStep d (fh,fp) (DispatchHPACK{..}) =
     let (decision, pattern) = case fp of
             PushPromiseFrame ppSid hbf -> do
                 (OpenPushPromise sid ppSid, Right hbf)
@@ -570,29 +550,28 @@ dispatchHPACKFramesSubLoop getNextFrame d (fh,fp) (DispatchHPACK{..}) = do
                 (ForwardHeader sid, Left err)
             _                        ->
                 error "wrong TypeId"
-    go fh decision pattern
+    in go fh decision pattern
   where
     sid :: StreamId
     sid = HTTP2.streamId fh
-    go :: FrameHeader -> HPACKLoopDecision -> Either ErrorCodeId ByteString -> IO ()
+
+    go :: FrameHeader -> HPACKLoopDecision -> Either ErrorCodeId ByteString -> HPACKStepResult
     go curFh decision (Right buffer) =
         if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
-        then do
-            frame <- getNextFrame
+        then WaitContinuation $ \frame -> do
             let interrupted fh2 fp2 =
                     not $ hasTypeId [ FrameRSTStream , FrameContinuation ] fh2 fp2
-            whenFrame interrupted frame $ \_ ->
-                error "invalid frame type while waiting for CONTINUATION"
-
-            whenFrame (\_ _ -> True) frame $ \(lastFh, lastFp) ->
+            whenFrameElse interrupted frame (\_ ->
+                error "invalid frame type while waiting for CONTINUATION")
+                                            (\(lastFh, lastFp) ->
                 case lastFp of
                     ContinuationFrame chbf ->
-                        go lastFh decision (Right (ByteString.append buffer chbf))
+                        return $ go lastFh decision (Right (ByteString.append buffer chbf))
                     RSTStreamFrame err     ->
-                        go lastFh decision (Left err)
+                        return $ go lastFh decision (Left err)
                     _                     ->
-                        error "continued frame has invalid type"
-        else do
+                        error "continued frame has invalid type")
+        else FinishedWithHeaders $ do
             newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
             case decision of
                 ForwardHeader sId ->
@@ -609,7 +588,7 @@ dispatchHPACKFramesSubLoop getNextFrame d (fh,fp) (DispatchHPACK{..}) = do
                     ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
                     writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
 
-    go curFh _ (Left err) =
+    go curFh _ (Left err) = FinishedWithHeaders $
         writeChan _dispatchHPACKWriteHeadersChan (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
 
 
@@ -805,3 +784,23 @@ sendPriorityFrame s p = do
     let payload = PriorityFrame p
     sendOne s id payload
     return ()
+
+-- | Runs an action, rethrowing exception 50ms later.
+--
+-- In a context where asynchronous are likely to occur this function gives a
+-- chance to other threads to do some work before Async linking reaps them all.
+--
+-- In particular, servers are likely to close their TCP connection soon after
+-- sending a GoAwayFrame and we want to give a better chance to clients to
+-- observe the GoAwayFrame in their handlers to distinguish GoAwayFrames
+-- followed by TCP disconnection and plain TCP resets. As a result, this
+-- function is mostly used to delay 'dispatchFrames'. A more involved
+-- and future design will be to inline the various loop-processes for
+-- dispatchFrames and GoAwayHandlers in a same thread (e.g., using
+-- pipe/conduit to retain composability).
+delayException :: IO a -> IO a
+delayException act = act `catch` slowdown
+  where
+    slowdown :: SomeException -> IO a
+    slowdown e = threadDelay 50000 >> throwIO e
+
