@@ -192,13 +192,10 @@ data Http2ClientAsyncs = Http2ClientAsyncs {
   , _HPACKAsync          :: Async ()
   -- ^ Async responsible for serializing every HEADERS/PUSH_PROMISE/CONTINUATION.
   -- See 'dispatchHPACKFramesLoop'.
-  , _controlFramesAsync  :: Async ()
-  -- ^ Async responsible for handling control frames (e.g., PING).
-  -- See 'dispatchControlFramesLoop'.
   , _incomingFramesAsync :: Async ()
   -- ^ Async responsible for ingesting all frames, increasing the
   -- maximum-received streamID and starting the frame dispatch. See
-  -- 'dispatchFramesLoop'.
+  -- 'dispatchFrames'.
   }
 
 -- | Links all client's asyncs to current thread.
@@ -208,7 +205,6 @@ linkAsyncs client =
            link _waitSettingsAsync
            link _creditFlowsAsync
            link _HPACKAsync
-           link _controlFramesAsync
            link _incomingFramesAsync
 
 -- | Synonym of '_goaway'.
@@ -320,12 +316,6 @@ runHttp2Client
   -- ^ Actions to run on the client.
   -> IO a
 runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler mainHandler = do
-    let _close = closeConnection conn
-    -- prepare client streams
-    clientStreamIdMutex <- newMVar 0
-    let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
-            (putMVar clientStreamIdMutex . succ)
-            (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
 
     let controlStream = makeFrameClientStream conn 0
     let ackPing = sendPingFrame controlStream HTTP2.setAck
@@ -333,17 +323,14 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
 
     -- Initial thread receiving server frames.
     dispatch  <- newDispatchIO
-    let incomingLoop = dispatchFramesLoop conn dispatch
+    dispatchControl <- newDispatchControlIO encoderBufSize
+                                            ackPing
+                                            ackSettings
+                                            goAwayHandler
+                                            fallbackHandler
+
+    let incomingLoop = dispatchLoop conn dispatch dispatchControl
     withAsync incomingLoop $ \aIncoming -> do
-      -- Thread handling control frames.
-      controlFrames <- newDispatchReadChanIO dispatch
-      dispatchControl <- newDispatchControlIO encoderBufSize
-                                              ackPing
-                                              ackSettings
-                                              goAwayHandler
-                                              fallbackHandler
-      let controlLoop = dispatchControlFramesLoop controlFrames dispatchControl
-      withAsync controlLoop $ \aControl -> do
         -- Thread handling push-promises and headers frames serializing the buffers.
         serverStreamFrames <- newDispatchReadChanIO dispatch
         creditFrames <- newDispatchReadChanIO dispatch
@@ -358,6 +345,12 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
           let creditLoop = creditDataFramesLoop _incomingFlowControl dataFrames
           withAsync creditLoop $ \aCredit -> do
             conccurentStreams <- newIORef 0
+            -- prepare client streams
+            clientStreamIdMutex <- newMVar 0
+            let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
+                    (putMVar clientStreamIdMutex . succ)
+                    (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
+
             let _startStream getWork = do
                     maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
                     roomNeeded <- atomicModifyIORef' conccurentStreams
@@ -405,7 +398,8 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
 
             settsIO <- _settings initSettings
             withAsync settsIO $ \aSettings -> do
-                let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aControl aIncoming
+                let _asyncs = Http2ClientAsyncs aSettings aCredit aHPACK aIncoming
+                let _close = closeConnection conn
                 mainHandler $ Http2Client{..}
 
 initializeStream
@@ -468,14 +462,20 @@ initializeStream conn control frames headersFrames mPushPromises sid getWork = d
     -- Returns 2nd action.
     return $ _handleStream streamActions incomingStreamFlowControl outgoingStreamFlowControl
 
-dispatchFramesLoop
+dispatchLoop
   :: Http2FrameConnection
   -> Dispatch
+  -> DispatchControl
   -> IO ()
-dispatchFramesLoop conn d =
+dispatchLoop conn d dc =
     delayException . forever $ do
       frame <- next conn
       dispatchFramesStep frame d
+      whenFrame (hasStreamId 0) frame $ \got ->
+          dispatchControlFramesStep got dc
+  where
+    hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
+    hasStreamId sid h _ = streamId h == sid
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -495,24 +495,15 @@ dispatchFramesStep frame@(fh,_) (Dispatch{..}) = do
 -- sending a GoAwayFrame and we want to give a better chance to clients to
 -- observe the GoAwayFrame in their handlers to distinguish GoAwayFrames
 -- followed by TCP disconnection and plain TCP resets. As a result, this
--- function is mostly used to delay 'dispatchFramesLoop'. A more involved
+-- function is mostly used to delay 'dispatchFrames'. A more involved
 -- and future design will be to inline the various loop-processes for
--- dispatchFramesLoop and GoAwayHandlers in a same thread (e.g., using
+-- dispatchFrames and GoAwayHandlers in a same thread (e.g., using
 -- pipe/conduit to retain composability).
 delayException :: IO a -> IO a
 delayException act = act `catch` slowdown
   where
     slowdown :: SomeException -> IO a
     slowdown e = threadDelay 50000 >> throwIO e
-
-dispatchControlFramesLoop
-  :: DispatchChan
-  -> DispatchControl
-  -> IO ()
-dispatchControlFramesLoop chan d =
-    forever $ do
-      controlFrame <- waitFrameWithStreamId 0 chan
-      dispatchControlFramesStep controlFrame d
 
 dispatchControlFramesStep
   :: (FrameHeader, FramePayload)

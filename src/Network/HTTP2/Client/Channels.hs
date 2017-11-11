@@ -12,6 +12,7 @@ module Network.HTTP2.Client.Channels (
  , waitFrameWithTypeIdForStreamId
  , isPingReply
  , isSettingsReply
+ , whenFrame
  , module Control.Concurrent.Chan
  ) where
 
@@ -68,6 +69,18 @@ waitFrame test chan =
         if test fHead dat
         then return (fHead, dat)
         else loop
+
+whenFrame
+  :: Exception e
+  => (FrameHeader -> FramePayload -> Bool)
+  -> (FrameHeader, Either e FramePayload)
+  -> ((FrameHeader, FramePayload) -> IO ())
+  -> IO ()
+whenFrame test (fHead, fPayload) handle = do
+    dat <- either throwIO pure fPayload
+    if test fHead dat
+    then handle (fHead, dat)
+    else pure ()
 
 isPingReply :: ByteString -> FrameHeader -> FramePayload -> Bool
 isPingReply datSent _ (PingFrame datRcv) = datSent == datRcv
