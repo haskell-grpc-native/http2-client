@@ -197,7 +197,7 @@ data Http2ClientAsyncs = Http2ClientAsyncs {
   , _incomingFramesAsync :: Async ()
   -- ^ Async responsible for ingesting all frames, increasing the
   -- maximum-received streamID and starting the frame dispatch. See
-  -- 'incomingFramesLoop'.
+  -- 'dispatchFramesLoop'.
   }
 
 -- | Links all client's asyncs to current thread.
@@ -355,33 +355,26 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
     let ackSettings = sendSettingsFrame controlStream HTTP2.setAck []
 
     -- Initial thread receiving server frames.
-    maxReceivedStreamId  <- newIORef 0
-    serverFrames <- newChan
-    let incomingLoop = incomingFramesLoop conn serverFrames maxReceivedStreamId
+    dispatch  <- newDispatchIO
+    let incomingLoop = dispatchFramesLoop conn dispatch
     withAsync incomingLoop $ \aIncoming -> do
 
       -- Thread handling control frames.
       settings  <- newIORef defaultConnectionSettings
-      controlFrames <- dupChan serverFrames
-      let controlLoop = incomingControlFramesLoop controlFrames settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler
+      controlFrames <- newDispatchReadChanIO dispatch
+      let controlLoop = incomingControlFramesLoop controlFrames (DispatchControl settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler)
       withAsync controlLoop $ \aControl -> do
         -- Thread handling push-promises and headers frames serializing the buffers.
-        serverStreamFrames <- dupChan serverFrames
-        serverHeaders <- newChan
-        hpackDecoder <- do
-            dt <- newDynamicTableForDecoding HPACK.defaultDynamicTableSize decoderBufSize
-            return dt
-
-        creditFrames <- dupChan serverFrames
+        serverStreamFrames <- newDispatchReadChanIO dispatch
+        creditFrames <- newDispatchReadChanIO dispatch
 
         _outgoingFlowControl <- newOutgoingFlowControl settings 0 creditFrames
         _incomingFlowControl <- newIncomingFlowControl settings controlStream
 
-        serverPushPromises <- newChan
-
-        let hpackLoop = incomingHPACKFramesLoop serverStreamFrames serverHeaders serverPushPromises hpackDecoder
+        dispatchHPACK <- newDispatchHPACKIO decoderBufSize
+        let hpackLoop = incomingHPACKFramesLoop serverStreamFrames dispatchHPACK
         withAsync hpackLoop $ \aHPACK -> do
-          dataFrames <- dupChan serverFrames
+          dataFrames <- newDispatchReadChanIO dispatch
           let creditLoop = creditDataFramesLoop _incomingFlowControl dataFrames
           withAsync creditLoop $ \aCredit -> do
             conccurentStreams <- newIORef 0
@@ -395,9 +388,9 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                         return $ Left $ TooMuchConcurrency roomNeeded
                     else do
                         cont <- withClientStreamId $ \sid -> do
-                            streamHeaders <- dupChan serverHeaders
-                            streamFrames <- dupChan serverFrames
-                            streamPP <- dupChan serverPushPromises
+                            streamHeaders <- newDispatchHPACKReadHeadersChanIO dispatchHPACK
+                            streamFrames <- newDispatchReadChanIO dispatch
+                            streamPP <- newDispatchHPACKReadPushPromisesChanIO dispatchHPACK
                             initializeStream conn
                                              settings
                                              streamFrames
@@ -413,12 +406,12 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
             let _ping dat = do
                     -- Need to dupChan before sending the query to avoid missing a fast
                     -- answer if the network is fast.
-                    pingFrames <- dupChan serverFrames
+                    pingFrames <- newDispatchReadChanIO dispatch
                     sendPingFrame controlStream id dat
                     return $ waitFrame (isPingReply dat) pingFrames
             let _settings settslist = do
                     -- Much like _ping, we need to dupChan before sending the query.
-                    pingFrames <- dupChan serverFrames
+                    pingFrames <- newDispatchReadChanIO dispatch
                     sendSettingsFrame controlStream id settslist
                     return $ do
                         ret <- waitFrame isSettingsReply pingFrames
@@ -427,7 +420,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                                 (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
                         return ret
             let _goaway err errStr = do
-                    sId <- readIORef maxReceivedStreamId
+                    sId <- readMaxReceivedStreamIdIO dispatch
                     sendGTFOFrame controlStream sId err errStr
 
             let _paylodSplitter = settingsPayloadSplitter <$> readIORef settings
@@ -499,16 +492,31 @@ initializeStream conn settings frames headersFrames mPushPromises hpackEncoder s
     -- Returns 2nd action.
     return $ _handleStream streamActions incomingStreamFlowControl outgoingStreamFlowControl
 
-incomingFramesLoop
+type DispatchChan = Chan (FrameHeader, Either HTTP2Error FramePayload)
+
+data Dispatch = Dispatch {
+    _dispatchWriteChan   :: !DispatchChan
+  , _dispatchMaxStreamId :: !(IORef StreamId)
+  }
+
+newDispatchIO :: IO Dispatch
+newDispatchIO = Dispatch <$> newChan <*> newIORef 0
+
+newDispatchReadChanIO :: Dispatch -> IO DispatchChan
+newDispatchReadChanIO = dupChan . _dispatchWriteChan
+
+readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
+readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId
+
+dispatchFramesLoop
   :: Http2FrameConnection
-  -> Chan (FrameHeader, Either HTTP2Error FramePayload)
-  -> IORef StreamId
+  -> Dispatch
   -> IO ()
-incomingFramesLoop conn frames maxReceivedStreamId = delayException $ forever $ do
+dispatchFramesLoop conn (Dispatch{..}) = delayException $ forever $ do
     frame@(fh, _) <- next conn
     -- Remember highest streamId.
-    atomicModifyIORef' maxReceivedStreamId (\n -> (max n (streamId fh), ()))
-    writeChan frames frame
+    atomicModifyIORef' _dispatchMaxStreamId (\n -> (max n (streamId fh), ()))
+    writeChan _dispatchWriteChan frame
 
 -- | Runs an action, rethrowing exception 50ms later.
 --
@@ -519,9 +527,9 @@ incomingFramesLoop conn frames maxReceivedStreamId = delayException $ forever $ 
 -- sending a GoAwayFrame and we want to give a better chance to clients to
 -- observe the GoAwayFrame in their handlers to distinguish GoAwayFrames
 -- followed by TCP disconnection and plain TCP resets. As a result, this
--- function is mostly used to delay 'incomingFramesLoop'. A more involved
+-- function is mostly used to delay 'dispatchFramesLoop'. A more involved
 -- and future design will be to inline the various loop-processes for
--- incomingFramesLoop and GoAwayHandlers in a same thread (e.g., using
+-- dispatchFramesLoop and GoAwayHandlers in a same thread (e.g., using
 -- pipe/conduit to retain composability).
 delayException :: IO a -> IO a
 delayException act = act `catch` slowdown
@@ -529,42 +537,46 @@ delayException act = act `catch` slowdown
     slowdown :: SomeException -> IO a
     slowdown e = threadDelay 50000 >> throwIO e
 
+data DispatchControl = DispatchControl {
+    _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
+  , _dispatchControlHpackEncoder        :: !HpackEncoderContext
+  , _dispatchControlAckPing             :: !(ByteString -> IO ())
+  , _dispatchControlAckSettings         :: !(IO ())
+  , _dispatchControlOnGoAway            :: !GoAwayHandler
+  , _dispatchControlOnFallback          :: !FallBackFrameHandler
+  }
+
 incomingControlFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
-  -> IORef ConnectionSettings
-  -> HpackEncoderContext
-  -> (ByteString -> IO ())
+  -> DispatchControl
   -> IO ()
-  -> GoAwayHandler
-  -> FallBackFrameHandler
-  -> IO ()
-incomingControlFramesLoop frames settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler = forever $ do
+incomingControlFramesLoop frames (DispatchControl{..}) = forever $ do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
         (SettingsFrame settsList)
             | not . testAck . flags $ fh -> do
-                atomicModifyIORef' settings
+                atomicModifyIORef' _dispatchControlConnectionSettings
                                    (\(ConnectionSettings cli srv) ->
                                       (ConnectionSettings cli (HTTP2.updateSettings srv settsList), ()))
                 maybe (return ())
-                      (_applySettings hpackEncoder)
+                      (_applySettings _dispatchControlHpackEncoder)
                       (lookup SettingsHeaderTableSize settsList)
-                ackSettings
+                _dispatchControlAckSettings
             | otherwise                 -> do
                 ignore "TODO: settings ack should be taken into account only after reception, we should return a waitSettingsAck in the _settings function"
         (PingFrame pingMsg)
             | not . testAck . flags $ fh ->
-                ackPing pingMsg
+                _dispatchControlAckPing pingMsg
             | otherwise                 -> do
                 ignore "PingFrame replies waited for in the requestor thread"
         (WindowUpdateFrame _ )  ->
                 ignore "connection-wide WindowUpdateFrame waited for in OutgoingFlowControl threads"
         (GoAwayFrame lastSid errCode reason)  ->
-             goAwayHandler $ RemoteSentGoAwayFrame lastSid errCode reason
+             _dispatchControlOnGoAway $ RemoteSentGoAwayFrame lastSid errCode reason
 
         _                   ->
-             fallbackHandler controlFrame
+             _dispatchControlOnFallback controlFrame
 
   where
     ignore :: String -> IO ()
@@ -620,14 +632,34 @@ data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
 
+data DispatchHPACK e = DispatchHPACK {
+    _dispatchHPACKWriteHeadersChan      :: !HeadersChan
+  , _dispatchHPACKWritePushPromisesChan :: !(PushPromisesChan e)
+  , _dispatchHPACKDynamicTable          :: !DynamicTable
+  }
+
+newDispatchHPACKIO :: Int -> IO (DispatchHPACK e)
+newDispatchHPACKIO decoderBufSize =
+    DispatchHPACK <$> newChan <*> newChan <*> newDecoder
+  where
+    newDecoder = newDynamicTableForDecoding
+        HPACK.defaultDynamicTableSize
+        decoderBufSize
+
+newDispatchHPACKReadHeadersChanIO :: DispatchHPACK e -> IO HeadersChan
+newDispatchHPACKReadHeadersChanIO =
+    dupChan . _dispatchHPACKWriteHeadersChan
+
+newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK e -> IO (PushPromisesChan e)
+newDispatchHPACKReadPushPromisesChanIO =
+    dupChan . _dispatchHPACKWritePushPromisesChan
+
 incomingHPACKFramesLoop
   :: Exception e
   => FramesChan e
-  -> HeadersChan
-  -> PushPromisesChan e
-  -> DynamicTable
+  -> DispatchHPACK e
   -> IO ()
-incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
+incomingHPACKFramesLoop frames (DispatchHPACK{..}) = forever $ do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
@@ -657,10 +689,10 @@ incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
                         go lastFh (Left err)
                     _                     -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
             else do
-                newHdrs <- decodeHeader hpackDecoder buffer
+                newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
                 case decision of
                     ForwardHeader sId ->
-                        writeChan hdrs (curFh, sId, Right newHdrs)
+                        writeChan _dispatchHPACKWriteHeadersChan (curFh, sId, Right newHdrs)
                     OpenPushPromise parentSid newSid -> do
                         -- Important: We duplicate the channel here or we risk
                         -- losing DATA or HEADERS+CONTINUATION frames sent over
@@ -670,11 +702,11 @@ incomingHPACKFramesLoop frames hdrs pushPromises hpackDecoder = forever $ do
                         -- stream and the push-promise handler that will
                         -- initiate the new stream are synchronous.
                         ppChan <- dupChan frames
-                        ppHeaders <- dupChan hdrs
-                        writeChan pushPromises (parentSid, ppChan, ppHeaders, newSid, newHdrs)
+                        ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
+                        writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
 
         go curFh (Left err) =
-                writeChan hdrs (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
+                writeChan _dispatchHPACKWriteHeadersChan (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
 
     go fh pattern
 
