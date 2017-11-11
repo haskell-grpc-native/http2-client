@@ -75,19 +75,26 @@ data DispatchControl = DispatchControl {
   }
 
 newDispatchControlIO
-  :: HpackEncoderContext
+  :: Size
   -> (ByteString -> IO ())
   -> (IO ())
   -> GoAwayHandler
   -> FallBackFrameHandler
   -> IO DispatchControl
-newDispatchControlIO hpack ackPing ackSetts onGoAway onFallback =
+newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
     DispatchControl <$> newIORef defaultConnectionSettings
-                    <*> pure hpack
+                    <*> hpackEncoder
                     <*> pure ackPing
                     <*> pure ackSetts
                     <*> pure onGoAway
                     <*> pure onFallback
+  where
+    hpackEncoder = do
+        let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
+        dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
+        return $ HpackEncoderContext
+            (HPACK.encodeHeader strategy encoderBufSize dt)
+            (\n -> HPACK.setLimitForEncoding n dt)
 
 readSettings :: DispatchControl -> IO ConnectionSettings
 readSettings = readIORef . _dispatchControlConnectionSettings
@@ -98,7 +105,7 @@ modifySettings d = atomicModifyIORef' (_dispatchControlConnectionSettings d)
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext {
     _encodeHeaders    :: HeaderList -> IO HeaderBlockFragment
-  , _applySettings    :: Int -> IO ()
+  , _applySettings    :: Size -> IO ()
   }
 
 data DispatchHPACK e = DispatchHPACK {
@@ -107,7 +114,7 @@ data DispatchHPACK e = DispatchHPACK {
   , _dispatchHPACKDynamicTable          :: !DynamicTable
   }
 
-newDispatchHPACKIO :: Int -> IO (DispatchHPACK e)
+newDispatchHPACKIO :: Size -> IO (DispatchHPACK e)
 newDispatchHPACKIO decoderBufSize =
     DispatchHPACK <$> newChan <*> newChan <*> newDecoder
   where

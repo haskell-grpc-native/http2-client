@@ -321,14 +321,6 @@ runHttp2Client
   -> IO a
 runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler mainHandler = do
     let _close = closeConnection conn
-    -- prepare hpack contexts
-    hpackEncoder <- do
-        let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
-        dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
-        let _encodeHeaders = HPACK.encodeHeader strategy encoderBufSize dt
-        let _applySettings n = HPACK.setLimitForEncoding n dt
-        return HpackEncoderContext{..}
-
     -- prepare client streams
     clientStreamIdMutex <- newMVar 0
     let withClientStreamId h = bracket (takeMVar clientStreamIdMutex)
@@ -345,7 +337,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
     withAsync incomingLoop $ \aIncoming -> do
       -- Thread handling control frames.
       controlFrames <- newDispatchReadChanIO dispatch
-      dispatchControl <- newDispatchControlIO hpackEncoder
+      dispatchControl <- newDispatchControlIO encoderBufSize
                                               ackPing
                                               ackSettings
                                               goAwayHandler
@@ -383,7 +375,6 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
                                              streamFrames
                                              streamHeaders
                                              (Just streamPP)
-                                             hpackEncoder
                                              sid
                                              getWork
                         v <- cont
@@ -426,11 +417,10 @@ initializeStream
   -> Maybe (PushPromisesChan e)
   -- ^ Just some PushPromiseChan for new client streams. Nothing for server
   -- streams.
-  -> HpackEncoderContext
   -> StreamId
   -> (Http2Stream -> StreamDefinition a)
   -> IO (IO a)
-initializeStream conn control frames headersFrames mPushPromises hpackEncoder sid getWork = do
+initializeStream conn control frames headersFrames mPushPromises sid getWork = do
     let frameStream = makeFrameClientStream conn sid
     -- Register interest in frames.
     credits <- dupChan frames
@@ -442,7 +432,7 @@ initializeStream conn control frames headersFrames mPushPromises hpackEncoder si
     -- Prepare handlers.
     let _headers headersList flags = do
             splitter <- settingsPayloadSplitter <$> readSettings control
-            sendHeaders frameStream hpackEncoder headersList splitter flags
+            sendHeaders frameStream (_dispatchControlHpackEncoder control) headersList splitter flags
     let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
@@ -465,7 +455,6 @@ initializeStream conn control frames headersFrames mPushPromises hpackEncoder si
                                        ppFrames
                                        ppHeaders
                                        Nothing
-                                       hpackEncoder
                                        ppSid
                                        mkStreamActions
             ppCont
