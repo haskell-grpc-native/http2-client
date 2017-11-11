@@ -191,10 +191,10 @@ data Http2ClientAsyncs = Http2ClientAsyncs {
   -- See 'creditDataFramesLoop'.
   , _HPACKAsync          :: Async ()
   -- ^ Async responsible for serializing every HEADERS/PUSH_PROMISE/CONTINUATION.
-  -- See 'incomingHPACKFramesLoop'.
+  -- See 'dispatchHPACKFramesLoop'.
   , _controlFramesAsync  :: Async ()
   -- ^ Async responsible for handling control frames (e.g., PING).
-  -- See 'incomingControlFramesLoop'.
+  -- See 'dispatchControlFramesLoop'.
   , _incomingFramesAsync :: Async ()
   -- ^ Async responsible for ingesting all frames, increasing the
   -- maximum-received streamID and starting the frame dispatch. See
@@ -347,7 +347,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
       -- Thread handling control frames.
       settings  <- newIORef defaultConnectionSettings
       controlFrames <- newDispatchReadChanIO dispatch
-      let controlLoop = incomingControlFramesLoop controlFrames (DispatchControl settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler)
+      let controlLoop = dispatchControlFramesLoop controlFrames (DispatchControl settings hpackEncoder ackPing ackSettings goAwayHandler fallbackHandler)
       withAsync controlLoop $ \aControl -> do
         -- Thread handling push-promises and headers frames serializing the buffers.
         serverStreamFrames <- newDispatchReadChanIO dispatch
@@ -357,7 +357,7 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
         _incomingFlowControl <- newIncomingFlowControl settings controlStream
 
         dispatchHPACK <- newDispatchHPACKIO decoderBufSize
-        let hpackLoop = incomingHPACKFramesLoop serverStreamFrames dispatchHPACK
+        let hpackLoop = dispatchHPACKFramesLoop serverStreamFrames dispatchHPACK
         withAsync hpackLoop $ \aHPACK -> do
           dataFrames <- newDispatchReadChanIO dispatch
           let creditLoop = creditDataFramesLoop _incomingFlowControl dataFrames
@@ -481,7 +481,14 @@ dispatchFramesLoop
   :: Http2FrameConnection
   -> Dispatch
   -> IO ()
-dispatchFramesLoop conn (Dispatch{..}) = delayException $ forever $ do
+dispatchFramesLoop c d =
+    delayException . forever $ dispatchFramesStep c d
+
+dispatchFramesStep
+  :: Http2FrameConnection
+  -> Dispatch
+  -> IO ()
+dispatchFramesStep conn (Dispatch{..}) = do
     frame@(fh, _) <- next conn
     -- Remember highest streamId.
     atomicModifyIORef' _dispatchMaxStreamId (\n -> (max n (streamId fh), ()))
@@ -506,12 +513,20 @@ delayException act = act `catch` slowdown
     slowdown :: SomeException -> IO a
     slowdown e = threadDelay 50000 >> throwIO e
 
-incomingControlFramesLoop
+dispatchControlFramesLoop
   :: Exception e
   => Chan (FrameHeader, Either e FramePayload)
   -> DispatchControl
   -> IO ()
-incomingControlFramesLoop frames (DispatchControl{..}) = forever $ do
+dispatchControlFramesLoop c d =
+    forever $ dispatchControlFramesStep c d
+
+dispatchControlFramesStep
+  :: Exception e
+  => Chan (FrameHeader, Either e FramePayload)
+  -> DispatchControl
+  -> IO ()
+dispatchControlFramesStep frames (DispatchControl{..}) = do
     controlFrame@(fh, payload) <- waitFrameWithStreamId 0 frames
     case payload of
         (SettingsFrame settsList)
@@ -564,12 +579,20 @@ data HPACKLoopDecision =
     ForwardHeader !StreamId
   | OpenPushPromise !StreamId !StreamId
 
-incomingHPACKFramesLoop
+dispatchHPACKFramesLoop
   :: Exception e
   => FramesChan e
   -> DispatchHPACK e
   -> IO ()
-incomingHPACKFramesLoop frames (DispatchHPACK{..}) = forever $ do
+dispatchHPACKFramesLoop c d =
+    forever $ dispatchHPACKFramesStep c d
+
+dispatchHPACKFramesStep
+  :: Exception e
+  => FramesChan e
+  -> DispatchHPACK e
+  -> IO ()
+dispatchHPACKFramesStep frames (DispatchHPACK{..}) = do
     (fh, fp) <- waitFrameWithTypeId [ FrameRSTStream
                                     , FramePushPromise
                                     , FrameHeaders
