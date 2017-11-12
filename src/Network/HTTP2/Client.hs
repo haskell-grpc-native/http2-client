@@ -48,7 +48,7 @@ import           Control.Concurrent.Async (Async, async, race, withAsync, link)
 import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
-import           Control.Monad (forever, when, forM_)
+import           Control.Monad (forever, join, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
@@ -475,7 +475,7 @@ initializeStream conn dispatch control stream getWork = do
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan)
+    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -541,7 +541,6 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                     writeChan hpackchan (curFh, sId, Right newHdrs)
                 hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
                     ppChan <- newDispatchReadChanIO d
-                    let hpackPPChan = _dispatchHPACKWritePushPromisesChan dh
                     newHdrs <- mkNewHdrs
                     -- Important: We duplicate the channel here or we risk
                     -- losing DATA or HEADERS+CONTINUATION frames sent over
@@ -551,7 +550,10 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                     -- stream and the push-promise handler that will
                     -- initiate the new stream are synchronous.
                     ppHeaders <- dupChan $ _dispatchHPACKWriteHeadersChan dh
-                    writeChan hpackPPChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
+                    xs <- readIORef $ _dispatchCurrentStreams d
+                    let chan = _streanStatePushPromisesChan <$> lookup parentSid xs
+                    let msg = (parentSid, ppChan, ppHeaders, newSid, newHdrs)
+                    maybe (return ()) (flip writeChan msg) (join chan)
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
                 hpackLoop (FailedHeaders curFh sId err)        = do

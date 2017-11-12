@@ -42,6 +42,7 @@ defaultGoAwayHandler = throwIO
 
 data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
+  , _streanStatePushPromisesChan  :: !(Maybe (PushPromisesChan HTTP2Error))
   }
 
 data Dispatch = Dispatch {
@@ -119,13 +120,12 @@ data HpackEncoderContext = HpackEncoderContext {
 
 data DispatchHPACK = DispatchHPACK {
     _dispatchHPACKWriteHeadersChan      :: !HeadersChan
-  , _dispatchHPACKWritePushPromisesChan :: !(PushPromisesChan HTTP2Error)
   , _dispatchHPACKDynamicTable          :: !DynamicTable
   }
 
 newDispatchHPACKIO :: Size -> IO DispatchHPACK
 newDispatchHPACKIO decoderBufSize =
-    DispatchHPACK <$> newChan <*> newChan <*> newDecoder
+    DispatchHPACK <$> newChan <*> newDecoder
   where
     newDecoder = newDynamicTableForDecoding
         HPACK.defaultDynamicTableSize
@@ -134,10 +134,6 @@ newDispatchHPACKIO decoderBufSize =
 newDispatchHPACKReadHeadersChanIO :: DispatchHPACK -> IO HeadersChan
 newDispatchHPACKReadHeadersChanIO =
     dupChan . _dispatchHPACKWriteHeadersChan
-
-newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK -> IO (PushPromisesChan HTTP2Error)
-newDispatchHPACKReadPushPromisesChanIO =
-    dupChan . _dispatchHPACKWritePushPromisesChan
 
 data DispatchStream = DispatchStream {
     _dispatchStreamId :: !StreamId
@@ -151,4 +147,8 @@ newDispatchStreamIO sid d dh =
     DispatchStream <$> pure sid
                    <*> newDispatchReadChanIO d
                    <*> newDispatchHPACKReadHeadersChanIO dh
-                   <*> (fmap Just $ newDispatchHPACKReadPushPromisesChanIO dh)
+                   <*> mkPPChan
+  where
+    -- assuming that client stream IDs must be odd, server streams are even
+    -- we can make a push-promise chan or not
+    mkPPChan = if odd sid then fmap Just newChan else pure Nothing
