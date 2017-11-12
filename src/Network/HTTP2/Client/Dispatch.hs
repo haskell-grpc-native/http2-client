@@ -42,7 +42,7 @@ defaultGoAwayHandler = throwIO
 
 data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
-  , _streamStatePushPromisesChan  :: !(Maybe (PushPromisesChan HTTP2Error))
+  , _streamStatePushPromisesChan  :: !(Maybe PushPromisesChan)
   , _streamStateHeadersChan       :: !HeadersChan
   }
 
@@ -135,7 +135,7 @@ data DispatchStream = DispatchStream {
     _dispatchStreamId :: !StreamId
   , _dispatchStreamReadStreamFrames :: !DispatchChan
   , _dispatchStreamReadHeaders      :: !HeadersChan
-  , _dispatchStreamReadPushPromises :: Maybe (PushPromisesChan HTTP2Error)
+  , _dispatchStreamReadPushPromises :: Maybe PushPromisesChan
   }
 
 newDispatchStreamIO :: StreamId -> Dispatch -> IO DispatchStream

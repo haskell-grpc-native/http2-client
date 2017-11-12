@@ -496,10 +496,9 @@ initializeStream conn dispatch control stream getWork = do
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
     let makeWaitPushPromise pushPromises = \ppHandler -> do
-            (_,ppFrames,ppSid,ppReadHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
-            let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppReadHeaders)
-            ppHeaders <- newChan
-            let newStream = DispatchStream ppSid ppFrames ppHeaders Nothing
+            (_,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
+            let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
+            newStream <- newDispatchStreamIO ppSid dispatch
             ppCont <- initializeStream conn
                                        dispatch
                                        control
@@ -544,9 +543,8 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                     maybe (return ()) (flip writeChan msg) chan
                 hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    ppDispatchChan <- newDispatchReadChanIO d
                     let chan = _streamStatePushPromisesChan <$> lookup parentSid xs
-                    let msg = (parentSid, ppDispatchChan, newSid, newHdrs)
+                    let msg = (parentSid, newSid, newHdrs)
                     maybe (return ()) (flip writeChan msg) (join chan)
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
