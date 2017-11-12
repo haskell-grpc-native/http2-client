@@ -50,16 +50,12 @@ data StreamState = StreamState {
   }
 
 data Dispatch = Dispatch {
-    _dispatchWriteChan      :: !DispatchChan
-  , _dispatchMaxStreamId    :: !(IORef StreamId)
+    _dispatchMaxStreamId    :: !(IORef StreamId)
   , _dispatchCurrentStreams :: !(IORef (IntMap StreamState))
   }
 
 newDispatchIO :: IO Dispatch
-newDispatchIO = Dispatch <$> newChan <*> newIORef 0 <*> newIORef (IntMap.empty)
-
-newDispatchReadChanIO :: Dispatch -> IO DispatchChan
-newDispatchReadChanIO = dupChan . _dispatchWriteChan
+newDispatchIO = Dispatch <$> newIORef 0 <*> newIORef (IntMap.empty)
 
 readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
 readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId

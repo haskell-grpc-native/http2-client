@@ -561,7 +561,6 @@ dispatchFramesStep frame@(fh,_) d = do
     atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
     -- Double write to the general chan (for ping & settings)
     -- as well as to the interested streams.
-    writeChan (_dispatchWriteChan d) frame
     chan <- fmap _streamStateStreamFramesChan <$> lookupStreamState d sid
     maybe (return ()) (flip writeChan frame) chan
 
