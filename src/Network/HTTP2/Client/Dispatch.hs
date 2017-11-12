@@ -112,9 +112,14 @@ registerPingHandler dc dat = do
         ((dat,handler):xs, ()))
     return handler
 
-lookupPingHandler :: DispatchControl -> ByteString -> IO (Maybe PingHandler)
-lookupPingHandler dc dat =
-    lookup dat <$> readIORef (_dispatchControlPingHandlers dc)
+lookupAndReleasePingHandler :: DispatchControl -> ByteString -> IO (Maybe PingHandler)
+lookupAndReleasePingHandler dc dat =
+    atomicModifyIORef' (_dispatchControlPingHandlers dc) f
+  where
+    -- Note: we considered doing a single pass for this folds but we expect the
+    -- size of handlers to be small anyway (hence, we use a List for
+    -- storing the handlers).
+    f xs = (filter (\x -> dat /= fst x) xs, lookup dat xs)
 
 registerSetSettingsHandler :: DispatchControl -> IO SetSettingsHandler
 registerSetSettingsHandler dc = do
@@ -123,12 +128,12 @@ registerSetSettingsHandler dc = do
         (handler:xs, ()))
     return handler
 
-lookupSetSettingsHandler :: DispatchControl -> IO (Maybe SetSettingsHandler)
-lookupSetSettingsHandler dc =
-    headMay <$> readIORef (_dispatchControlSetSettingsHandlers dc)
+lookupAndReleaseSetSettingsHandler :: DispatchControl -> IO (Maybe SetSettingsHandler)
+lookupAndReleaseSetSettingsHandler dc =
+    atomicModifyIORef' (_dispatchControlSetSettingsHandlers dc) f
   where
-    headMay []     = Nothing
-    headMay (x:_) = Just x
+    f []     = ([], Nothing)
+    f (x:xs) = (xs, Just x)
 
 data DispatchControl = DispatchControl {
     _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)

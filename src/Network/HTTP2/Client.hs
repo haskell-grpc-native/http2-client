@@ -8,8 +8,6 @@
 -- For higher-level primitives, please refer to Network.HTTP2.Client.Helpers .
 --
 -- TODO: release stream states when closed
--- TODO: unregister ping handlers
--- TODO: unregister settings handlers
 module Network.HTTP2.Client (
     -- * Basics
       runHttp2Client
@@ -584,13 +582,13 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
                       (lookup SettingsHeaderTableSize settsList)
                 _dispatchControlAckSettings
             | otherwise                 -> do
-                handler <- lookupSetSettingsHandler control
+                handler <- lookupAndReleaseSetSettingsHandler control
                 maybe (return ()) (notifySetSettingsHandler controlFrame) handler
         (PingFrame pingMsg)
             | not . testAck . flags $ fh ->
                 _dispatchControlAckPing pingMsg
             | otherwise                 -> do
-                handler <- lookupPingHandler control pingMsg
+                handler <- lookupAndReleasePingHandler control pingMsg
                 maybe (return ()) (notifyPingHandler controlFrame) handler
         (WindowUpdateFrame _ )  ->
                 writeChan windowUpdatesChan controlFrame
