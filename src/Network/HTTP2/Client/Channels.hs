@@ -31,7 +31,7 @@ type HeadersChanContent = (FrameHeader, StreamId, Either ErrorCode HeaderList)
 
 type HeadersChan = Chan HeadersChanContent
 
-type PushPromisesChanContent e = (StreamId, FramesChan e, HeadersChan, StreamId, HeaderList)
+type PushPromisesChanContent e = (StreamId, FramesChan e, StreamId, HeaderList)
 
 type PushPromisesChan e = Chan (PushPromisesChanContent e)
 
@@ -140,7 +140,7 @@ waitPushPromiseWithParentStreamId sid chan =
     loop
   where
     loop = do
-        tuple@(parentSid,_,_,_,_) <- readChan chan
+        tuple@(parentSid,_,_,_) <- readChan chan
         if parentSid == sid
         then return tuple
         else loop

@@ -422,7 +422,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                 return $ Left $ TooMuchConcurrency roomNeeded
             else Right <$> do
                 cont <- withClientStreamId $ \sid -> do
-                    dispatchStream <- newDispatchStreamIO sid dispatch dispatchHPACK
+                    dispatchStream <- newDispatchStreamIO sid dispatch
                     initializeStream conn
                                      dispatch
                                      dispatchControl
@@ -475,7 +475,7 @@ initializeStream conn dispatch control stream getWork = do
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises)
+    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -496,8 +496,9 @@ initializeStream conn dispatch control stream getWork = do
     let _rst            = sendResetFrame frameStream
     let _prio           = sendPriorityFrame frameStream
     let makeWaitPushPromise pushPromises = \ppHandler -> do
-            (_,ppFrames,ppHeaders,ppSid,ppReadHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
+            (_,ppFrames,ppSid,ppReadHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
             let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppReadHeaders)
+            ppHeaders <- newChan
             let newStream = DispatchStream ppSid ppFrames ppHeaders Nothing
             ppCont <- initializeStream conn
                                        dispatch
@@ -535,30 +536,24 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
         whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
             updateWindowsStep d got
         whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
+            xs <- readIORef $ _dispatchCurrentStreams d
             let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
-                    let hpackchan = _dispatchHPACKWriteHeadersChan dh
                     newHdrs <- mkNewHdrs
-                    writeChan hpackchan (curFh, sId, Right newHdrs)
+                    let chan = _streamStateHeadersChan <$> lookup sId xs
+                    let msg = (curFh, sId, Right newHdrs)
+                    maybe (return ()) (flip writeChan msg) chan
                 hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
-                    ppChan <- newDispatchReadChanIO d
                     newHdrs <- mkNewHdrs
-                    -- Important: We duplicate the channel here or we risk
-                    -- losing DATA or HEADERS+CONTINUATION frames sent over
-                    -- the main stream because even though
-                    -- 'initializeStream' dupes frame channels, this
-                    -- function will has no guarantee that the parent
-                    -- stream and the push-promise handler that will
-                    -- initiate the new stream are synchronous.
-                    ppHeaders <- dupChan $ _dispatchHPACKWriteHeadersChan dh
-                    xs <- readIORef $ _dispatchCurrentStreams d
-                    let chan = _streanStatePushPromisesChan <$> lookup parentSid xs
-                    let msg = (parentSid, ppChan, ppHeaders, newSid, newHdrs)
+                    ppDispatchChan <- newDispatchReadChanIO d
+                    let chan = _streamStatePushPromisesChan <$> lookup parentSid xs
+                    let msg = (parentSid, ppDispatchChan, newSid, newHdrs)
                     maybe (return ()) (flip writeChan msg) (join chan)
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
                 hpackLoop (FailedHeaders curFh sId err)        = do
-                    let hpackchan = _dispatchHPACKWriteHeadersChan dh
-                    writeChan hpackchan (curFh, sId, Left err)
+                    let chan = _streamStateHeadersChan <$> lookup sId xs
+                    let msg = (curFh, sId, Left err)
+                    maybe (return ()) (flip writeChan msg) chan
             hpackLoop (dispatchHPACKFramesStep got dh)
 
 dispatchFramesStep
