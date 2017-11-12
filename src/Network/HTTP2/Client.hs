@@ -400,10 +400,10 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                                             fallbackHandler
 
     _initIncomingFlowControl <- newIncomingFlowControl dispatchControl controlStream
-    _initOutgoingFlowControl <- newOutgoingFlowControl dispatch dispatchControl 0
+    (_initOutgoingFlowControl,windowUpdatesChan) <- newOutgoingFlowControl dispatchControl 0
 
     dispatchHPACK <- newDispatchHPACKIO decoderBufSize
-    let incomingLoop = dispatchLoop conn dispatch dispatchControl _initIncomingFlowControl dispatchHPACK
+    let incomingLoop = dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
 
     {- Setup for client-initiated streams. -}
     conccurentStreams <- newIORef 0
@@ -474,7 +474,8 @@ initializeStream conn dispatch control stream getWork = do
 
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
-    outgoingStreamFlowControl <- newOutgoingFlowControl dispatch control sid
+    (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
+    registerStream dispatch sid (StreamState windowUpdatesChan)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -518,16 +519,17 @@ dispatchLoop
   :: Http2FrameConnection
   -> Dispatch
   -> DispatchControl
+  -> Chan (FrameHeader, FramePayload)
   -> IncomingFlowControl
   -> DispatchHPACK
   -> IO ()
-dispatchLoop conn d dc inFlowControl dh = do
+dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
     let getNextFrame = next conn
     delayException . forever $ do
         frame <- getNextFrame
         dispatchFramesStep frame d
         whenFrame (hasStreamId 0) frame $ \got ->
-            dispatchControlFramesStep got dc
+            dispatchControlFramesStep windowUpdatesChan got dc
         whenFrame (hasTypeId [FrameData]) frame $ \got ->
             creditDataFramesStep inFlowControl got
         whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
@@ -567,10 +569,11 @@ dispatchFramesStep frame@(fh,_) (Dispatch{..}) = do
     writeChan _dispatchWriteChan frame
 
 dispatchControlFramesStep
-  :: (FrameHeader, FramePayload)
+  :: Chan (FrameHeader, FramePayload)
+  -> (FrameHeader, FramePayload)
   -> DispatchControl
   -> IO ()
-dispatchControlFramesStep controlFrame@(fh, payload) (DispatchControl{..}) = do
+dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) (DispatchControl{..}) = do
     case payload of
         (SettingsFrame settsList)
             | not . testAck . flags $ fh -> do
@@ -589,7 +592,7 @@ dispatchControlFramesStep controlFrame@(fh, payload) (DispatchControl{..}) = do
             | otherwise                 -> do
                 ignore "PingFrame replies waited for in the requestor thread"
         (WindowUpdateFrame _ )  ->
-                ignore "connection-wide WindowUpdateFrame waited for in OutgoingFlowControl channels"
+                writeChan windowUpdatesChan controlFrame
         (GoAwayFrame lastSid errCode reason)  ->
              _dispatchControlOnGoAway $ RemoteSentGoAwayFrame lastSid errCode reason
 
@@ -713,14 +716,12 @@ newIncomingFlowControl control stream = do
     return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow
 
 newOutgoingFlowControl ::
-     Dispatch
-  -> DispatchControl
+     DispatchControl
   -> StreamId
-  -> IO OutgoingFlowControl
-newOutgoingFlowControl dispatch control sid = do
+  -> IO (OutgoingFlowControl, Chan (FrameHeader, FramePayload))
+newOutgoingFlowControl control sid = do
     credit <- newIORef 0
     frames <- newChan
-    registerStream dispatch sid (StreamState frames)
     let getBase = if sid == 0
                   then return HTTP2.defaultInitialWindowSize
                   else initialWindowSize . _serverSettings <$> readSettings control
@@ -738,7 +739,7 @@ newOutgoingFlowControl dispatch control sid = do
                 amount <- race (waitSettingsChange base) (waitSomeCredit frames)
                 receive (either (const 0) id amount)
                 withdraw n
-    return $ OutgoingFlowControl receive withdraw
+    return $ (OutgoingFlowControl receive withdraw, frames)
   where
     -- TODO: broadcast settings changes from ConnectionSettings using a better data type
     -- than IORef+busy loop. Currently the busy loop is fine because
