@@ -4,6 +4,8 @@ module Network.HTTP2.Client.Dispatch where
 import           Control.Exception (throwIO)
 import           Data.ByteString (ByteString)
 import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import           Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -49,11 +51,11 @@ data StreamState = StreamState {
 data Dispatch = Dispatch {
     _dispatchWriteChan      :: !DispatchChan
   , _dispatchMaxStreamId    :: !(IORef StreamId)
-  , _dispatchCurrentStreams :: !(IORef [(StreamId, StreamState)])
+  , _dispatchCurrentStreams :: !(IORef (IntMap StreamState))
   }
 
 newDispatchIO :: IO Dispatch
-newDispatchIO = Dispatch <$> newChan <*> newIORef 0 <*> newIORef []
+newDispatchIO = Dispatch <$> newChan <*> newIORef 0 <*> newIORef (IntMap.empty)
 
 newDispatchReadChanIO :: Dispatch -> IO DispatchChan
 newDispatchReadChanIO = dupChan . _dispatchWriteChan
@@ -64,7 +66,11 @@ readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId
 registerStream :: Dispatch -> StreamId -> StreamState -> IO ()
 registerStream d sid st =
     atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
-      let v = ((sid,st):xs) in (v, ())
+      let v = (IntMap.insert sid st xs) in (v, ())
+
+lookupStreamState :: Dispatch -> StreamId -> IO (Maybe StreamState)
+lookupStreamState d sid =
+    IntMap.lookup sid <$> readIORef (_dispatchCurrentStreams d)
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {

@@ -535,21 +535,20 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
         whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
             updateWindowsStep d got
         whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
-            xs <- readIORef $ _dispatchCurrentStreams d
             let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    let chan = _streamStateHeadersChan <$> lookup sId xs
+                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
                     let msg = (curFh, sId, Right newHdrs)
                     maybe (return ()) (flip writeChan msg) chan
                 hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    let chan = _streamStatePushPromisesChan <$> lookup parentSid xs
+                    chan <- fmap _streamStatePushPromisesChan <$> lookupStreamState d parentSid
                     let msg = (parentSid, newSid, newHdrs)
                     maybe (return ()) (flip writeChan msg) (join chan)
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
                 hpackLoop (FailedHeaders curFh sId err)        = do
-                    let chan = _streamStateHeadersChan <$> lookup sId xs
+                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
                     let msg = (curFh, sId, Left err)
                     maybe (return ()) (flip writeChan msg) chan
             hpackLoop (dispatchHPACKFramesStep got dh)
@@ -619,9 +618,8 @@ updateWindowsStep
   -> (FrameHeader, FramePayload)
   -> IO ()
 updateWindowsStep d got@(fh,_) = do
-    xs <- readIORef $ _dispatchCurrentStreams d
     let sid = HTTP2.streamId fh
-    let chan = _streamStateWindowUpdatesChan <$> lookup sid xs
+    chan <- fmap _streamStateWindowUpdatesChan <$> lookupStreamState d sid
     maybe (return ()) (flip writeChan got) chan --TODO: refer to RFC for erroring on idle/closed streams
 
 data HPACKLoopDecision =
