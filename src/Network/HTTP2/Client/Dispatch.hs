@@ -4,6 +4,8 @@ module Network.HTTP2.Client.Dispatch where
 import           Control.Exception (throwIO)
 import           Data.ByteString (ByteString)
 import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import           Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -40,19 +42,68 @@ type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 defaultGoAwayHandler :: GoAwayHandler
 defaultGoAwayHandler = throwIO
 
+data StreamFSMState =
+    Idle
+  | ReservedRemote
+  | Open
+  | HalfClosedRemote
+  | HalfClosedLocal
+  | Closed
+
+data StreamState = StreamState {
+    _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
+  , _streamStatePushPromisesChan  :: !(Maybe PushPromisesChan)
+  , _streamStateHeadersChan       :: !HeadersChan
+  , _streamStateStreamFramesChan  :: !DispatchChan
+  , _streamStateFSMState          :: !StreamFSMState
+  }
+
 data Dispatch = Dispatch {
-    _dispatchWriteChan   :: !DispatchChan
-  , _dispatchMaxStreamId :: !(IORef StreamId)
+    _dispatchMaxStreamId    :: !(IORef StreamId)
+  , _dispatchCurrentStreams :: !(IORef (IntMap StreamState))
   }
 
 newDispatchIO :: IO Dispatch
-newDispatchIO = Dispatch <$> newChan <*> newIORef 0
-
-newDispatchReadChanIO :: Dispatch -> IO DispatchChan
-newDispatchReadChanIO = dupChan . _dispatchWriteChan
+newDispatchIO = Dispatch <$> newIORef 0 <*> newIORef (IntMap.empty)
 
 readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
 readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId
+
+registerStream :: Dispatch -> StreamId -> StreamState -> IO ()
+registerStream d sid st =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let v = (IntMap.insert sid st xs) in (v, ())
+
+lookupStreamState :: Dispatch -> StreamId -> IO (Maybe StreamState)
+lookupStreamState d sid =
+    IntMap.lookup sid <$> readIORef (_dispatchCurrentStreams d)
+
+closeLocalStream :: Dispatch -> StreamId -> IO ()
+closeLocalStream d sid =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let (_,v) = IntMap.updateLookupWithKey f sid xs in (v, ())
+  where
+    f :: StreamId -> StreamState -> Maybe StreamState
+    f _ st = case _streamStateFSMState st of
+        HalfClosedRemote -> Nothing
+        Closed           -> Nothing
+        _ -> Just $ st { _streamStateFSMState = HalfClosedLocal }
+
+closeRemoteStream :: Dispatch -> StreamId -> IO ()
+closeRemoteStream d sid =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let (_,v) = IntMap.updateLookupWithKey f sid xs in (v, ())
+  where
+    f :: StreamId -> StreamState -> Maybe StreamState
+    f _ st = case _streamStateFSMState st of
+        HalfClosedLocal  -> Nothing
+        Closed           -> Nothing
+        _ -> Just $ st { _streamStateFSMState = HalfClosedRemote }
+
+closeReleaseStream :: Dispatch -> StreamId -> IO ()
+closeReleaseStream d sid =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let v = (IntMap.delete sid xs) in (v, ())
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {
@@ -64,6 +115,58 @@ defaultConnectionSettings :: ConnectionSettings
 defaultConnectionSettings =
     ConnectionSettings defaultSettings defaultSettings
 
+data PingHandler = PingHandler !(Chan (FrameHeader, FramePayload))
+
+newPingHandler :: IO PingHandler
+newPingHandler = PingHandler <$> newChan
+
+notifyPingHandler :: (FrameHeader, FramePayload) -> PingHandler -> IO ()
+notifyPingHandler dat (PingHandler c) = writeChan c dat
+
+waitPingReply :: PingHandler -> IO (FrameHeader, FramePayload)
+waitPingReply (PingHandler c) = readChan c
+
+data SetSettingsHandler = SetSettingsHandler !(Chan (FrameHeader, FramePayload))
+
+newSetSettingsHandler :: IO SetSettingsHandler
+newSetSettingsHandler = SetSettingsHandler <$> newChan
+
+notifySetSettingsHandler :: (FrameHeader, FramePayload) -> SetSettingsHandler -> IO ()
+notifySetSettingsHandler dat (SetSettingsHandler c) = writeChan c dat
+
+waitSetSettingsReply :: SetSettingsHandler -> IO (FrameHeader, FramePayload)
+waitSetSettingsReply (SetSettingsHandler c) = readChan c
+
+registerPingHandler :: DispatchControl -> ByteString -> IO PingHandler
+registerPingHandler dc dat = do
+    handler <- newPingHandler
+    atomicModifyIORef' (_dispatchControlPingHandlers dc) (\xs ->
+        ((dat,handler):xs, ()))
+    return handler
+
+lookupAndReleasePingHandler :: DispatchControl -> ByteString -> IO (Maybe PingHandler)
+lookupAndReleasePingHandler dc dat =
+    atomicModifyIORef' (_dispatchControlPingHandlers dc) f
+  where
+    -- Note: we considered doing a single pass for this folds but we expect the
+    -- size of handlers to be small anyway (hence, we use a List for
+    -- storing the handlers).
+    f xs = (filter (\x -> dat /= fst x) xs, lookup dat xs)
+
+registerSetSettingsHandler :: DispatchControl -> IO SetSettingsHandler
+registerSetSettingsHandler dc = do
+    handler <- newSetSettingsHandler
+    atomicModifyIORef' (_dispatchControlSetSettingsHandlers dc) (\xs ->
+        (handler:xs, ()))
+    return handler
+
+lookupAndReleaseSetSettingsHandler :: DispatchControl -> IO (Maybe SetSettingsHandler)
+lookupAndReleaseSetSettingsHandler dc =
+    atomicModifyIORef' (_dispatchControlSetSettingsHandlers dc) f
+  where
+    f []     = ([], Nothing)
+    f (x:xs) = (xs, Just x)
+
 data DispatchControl = DispatchControl {
     _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
   , _dispatchControlHpackEncoder        :: !HpackEncoderContext
@@ -71,6 +174,8 @@ data DispatchControl = DispatchControl {
   , _dispatchControlAckSettings         :: !(IO ())
   , _dispatchControlOnGoAway            :: !GoAwayHandler
   , _dispatchControlOnFallback          :: !FallBackFrameHandler
+  , _dispatchControlPingHandlers        :: !(IORef [(ByteString, PingHandler)])
+  , _dispatchControlSetSettingsHandlers :: !(IORef [SetSettingsHandler])
   }
 
 newDispatchControlIO
@@ -87,6 +192,8 @@ newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
                     <*> pure ackSetts
                     <*> pure onGoAway
                     <*> pure onFallback
+                    <*> newIORef []
+                    <*> newIORef []
   where
     hpackEncoder = do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
@@ -108,23 +215,31 @@ data HpackEncoderContext = HpackEncoderContext {
   }
 
 data DispatchHPACK = DispatchHPACK {
-    _dispatchHPACKWriteHeadersChan      :: !HeadersChan
-  , _dispatchHPACKWritePushPromisesChan :: !(PushPromisesChan HTTP2Error)
-  , _dispatchHPACKDynamicTable          :: !DynamicTable
+    _dispatchHPACKDynamicTable          :: !DynamicTable
   }
 
 newDispatchHPACKIO :: Size -> IO DispatchHPACK
 newDispatchHPACKIO decoderBufSize =
-    DispatchHPACK <$> newChan <*> newChan <*> newDecoder
+    DispatchHPACK <$> newDecoder
   where
     newDecoder = newDynamicTableForDecoding
         HPACK.defaultDynamicTableSize
         decoderBufSize
 
-newDispatchHPACKReadHeadersChanIO :: DispatchHPACK -> IO HeadersChan
-newDispatchHPACKReadHeadersChanIO =
-    dupChan . _dispatchHPACKWriteHeadersChan
+data DispatchStream = DispatchStream {
+    _dispatchStreamId :: !StreamId
+  , _dispatchStreamReadStreamFrames :: !DispatchChan
+  , _dispatchStreamReadHeaders      :: !HeadersChan
+  , _dispatchStreamReadPushPromises :: Maybe PushPromisesChan
+  }
 
-newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK -> IO (PushPromisesChan HTTP2Error)
-newDispatchHPACKReadPushPromisesChanIO =
-    dupChan . _dispatchHPACKWritePushPromisesChan
+newDispatchStreamIO :: StreamId -> IO DispatchStream
+newDispatchStreamIO sid =
+    DispatchStream <$> pure sid
+                   <*> newChan
+                   <*> newChan
+                   <*> mkPPChan
+  where
+    -- assuming that client stream IDs must be odd, server streams are even
+    -- we can make a push-promise chan or not
+    mkPPChan = if odd sid then fmap Just newChan else pure Nothing
