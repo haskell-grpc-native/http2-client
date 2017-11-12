@@ -83,6 +83,29 @@ defaultConnectionSettings :: ConnectionSettings
 defaultConnectionSettings =
     ConnectionSettings defaultSettings defaultSettings
 
+data PingHandler = PingHandler !(Chan (FrameHeader, FramePayload))
+
+newPingHandler :: IO PingHandler
+newPingHandler = PingHandler <$> newChan
+
+notifyPingHandler :: (FrameHeader, FramePayload) -> PingHandler -> IO ()
+notifyPingHandler dat (PingHandler c) = writeChan c dat
+
+waitPingReply :: PingHandler -> IO (FrameHeader, FramePayload)
+waitPingReply (PingHandler c) = readChan c
+
+registerPingHandler :: DispatchControl -> ByteString -> IO PingHandler
+registerPingHandler dc dat = do
+    handler <- newPingHandler
+    atomicModifyIORef' (_dispatchControlPingHandlers dc) (\xs ->
+        ((dat,handler):xs, ()))
+    return handler
+
+lookupPingHandler :: DispatchControl -> ByteString -> IO (Maybe PingHandler)
+lookupPingHandler dc dat =
+    lookup dat <$> readIORef (_dispatchControlPingHandlers dc)
+
+
 data DispatchControl = DispatchControl {
     _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
   , _dispatchControlHpackEncoder        :: !HpackEncoderContext
@@ -90,6 +113,7 @@ data DispatchControl = DispatchControl {
   , _dispatchControlAckSettings         :: !(IO ())
   , _dispatchControlOnGoAway            :: !GoAwayHandler
   , _dispatchControlOnFallback          :: !FallBackFrameHandler
+  , _dispatchControlPingHandlers        :: !(IORef [(ByteString, PingHandler)])
   }
 
 newDispatchControlIO
@@ -106,6 +130,7 @@ newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
                     <*> pure ackSetts
                     <*> pure onGoAway
                     <*> pure onFallback
+                    <*> newIORef []
   where
     hpackEncoder = do
         let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })

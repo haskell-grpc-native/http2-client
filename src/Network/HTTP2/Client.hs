@@ -8,6 +8,7 @@
 -- For higher-level primitives, please refer to Network.HTTP2.Client.Helpers .
 --
 -- TODO: release stream states when closed
+-- TODO: unregister ping handlers
 module Network.HTTP2.Client (
     -- * Basics
       runHttp2Client
@@ -433,13 +434,13 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                 pure v
 
     let _initPing dat = do
+            handler <- registerPingHandler dispatchControl dat
+            sendPingFrame controlStream id dat
+            return $ waitPingReply handler
+
+    let _initSettings settslist = do
             -- Need to dupChan before sending the query to avoid missing a fast
             -- answer if the network is fast.
-            pingFrames <- newDispatchReadChanIO dispatch
-            sendPingFrame controlStream id dat
-            return $ waitFrame (isPingReply dat) pingFrames
-    let _initSettings settslist = do
-            -- Much like _ping, we need to dupChan before sending the query.
             settingsFrames <- newDispatchReadChanIO dispatch
             sendSettingsFrame controlStream id settslist
             return $ do
@@ -572,7 +573,7 @@ dispatchControlFramesStep
   -> (FrameHeader, FramePayload)
   -> DispatchControl
   -> IO ()
-dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) (DispatchControl{..}) = do
+dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(DispatchControl{..}) = do
     case payload of
         (SettingsFrame settsList)
             | not . testAck . flags $ fh -> do
@@ -589,7 +590,8 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) (Dispatch
             | not . testAck . flags $ fh ->
                 _dispatchControlAckPing pingMsg
             | otherwise                 -> do
-                ignore "PingFrame replies waited for in the requestor thread"
+                handler <- lookupPingHandler control pingMsg
+                maybe (return ()) (notifyPingHandler controlFrame) handler
         (WindowUpdateFrame _ )  ->
                 writeChan windowUpdatesChan controlFrame
         (GoAwayFrame lastSid errCode reason)  ->
