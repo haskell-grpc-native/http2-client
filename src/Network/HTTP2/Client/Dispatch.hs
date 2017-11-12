@@ -40,19 +40,27 @@ type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 defaultGoAwayHandler :: GoAwayHandler
 defaultGoAwayHandler = throwIO
 
+type StreamState = Chan (FrameHeader, FramePayload)
+
 data Dispatch = Dispatch {
-    _dispatchWriteChan   :: !DispatchChan
-  , _dispatchMaxStreamId :: !(IORef StreamId)
+    _dispatchWriteChan      :: !DispatchChan
+  , _dispatchMaxStreamId    :: !(IORef StreamId)
+  , _dispatchCurrentStreams :: !(IORef [(StreamId, StreamState)])
   }
 
 newDispatchIO :: IO Dispatch
-newDispatchIO = Dispatch <$> newChan <*> newIORef 0
+newDispatchIO = Dispatch <$> newChan <*> newIORef 0 <*> newIORef []
 
 newDispatchReadChanIO :: Dispatch -> IO DispatchChan
 newDispatchReadChanIO = dupChan . _dispatchWriteChan
 
 readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
 readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId
+
+registerStream :: Dispatch -> StreamId -> StreamState -> IO ()
+registerStream d sid st =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let v = ((sid,st):xs) in (v, ())
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {
@@ -128,3 +136,17 @@ newDispatchHPACKReadHeadersChanIO =
 newDispatchHPACKReadPushPromisesChanIO :: DispatchHPACK -> IO (PushPromisesChan HTTP2Error)
 newDispatchHPACKReadPushPromisesChanIO =
     dupChan . _dispatchHPACKWritePushPromisesChan
+
+data DispatchStream = DispatchStream {
+    _dispatchStreamId :: !StreamId
+  , _dispatchStreamReadStreamFrames :: !DispatchChan
+  , _dispatchStreamReadHeaders      :: !HeadersChan
+  , _dispatchStreamReadPushPromises :: Maybe (PushPromisesChan HTTP2Error)
+  }
+
+newDispatchStreamIO :: StreamId -> Dispatch -> DispatchHPACK -> IO DispatchStream
+newDispatchStreamIO sid d dh =
+    DispatchStream <$> pure sid
+                   <*> newDispatchReadChanIO d
+                   <*> newDispatchHPACKReadHeadersChanIO dh
+                   <*> (fmap Just $ newDispatchHPACKReadPushPromisesChanIO dh)
