@@ -537,12 +537,28 @@ dispatchLoop conn d dc inFlowControl dh = do
         whenFrame (hasTypeId [FrameData]) frame $ \got ->
             creditDataFramesStep inFlowControl got
         whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
-            let hpackLoop (FinishedWithHeaders act)     =
-                    act
-                hpackLoop (FinishedWithPushPromise act) = do
-                    newDispatchReadChanIO d >>= act
+            let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
+                    let hpackchan = _dispatchHPACKWriteHeadersChan dh
+                    newHdrs <- mkNewHdrs
+                    writeChan hpackchan (curFh, sId, Right newHdrs)
+                hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
+                    ppChan <- newDispatchReadChanIO d
+                    let hpackPPChan = _dispatchHPACKWritePushPromisesChan dh
+                    newHdrs <- mkNewHdrs
+                    -- Important: We duplicate the channel here or we risk
+                    -- losing DATA or HEADERS+CONTINUATION frames sent over
+                    -- the main stream because even though
+                    -- 'initializeStream' dupes frame channels, this
+                    -- function will has no guarantee that the parent
+                    -- stream and the push-promise handler that will
+                    -- initiate the new stream are synchronous.
+                    ppHeaders <- dupChan $ _dispatchHPACKWriteHeadersChan dh
+                    writeChan hpackPPChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
+                hpackLoop (FailedHeaders curFh sId err)        = do
+                    let hpackchan = _dispatchHPACKWriteHeadersChan dh
+                    writeChan hpackchan (curFh, sId, Left err)
             hpackLoop (dispatchHPACKFramesStep got dh)
 
 dispatchFramesStep
@@ -610,8 +626,9 @@ data HPACKLoopDecision =
 
 data HPACKStepResult =
     WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> IO HPACKStepResult)
-  | FinishedWithHeaders !(IO ())
-  | FinishedWithPushPromise !(DispatchChan -> IO ())
+  | FailedHeaders !FrameHeader !StreamId ErrorCode
+  | FinishedWithHeaders !FrameHeader !StreamId (IO HeaderList)
+  | FinishedWithPushPromise !FrameHeader !StreamId !StreamId (IO HeaderList)
 
 dispatchHPACKFramesStep
   :: (FrameHeader, FramePayload)
@@ -649,23 +666,12 @@ dispatchHPACKFramesStep (fh,fp) (DispatchHPACK{..}) =
                     _                     ->
                         error "continued frame has invalid type")
         else case decision of
-            ForwardHeader sId -> FinishedWithHeaders $ do
-                newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
-                writeChan _dispatchHPACKWriteHeadersChan (curFh, sId, Right newHdrs)
-            OpenPushPromise parentSid newSid -> FinishedWithPushPromise $ \ppChan -> do
-                newHdrs <- decodeHeader _dispatchHPACKDynamicTable buffer
-                -- Important: We duplicate the channel here or we risk
-                -- losing DATA or HEADERS+CONTINUATION frames sent over
-                -- the main stream because even though
-                -- 'initializeStream' dupes frame channels, this
-                -- function will has no guarantee that the parent
-                -- stream and the push-promise handler that will
-                -- initiate the new stream are synchronous.
-                ppHeaders <- dupChan _dispatchHPACKWriteHeadersChan
-                writeChan _dispatchHPACKWritePushPromisesChan (parentSid, ppChan, ppHeaders, newSid, newHdrs)
-
-    go curFh _ (Left err) = FinishedWithHeaders $
-        writeChan _dispatchHPACKWriteHeadersChan (curFh, sid, (Left $ HTTP2.fromErrorCodeId err))
+            ForwardHeader sId ->
+                FinishedWithHeaders curFh sId (decodeHeader _dispatchHPACKDynamicTable buffer)
+            OpenPushPromise parentSid newSid ->
+                FinishedWithPushPromise curFh parentSid newSid (decodeHeader _dispatchHPACKDynamicTable buffer)
+    go curFh _ (Left err) =
+        FailedHeaders curFh sid (HTTP2.fromErrorCodeId err)
 
 
 newIncomingFlowControl
