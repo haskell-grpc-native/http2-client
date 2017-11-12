@@ -9,6 +9,7 @@
 --
 -- TODO: release stream states when closed
 -- TODO: unregister ping handlers
+-- TODO: unregister settings handlers
 module Network.HTTP2.Client (
     -- * Basics
       runHttp2Client
@@ -439,12 +440,10 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             return $ waitPingReply handler
 
     let _initSettings settslist = do
-            -- Need to dupChan before sending the query to avoid missing a fast
-            -- answer if the network is fast.
-            settingsFrames <- newDispatchReadChanIO dispatch
+            handler <- registerSetSettingsHandler dispatchControl
             sendSettingsFrame controlStream id settslist
             return $ do
-                ret <- waitFrame isSettingsReply settingsFrames
+                ret <- waitSetSettingsReply handler
                 modifySettings dispatchControl
                     (\(ConnectionSettings cli srv) ->
                         (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
@@ -585,7 +584,8 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
                       (lookup SettingsHeaderTableSize settsList)
                 _dispatchControlAckSettings
             | otherwise                 -> do
-                ignore "TODO: settings ack should be taken into account only after reception, we should return a waitSettingsAck in the _settings function"
+                handler <- lookupSetSettingsHandler control
+                maybe (return ()) (notifySetSettingsHandler controlFrame) handler
         (PingFrame pingMsg)
             | not . testAck . flags $ fh ->
                 _dispatchControlAckPing pingMsg
@@ -599,10 +599,6 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
 
         _                   ->
              _dispatchControlOnFallback controlFrame
-
-  where
-    ignore :: String -> IO ()
-    ignore _ = return ()
 
 -- | We currently need a specific step in the main loop for crediting streams
 -- because a client user may programmatically reset and stop listening for a

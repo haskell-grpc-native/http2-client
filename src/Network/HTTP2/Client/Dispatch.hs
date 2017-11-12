@@ -94,6 +94,17 @@ notifyPingHandler dat (PingHandler c) = writeChan c dat
 waitPingReply :: PingHandler -> IO (FrameHeader, FramePayload)
 waitPingReply (PingHandler c) = readChan c
 
+data SetSettingsHandler = SetSettingsHandler !(Chan (FrameHeader, FramePayload))
+
+newSetSettingsHandler :: IO SetSettingsHandler
+newSetSettingsHandler = SetSettingsHandler <$> newChan
+
+notifySetSettingsHandler :: (FrameHeader, FramePayload) -> SetSettingsHandler -> IO ()
+notifySetSettingsHandler dat (SetSettingsHandler c) = writeChan c dat
+
+waitSetSettingsReply :: SetSettingsHandler -> IO (FrameHeader, FramePayload)
+waitSetSettingsReply (SetSettingsHandler c) = readChan c
+
 registerPingHandler :: DispatchControl -> ByteString -> IO PingHandler
 registerPingHandler dc dat = do
     handler <- newPingHandler
@@ -105,6 +116,19 @@ lookupPingHandler :: DispatchControl -> ByteString -> IO (Maybe PingHandler)
 lookupPingHandler dc dat =
     lookup dat <$> readIORef (_dispatchControlPingHandlers dc)
 
+registerSetSettingsHandler :: DispatchControl -> IO SetSettingsHandler
+registerSetSettingsHandler dc = do
+    handler <- newSetSettingsHandler
+    atomicModifyIORef' (_dispatchControlSetSettingsHandlers dc) (\xs ->
+        (handler:xs, ()))
+    return handler
+
+lookupSetSettingsHandler :: DispatchControl -> IO (Maybe SetSettingsHandler)
+lookupSetSettingsHandler dc =
+    headMay <$> readIORef (_dispatchControlSetSettingsHandlers dc)
+  where
+    headMay []     = Nothing
+    headMay (x:_) = Just x
 
 data DispatchControl = DispatchControl {
     _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
@@ -114,6 +138,7 @@ data DispatchControl = DispatchControl {
   , _dispatchControlOnGoAway            :: !GoAwayHandler
   , _dispatchControlOnFallback          :: !FallBackFrameHandler
   , _dispatchControlPingHandlers        :: !(IORef [(ByteString, PingHandler)])
+  , _dispatchControlSetSettingsHandlers :: !(IORef [SetSettingsHandler])
   }
 
 newDispatchControlIO
@@ -130,6 +155,7 @@ newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
                     <*> pure ackSetts
                     <*> pure onGoAway
                     <*> pure onFallback
+                    <*> newIORef []
                     <*> newIORef []
   where
     hpackEncoder = do
