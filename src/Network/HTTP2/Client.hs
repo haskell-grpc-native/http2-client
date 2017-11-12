@@ -422,7 +422,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                 return $ Left $ TooMuchConcurrency roomNeeded
             else Right <$> do
                 cont <- withClientStreamId $ \sid -> do
-                    dispatchStream <- newDispatchStreamIO sid dispatch
+                    dispatchStream <- newDispatchStreamIO sid
                     initializeStream conn
                                      dispatch
                                      dispatchControl
@@ -475,7 +475,7 @@ initializeStream conn dispatch control stream getWork = do
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames)
+    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames frames)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -498,7 +498,7 @@ initializeStream conn dispatch control stream getWork = do
     let makeWaitPushPromise pushPromises = \ppHandler -> do
             (_,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
             let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
-            newStream <- newDispatchStreamIO ppSid dispatch
+            newStream <- newDispatchStreamIO ppSid
             ppCont <- initializeStream conn
                                        dispatch
                                        control
@@ -557,10 +557,15 @@ dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
   -> Dispatch
   -> IO ()
-dispatchFramesStep frame@(fh,_) (Dispatch{..}) = do
+dispatchFramesStep frame@(fh,_) d = do
+    let sid = streamId fh
     -- Remember highest streamId.
-    atomicModifyIORef' _dispatchMaxStreamId (\n -> (max n (streamId fh), ()))
-    writeChan _dispatchWriteChan frame
+    atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
+    -- Double write to the general chan (for ping & settings)
+    -- as well as to the interested streams.
+    writeChan (_dispatchWriteChan d) frame
+    chan <- fmap _streamStateStreamFramesChan <$> lookupStreamState d sid
+    maybe (return ()) (flip writeChan frame) chan
 
 dispatchControlFramesStep
   :: Chan (FrameHeader, FramePayload)

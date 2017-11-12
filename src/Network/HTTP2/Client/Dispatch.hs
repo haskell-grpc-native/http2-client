@@ -46,6 +46,7 @@ data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
   , _streamStatePushPromisesChan  :: !(Maybe PushPromisesChan)
   , _streamStateHeadersChan       :: !HeadersChan
+  , _streamStateStreamFramesChan  :: !DispatchChan
   }
 
 data Dispatch = Dispatch {
@@ -144,10 +145,10 @@ data DispatchStream = DispatchStream {
   , _dispatchStreamReadPushPromises :: Maybe PushPromisesChan
   }
 
-newDispatchStreamIO :: StreamId -> Dispatch -> IO DispatchStream
-newDispatchStreamIO sid d =
+newDispatchStreamIO :: StreamId -> IO DispatchStream
+newDispatchStreamIO sid =
     DispatchStream <$> pure sid
-                   <*> newDispatchReadChanIO d
+                   <*> newChan
                    <*> newChan
                    <*> mkPPChan
   where
