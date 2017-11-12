@@ -6,8 +6,6 @@
 -- session and interacting with a server.
 --
 -- For higher-level primitives, please refer to Network.HTTP2.Client.Helpers .
---
--- TODO: release stream states when closed
 module Network.HTTP2.Client (
     -- * Basics
       runHttp2Client
@@ -428,6 +426,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                                      dispatchControl
                                      dispatchStream
                                      getWork
+                                     Idle
                 v <- cont
                 atomicModifyIORef' conccurentStreams (\n -> (n - 1, ()))
                 pure v
@@ -461,8 +460,9 @@ initializeStream
   -> DispatchControl
   -> DispatchStream
   -> (Http2Stream -> StreamDefinition a)
+  -> StreamFSMState
   -> IO (IO a)
-initializeStream conn dispatch control stream getWork = do
+initializeStream conn dispatch control stream getWork initialState = do
     let sid = _dispatchStreamId stream
     let frameStream = makeFrameClientStream conn sid
 
@@ -473,12 +473,15 @@ initializeStream conn dispatch control stream getWork = do
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames frames)
+    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames frames initialState)
 
     -- Prepare handlers.
     let _headers headersList flags = do
             splitter <- settingsPayloadSplitter <$> readSettings control
-            sendHeaders frameStream (_dispatchControlHpackEncoder control) headersList splitter flags
+            cst <- sendHeaders frameStream (_dispatchControlHpackEncoder control) headersList splitter flags
+            when (testEndStream $ flags 0) $ do
+                closeLocalStream dispatch sid
+            return cst
     let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
@@ -490,8 +493,13 @@ initializeStream conn dispatch control stream getWork = do
                 RSTStreamFrame err -> do
                      return (fh, Left $ HTTP2.fromErrorCodeId err)
                 _                  -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
-    let _sendDataChunk  = sendDataFrame frameStream
-    let _rst            = sendResetFrame frameStream
+    let _sendDataChunk flags dat = do
+            sendDataFrame frameStream flags dat
+            when (testEndStream $ flags 0) $ do
+                closeLocalStream dispatch sid
+    let _rst = \err -> do
+            sendResetFrame frameStream err
+            closeReleaseStream dispatch sid
     let _prio           = sendPriorityFrame frameStream
     let makeWaitPushPromise pushPromises = \ppHandler -> do
             (_,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
@@ -502,6 +510,7 @@ initializeStream conn dispatch control stream getWork = do
                                        control
                                        newStream
                                        mkStreamActions
+                                       ReservedRemote
             ppCont
     let _waitPushPromise = fmap makeWaitPushPromise mPushPromises
 
@@ -550,6 +559,8 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                     let msg = (curFh, sId, Left err)
                     maybe (return ()) (flip writeChan msg) chan
             hpackLoop (dispatchHPACKFramesStep got dh)
+        whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
+            closeReleaseStream d $ streamId $ fst got
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -559,10 +570,12 @@ dispatchFramesStep frame@(fh,_) d = do
     let sid = streamId fh
     -- Remember highest streamId.
     atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
-    -- Double write to the general chan (for ping & settings)
-    -- as well as to the interested streams.
+    -- Write to the interested streams.
     chan <- fmap _streamStateStreamFramesChan <$> lookupStreamState d sid
     maybe (return ()) (flip writeChan frame) chan
+    -- Remote-close streams that match.
+    when (testEndStream $ flags fh) $ do
+        closeRemoteStream d sid
 
 dispatchControlFramesStep
   :: Chan (FrameHeader, FramePayload)

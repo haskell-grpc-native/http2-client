@@ -42,11 +42,20 @@ type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 defaultGoAwayHandler :: GoAwayHandler
 defaultGoAwayHandler = throwIO
 
+data StreamFSMState =
+    Idle
+  | ReservedRemote
+  | Open
+  | HalfClosedRemote
+  | HalfClosedLocal
+  | Closed
+
 data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
   , _streamStatePushPromisesChan  :: !(Maybe PushPromisesChan)
   , _streamStateHeadersChan       :: !HeadersChan
   , _streamStateStreamFramesChan  :: !DispatchChan
+  , _streamStateFSMState          :: !StreamFSMState
   }
 
 data Dispatch = Dispatch {
@@ -68,6 +77,33 @@ registerStream d sid st =
 lookupStreamState :: Dispatch -> StreamId -> IO (Maybe StreamState)
 lookupStreamState d sid =
     IntMap.lookup sid <$> readIORef (_dispatchCurrentStreams d)
+
+closeLocalStream :: Dispatch -> StreamId -> IO ()
+closeLocalStream d sid =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let (_,v) = IntMap.updateLookupWithKey f sid xs in (v, ())
+  where
+    f :: StreamId -> StreamState -> Maybe StreamState
+    f _ st = case _streamStateFSMState st of
+        HalfClosedRemote -> Nothing
+        Closed           -> Nothing
+        _ -> Just $ st { _streamStateFSMState = HalfClosedLocal }
+
+closeRemoteStream :: Dispatch -> StreamId -> IO ()
+closeRemoteStream d sid =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let (_,v) = IntMap.updateLookupWithKey f sid xs in (v, ())
+  where
+    f :: StreamId -> StreamState -> Maybe StreamState
+    f _ st = case _streamStateFSMState st of
+        HalfClosedLocal  -> Nothing
+        Closed           -> Nothing
+        _ -> Just $ st { _streamStateFSMState = HalfClosedRemote }
+
+closeReleaseStream :: Dispatch -> StreamId -> IO ()
+closeReleaseStream d sid =
+    atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
+      let v = (IntMap.delete sid xs) in (v, ())
 
 -- | Couples client and server settings together.
 data ConnectionSettings = ConnectionSettings {
