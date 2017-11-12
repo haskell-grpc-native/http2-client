@@ -40,7 +40,9 @@ type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 defaultGoAwayHandler :: GoAwayHandler
 defaultGoAwayHandler = throwIO
 
-type StreamState = Chan (FrameHeader, FramePayload)
+data StreamState = StreamState {
+    _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
+  }
 
 data Dispatch = Dispatch {
     _dispatchWriteChan      :: !DispatchChan

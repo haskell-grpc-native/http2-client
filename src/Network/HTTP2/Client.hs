@@ -623,8 +623,8 @@ updateWindowsStep
 updateWindowsStep d got@(fh,_) = do
     xs <- readIORef $ _dispatchCurrentStreams d
     let sid = HTTP2.streamId fh
-    let streamState = lookup sid xs
-    maybe (return ()) (flip writeChan got) streamState --TODO: refer to RFC for erroring on idle/closed streams
+    let chan = _streamStateWindowUpdatesChan <$> lookup sid xs
+    maybe (return ()) (flip writeChan got) chan --TODO: refer to RFC for erroring on idle/closed streams
 
 data HPACKLoopDecision =
     ForwardHeader !StreamId
@@ -720,7 +720,7 @@ newOutgoingFlowControl ::
 newOutgoingFlowControl dispatch control sid = do
     credit <- newIORef 0
     frames <- newChan
-    registerStream dispatch sid frames
+    registerStream dispatch sid (StreamState frames)
     let getBase = if sid == 0
                   then return HTTP2.defaultInitialWindowSize
                   else initialWindowSize . _serverSettings <$> readSettings control
