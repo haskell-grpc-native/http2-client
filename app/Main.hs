@@ -36,6 +36,9 @@ data ServerPushSwitch = PushEnabled | PushDisabled
 data Verbosity = Verbose | NonVerbose
   deriving Show
 
+data UseTLS = UseTLS | PlainText
+  deriving Show
+
 data QueryArgs = QueryArgs {
     _host                       :: !HostName
   , _port                       :: !PortNumber
@@ -60,6 +63,7 @@ data QueryArgs = QueryArgs {
   , _decoderBufsize             :: !Int
   , _downloadPrefix             :: !FilePath
   , _verboseDebug               :: !Verbosity
+  , _useTLS                     :: !UseTLS
   } deriving Show
 
 clientArgs :: Parser QueryArgs
@@ -88,6 +92,7 @@ clientArgs =
         <*> decoderBufSize
         <*> downloadPrefix
         <*> verboseDebug
+        <*> useTLS
   where
     bstrOption = fmap ByteString.pack . strOption
     milliseconds what base = fmap (*1000) $ option auto (long what <> value base)
@@ -112,6 +117,7 @@ clientArgs =
     decoderBufSize = option auto (long "hpack-decoder-buffer-size" <> value 4096)
     downloadPrefix = strOption (long "push-files-prefix" <> value ":stdout-pp")
     verboseDebug = flag NonVerbose Verbose (long "verbose")
+    useTLS = flag UseTLS PlainText (long "plain-text")
 
 main :: IO ()
 main = execParser opts >>= client
@@ -162,7 +168,12 @@ client QueryArgs{..} = do
                ]
     timePrint conf
 
-    frameConn <- newHttp2FrameConnection _host _port (Just tlsParams)
+    let tlsSetting = case _useTLS of
+            UseTLS ->
+                Just tlsParams
+            PlainText ->
+                Nothing
+    frameConn <- newHttp2FrameConnection _host _port tlsSetting
     let wrappedFrameConn = frameConn {
             _makeFrameClientStream = \sid ->
                 let frameClient = (_makeFrameClientStream frameConn) sid
