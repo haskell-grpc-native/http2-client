@@ -12,6 +12,7 @@ module Network.HTTP2.Client (
     , newHttp2Client
     , withHttp2Stream
     , headers
+    , trailers
     , sendData
     -- * Starting clients
     , Http2Client(..)
@@ -46,7 +47,7 @@ import           Control.Concurrent.Async (Async, async, race, withAsync, link)
 import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
-import           Control.Monad (forever, join, when, forM_)
+import           Control.Monad (forever, join, void, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
@@ -250,6 +251,12 @@ data Http2Stream = Http2Stream {
   -- can be useful if you intend to handle the framing yourself.
   , _waitPushPromise :: Maybe (PushPromiseHandler -> IO ())
   }
+
+-- | Sends HTTP trailers.
+--
+-- Trailers should be the last thing sent over a stream.
+trailers :: Http2Stream -> HPACK.HeaderList -> (FrameFlags -> FrameFlags) -> IO ()
+trailers stream hdrs mod = void $ _headers stream hdrs mod
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
 --

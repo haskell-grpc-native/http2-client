@@ -78,6 +78,8 @@ type StreamResponse = (HPACK.HeaderList, ByteString)
 -- setEndStream and no payload.
 upload :: ByteString
        -- ^ HTTP body.
+       -> (HTTP2.FrameFlags -> HTTP2.FrameFlags)
+       -- ^ Flag modifier for the last DATA frame sent.
        -> Http2Client
        -- ^ The client.
        -> OutgoingFlowControl
@@ -89,9 +91,9 @@ upload :: ByteString
        -> OutgoingFlowControl
        -- ^ The flow control for this stream.
        -> IO ()
-upload "" conn _ stream _ = do
-    sendData conn stream HTTP2.setEndStream ""
-upload dat conn connectionFlowControl stream streamFlowControl = do
+upload "" flagmod conn _ stream _ = do
+    sendData conn stream flagmod ""
+upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
     let wanted = ByteString.length dat
 
     gotStream <- _withdrawCredit streamFlowControl wanted
@@ -105,10 +107,11 @@ upload dat conn connectionFlowControl stream streamFlowControl = do
 
     if got == wanted
     then
-        uploadChunks HTTP2.setEndStream
+        uploadChunks flagmod
     else do
         uploadChunks id
-        upload (ByteString.drop got dat) conn connectionFlowControl stream streamFlowControl
+        upload (ByteString.drop got dat) flagmod conn connectionFlowControl stream streamFlowControl
+
 
 -- | Wait for a stream until completion.
 --
