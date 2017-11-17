@@ -587,6 +587,7 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
             hpackLoop (dispatchHPACKFramesStep got dh)
         whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
             closeReleaseStream d $ streamId $ fst got
+        finalizeFramesStep frame d
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
@@ -596,6 +597,13 @@ dispatchFramesStep (fh,_) d = do
     let sid = streamId fh
     -- Remember highest streamId.
     atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
+
+finalizeFramesStep
+  :: (FrameHeader, Either HTTP2Error FramePayload)
+  -> Dispatch
+  -> IO ()
+finalizeFramesStep (fh,_) d = do
+    let sid = streamId fh
     -- Remote-close streams that match.
     when (testEndStream $ flags fh) $ do
         closeRemoteStream d sid
