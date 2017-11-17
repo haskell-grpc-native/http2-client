@@ -52,7 +52,7 @@ data StreamFSMState =
 
 data StreamEvent =
     StreamHeadersEvent !FrameHeader !HeaderList
-  | StreamPushPromise !FrameHeader !HeaderList
+  | StreamPushPromiseEvent !FrameHeader !StreamId !HeaderList
   | StreamData !FrameHeader ByteString
   | StreamErrorEvent !FrameHeader ErrorCode
   deriving Show
@@ -60,7 +60,6 @@ data StreamEvent =
 data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
   , _streamStateEvents            :: !(Chan StreamEvent)
-  , _streamStatePushPromisesChan  :: !(Maybe PushPromisesChan)
   , _streamStateStreamFramesChan  :: !DispatchChan
   , _streamStateFSMState          :: !StreamFSMState
   }
@@ -237,7 +236,6 @@ data DispatchStream = DispatchStream {
     _dispatchStreamId               :: !StreamId
   , _dispatchStreamReadEvents       :: !(Chan StreamEvent)
   , _dispatchStreamReadStreamFrames :: !DispatchChan
-  , _dispatchStreamReadPushPromises :: Maybe PushPromisesChan -- TODO: deprecate
   }
 
 newDispatchStreamIO :: StreamId -> IO DispatchStream
@@ -245,8 +243,3 @@ newDispatchStreamIO sid =
     DispatchStream <$> pure sid
                    <*> newChan
                    <*> newChan
-                   <*> mkPPChan
-  where
-    -- assuming that client stream IDs must be odd, server streams are even
-    -- we can make a push-promise chan or not
-    mkPPChan = if odd sid then fmap Just newChan else pure Nothing

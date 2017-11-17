@@ -47,7 +47,7 @@ import           Control.Concurrent.Async (Async, async, race, withAsync, link)
 import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
-import           Control.Monad (forever, join, void, when, forM_)
+import           Control.Monad (forever, void, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
@@ -477,12 +477,11 @@ initializeStream conn dispatch control stream getWork initialState = do
 
     let events        = _dispatchStreamReadEvents stream
     let frames        = _dispatchStreamReadStreamFrames stream
-    let mPushPromises = _dispatchStreamReadPushPromises stream
 
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan events mPushPromises frames initialState)
+    registerStream dispatch sid (StreamState windowUpdatesChan events frames initialState)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -492,15 +491,17 @@ initializeStream conn dispatch control stream getWork initialState = do
                 closeLocalStream dispatch sid
             return cst
     let _waitEvent    = readChan events
-    let _waitHeaders  = do
-            ev <- _waitEvent
-            case ev of
-                StreamHeadersEvent fh hdrs ->
-                    return (fh, sid, Right hdrs)
-                StreamErrorEvent fh err ->
-                    return (fh, sid, Left err)
-                _ ->
-                    error ("error, waiting for headers but got: " ++ show ev)
+    let _waitHeaders  =
+            let loop = do
+                    ev <- _waitEvent
+                    case ev of
+                        StreamHeadersEvent fh hdrs ->
+                            return (fh, sid, Right hdrs)
+                        StreamErrorEvent fh err ->
+                            return (fh, sid, Left err)
+                        _ ->
+                            loop
+            in loop
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
@@ -519,18 +520,23 @@ initializeStream conn dispatch control stream getWork initialState = do
             sendResetFrame frameStream err
             closeReleaseStream dispatch sid
     let _prio           = sendPriorityFrame frameStream
-    let makeWaitPushPromise pushPromises = \ppHandler -> do
-            (_,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
-            let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
-            newStream <- newDispatchStreamIO ppSid
-            ppCont <- initializeStream conn
-                                       dispatch
-                                       control
-                                       newStream
-                                       mkStreamActions
-                                       ReservedRemote
-            ppCont
-    let _waitPushPromise = fmap makeWaitPushPromise mPushPromises
+    let _waitPushPromise = Just $ \ppHandler ->
+            let loop = do
+                    ev <- _waitEvent
+                    case ev of
+                        StreamPushPromiseEvent _ ppSid ppHeaders -> do
+                            let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
+                            newStream <- newDispatchStreamIO ppSid
+                            ppCont <- initializeStream conn
+                                                       dispatch
+                                                       control
+                                                       newStream
+                                                       mkStreamActions
+                                                       ReservedRemote
+                            ppCont
+                        _ ->
+                            loop
+            in loop
 
     let streamActions = getWork $ Http2Stream{..}
 
@@ -565,11 +571,11 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                     chan <- fmap _streamStateEvents <$> lookupStreamState d sId
                     let msg = StreamHeadersEvent curFh newHdrs
                     maybe (return ()) (flip writeChan msg) chan
-                hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
+                hpackLoop (FinishedWithPushPromise curFh parentSid newSid mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStatePushPromisesChan <$> lookupStreamState d parentSid
-                    let msg = (parentSid, newSid, newHdrs)
-                    maybe (return ()) (flip writeChan msg) (join chan)
+                    chan <- fmap _streamStateEvents <$> lookupStreamState d parentSid
+                    let msg = StreamPushPromiseEvent curFh newSid newHdrs
+                    maybe (return ()) (flip writeChan msg) chan
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
                 hpackLoop (FailedHeaders curFh sId err)        = do
