@@ -53,14 +53,13 @@ data StreamFSMState =
 data StreamEvent =
     StreamHeadersEvent !FrameHeader !HeaderList
   | StreamPushPromiseEvent !FrameHeader !StreamId !HeaderList
-  | StreamData !FrameHeader ByteString
+  | StreamDataEvent !FrameHeader ByteString
   | StreamErrorEvent !FrameHeader ErrorCode
   deriving Show
 
 data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
   , _streamStateEvents            :: !(Chan StreamEvent)
-  , _streamStateStreamFramesChan  :: !DispatchChan
   , _streamStateFSMState          :: !StreamFSMState
   }
 
@@ -233,13 +232,11 @@ newDispatchHPACKIO decoderBufSize =
         decoderBufSize
 
 data DispatchStream = DispatchStream {
-    _dispatchStreamId               :: !StreamId
-  , _dispatchStreamReadEvents       :: !(Chan StreamEvent)
-  , _dispatchStreamReadStreamFrames :: !DispatchChan
+    _dispatchStreamId         :: !StreamId
+  , _dispatchStreamReadEvents :: !(Chan StreamEvent)
   }
 
 newDispatchStreamIO :: StreamId -> IO DispatchStream
 newDispatchStreamIO sid =
     DispatchStream <$> pure sid
-                   <*> newChan
                    <*> newChan
