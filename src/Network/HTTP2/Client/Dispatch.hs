@@ -50,10 +50,17 @@ data StreamFSMState =
   | HalfClosedLocal
   | Closed
 
+data StreamEvent =
+    StreamHeadersEvent !FrameHeader !HeaderList
+  | StreamPushPromise !FrameHeader !HeaderList
+  | StreamData !FrameHeader ByteString
+  | StreamErrorEvent !FrameHeader ErrorCode
+  deriving Show
+
 data StreamState = StreamState {
     _streamStateWindowUpdatesChan :: !(Chan (FrameHeader, FramePayload))
+  , _streamStateEvents            :: !(Chan StreamEvent)
   , _streamStatePushPromisesChan  :: !(Maybe PushPromisesChan)
-  , _streamStateHeadersChan       :: !HeadersChan
   , _streamStateStreamFramesChan  :: !DispatchChan
   , _streamStateFSMState          :: !StreamFSMState
   }
@@ -227,10 +234,10 @@ newDispatchHPACKIO decoderBufSize =
         decoderBufSize
 
 data DispatchStream = DispatchStream {
-    _dispatchStreamId :: !StreamId
+    _dispatchStreamId               :: !StreamId
+  , _dispatchStreamReadEvents       :: !(Chan StreamEvent)
   , _dispatchStreamReadStreamFrames :: !DispatchChan
-  , _dispatchStreamReadHeaders      :: !HeadersChan
-  , _dispatchStreamReadPushPromises :: Maybe PushPromisesChan
+  , _dispatchStreamReadPushPromises :: Maybe PushPromisesChan -- TODO: deprecate
   }
 
 newDispatchStreamIO :: StreamId -> IO DispatchStream

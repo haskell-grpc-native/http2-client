@@ -243,6 +243,8 @@ data Http2Stream = Http2Stream {
   , _waitData     :: IO (FrameHeader, Either ErrorCode ByteString)
   -- ^ Waits for a DATA frame chunk. A user should testEndStream on the frame
   -- header to know when the server is done with the stream.
+  , _waitEvent    :: IO StreamEvent
+  -- ^ Waits for the next event on the stream.
   , _sendDataChunk     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
   -- ^ Sends a DATA frame chunk. You can use send empty frames with only
   -- headers modifiers to close streams. This function is oblivious to framing
@@ -256,7 +258,7 @@ data Http2Stream = Http2Stream {
 --
 -- Trailers should be the last thing sent over a stream.
 trailers :: Http2Stream -> HPACK.HeaderList -> (FrameFlags -> FrameFlags) -> IO ()
-trailers stream hdrs mod = void $ _headers stream hdrs mod
+trailers stream hdrs flagmod = void $ _headers stream hdrs flagmod
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
 --
@@ -473,14 +475,14 @@ initializeStream conn dispatch control stream getWork initialState = do
     let sid = _dispatchStreamId stream
     let frameStream = makeFrameClientStream conn sid
 
+    let events        = _dispatchStreamReadEvents stream
     let frames        = _dispatchStreamReadStreamFrames stream
-    let headersFrames = _dispatchStreamReadHeaders stream
     let mPushPromises = _dispatchStreamReadPushPromises stream
 
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames frames initialState)
+    registerStream dispatch sid (StreamState windowUpdatesChan events mPushPromises frames initialState)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -489,7 +491,16 @@ initializeStream conn dispatch control stream getWork initialState = do
             when (testEndStream $ flags 0) $ do
                 closeLocalStream dispatch sid
             return cst
-    let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
+    let _waitEvent    = readChan events
+    let _waitHeaders  = do
+            ev <- _waitEvent
+            case ev of
+                StreamHeadersEvent fh hdrs ->
+                    return (fh, sid, Right hdrs)
+                StreamErrorEvent fh err ->
+                    return (fh, sid, Left err)
+                _ ->
+                    error ("error, waiting for headers but got: " ++ show ev)
     let _waitData     = do
             (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
             case fp of
@@ -551,8 +562,8 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
         whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
             let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
-                    let msg = (curFh, sId, Right newHdrs)
+                    chan <- fmap _streamStateEvents <$> lookupStreamState d sId
+                    let msg = StreamHeadersEvent curFh newHdrs
                     maybe (return ()) (flip writeChan msg) chan
                 hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
@@ -562,8 +573,8 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
                 hpackLoop (FailedHeaders curFh sId err)        = do
-                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
-                    let msg = (curFh, sId, Left err)
+                    chan <- fmap _streamStateEvents <$> lookupStreamState d sId
+                    let msg = StreamErrorEvent curFh err
                     maybe (return ()) (flip writeChan msg) chan
             hpackLoop (dispatchHPACKFramesStep got dh)
         whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
