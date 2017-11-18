@@ -174,7 +174,7 @@ client QueryArgs{..} = do
     let ppHandler n idx _ stream ppHdrs streamFlowControl _ = void $ forkIO $ do
             let pushpath = fromMaybe "unspecified-path" (lookup ":path" ppHdrs)
             timePrint ("push stream started" :: String, pushpath)
-            ret <- fromStreamResult <$> waitStream stream streamFlowControl
+            ret <- fromStreamResult <$> waitStream stream streamFlowControl (ppHandler n idx)
             either (\e -> timePrint e) (dump PushPromiseFile pushpath n idx _downloadPrefix) ret
             timePrint ("push stream ended" :: String)
 
@@ -235,8 +235,7 @@ client QueryArgs{..} = do
       let go 0 idx = timePrint $ "done worker: " <> show idx
           go n idx = do
               _ <- (withHttp2Stream conn $ \stream ->
-                      let initStream = do
-                              _ <- async $ onPushPromise stream (ppHandler n idx)
+                      let initStream =
                               headers stream headersPairs headersFlags
                           handler streamINFlowControl streamOUTFlowControl = do
                               timePrint $ "stream started " <> show (idx, n)
@@ -245,7 +244,7 @@ client QueryArgs{..} = do
                                                    (_outgoingFlowControl conn)
                                                    stream
                                                    streamOUTFlowControl
-                              ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
+                              ret <-  fromStreamResult <$> waitStream stream streamINFlowControl (ppHandler n idx)
                               either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
                               timePrint $ "stream ended " <> show (idx, n)
                       in StreamDefinition initStream handler)

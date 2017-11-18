@@ -12,7 +12,6 @@ module Network.HTTP2.Client.Helpers (
     upload
   , waitStream
   , fromStreamResult 
-  , onPushPromise
   , StreamResult
   , StreamResponse
   -- * Diagnostics
@@ -112,26 +111,42 @@ upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
         uploadChunks id
         upload (ByteString.drop got dat) flagmod conn connectionFlowControl stream streamFlowControl
 
-
 -- | Wait for a stream until completion.
 --
 -- This function is fine if you don't want to consume results in chunks.  See
 -- 'fromStreamResult' to collect the complicated 'StreamResult' into a simpler
 -- 'StramResponse'.
-waitStream :: Http2Stream -> IncomingFlowControl -> IO StreamResult
-waitStream stream streamFlowControl = do
-    (_,_,hdrs) <- _waitHeaders stream
-    dataFrames <- moredata []
-    return (hdrs, reverse dataFrames)
+waitStream :: Http2Stream
+           -> IncomingFlowControl
+           -> PushPromiseHandler
+           -> IO StreamResult
+waitStream stream streamFlowControl ppHandler = do
+    ev <- _waitEvent stream
+    case ev of
+        StreamHeadersEvent _ hdrs ->
+            (,) <$> pure (Right hdrs) <*> (reverse <$> waitDataFrames [])
+        StreamPushPromiseEvent _ ppSid ppHdrs -> do
+            _handlePushPromise stream ppSid ppHdrs ppHandler
+            waitStream stream streamFlowControl ppHandler
+        _ ->
+            error $ "expecting StreamHeadersEvent but got " ++ show ev
   where
-    moredata xs = do
-        (fh, x) <- _waitData stream
-        if HTTP2.testEndStream (HTTP2.flags fh)
-        then
-            return (x:xs)
-        else do
-            _ <- _updateWindow $ streamFlowControl
-            moredata (x:xs)
+    waitDataFrames xs = do
+        ev <- _waitEvent stream
+        case ev of
+            StreamDataEvent fh x
+                | HTTP2.testEndStream (HTTP2.flags fh) ->
+                    return ((Right x):xs)
+                | otherwise                            -> do
+                    _ <- _consumeCredit streamFlowControl (HTTP2.payloadLength fh)
+                    _addCredit streamFlowControl (HTTP2.payloadLength fh)
+                    _ <- _updateWindow $ streamFlowControl
+                    waitDataFrames ((Right x):xs)
+            StreamPushPromiseEvent _ ppSid ppHdrs -> do
+                _handlePushPromise stream ppSid ppHdrs ppHandler
+                waitDataFrames xs
+            _ ->
+                error $ "expecting StreamDataEvent but got " ++ show ev
 
 -- | Converts a StreamResult to a StramResponse, stopping at the first error
 -- using the `Either HTTP2.ErrorCode` monad.
@@ -140,14 +155,3 @@ fromStreamResult (headersE, chunksE) = do
     hdrs <- headersE
     chunks <- sequence chunksE
     return (hdrs, mconcat chunks)
-
--- | Sequentially wait for every push-promise with a handler.
---
--- This function runs forever and you should wrap it with 'withAsync'.
--- This function immediately returns if run on a stream that has no PushPromise
--- handler (i.e., server-streams when already waiting for push promises).
-onPushPromise :: Http2Stream -> PushPromiseHandler -> IO ()
-onPushPromise stream handler =
-    case _waitPushPromise stream of
-        Nothing -> pure ()
-        Just w  -> forever $ w handler

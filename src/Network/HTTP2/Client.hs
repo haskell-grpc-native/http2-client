@@ -38,6 +38,7 @@ module Network.HTTP2.Client (
     , Http2ClientAsyncs(..)
     , _gtfo
     -- * Convenience re-exports
+    , StreamEvent(..)
     , module Network.HTTP2.Client.FrameConnection
     , module Network.Socket
     , module Network.TLS
@@ -236,13 +237,6 @@ data Http2Stream = Http2Stream {
   -- ^ Changes the PRIORITY of this stream.
   , _rst          :: ErrorCodeId -> IO ()
   -- ^ Resets this stream with a RST frame. You should not use this stream past this call.
-  , _waitHeaders  :: IO (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -- ^ Waits for HTTP headers from the server. This function also passes the
-  -- last frame header of the PUSH-PROMISE, HEADERS, or CONTINUATION sequence of frames.
-  -- Waiting more than once per stream will hang as headers are sent only one time.
-  , _waitData     :: IO (FrameHeader, Either ErrorCode ByteString)
-  -- ^ Waits for a DATA frame chunk. A user should testEndStream on the frame
-  -- header to know when the server is done with the stream.
   , _waitEvent    :: IO StreamEvent
   -- ^ Waits for the next event on the stream.
   , _sendDataChunk     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
@@ -251,7 +245,7 @@ data Http2Stream = Http2Stream {
   -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
   -- to chunk and send naively according to server\'s preferences. This function
   -- can be useful if you intend to handle the framing yourself.
-  , _waitPushPromise :: Maybe (PushPromiseHandler -> IO ())
+  , _handlePushPromise :: StreamId -> HeaderList -> PushPromiseHandler -> IO ()
   }
 
 -- | Sends HTTP trailers.
@@ -490,30 +484,6 @@ initializeStream conn dispatch control stream getWork initialState = do
                 closeLocalStream dispatch sid
             return cst
     let _waitEvent    = readChan events
-    let _waitHeaders  =
-            let loop = do
-                    ev <- _waitEvent
-                    case ev of
-                        StreamHeadersEvent fh hdrs ->
-                            return (fh, sid, Right hdrs)
-                        StreamErrorEvent fh err ->
-                            return (fh, sid, Left err)
-                        _ ->
-                            loop
-            in loop
-    let _waitData     =
-            let loop = do
-                    ev <- _waitEvent
-                    case ev of
-                        StreamDataEvent fh dat -> do
-                            _ <- _consumeCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                            _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                            return (fh, Right dat)
-                        StreamErrorEvent fh err ->
-                            return (fh, Left err)
-                        _ ->
-                            loop
-            in loop
     let _sendDataChunk flags dat = do
             sendDataFrame frameStream flags dat
             when (testEndStream $ flags 0) $ do
@@ -522,23 +492,16 @@ initializeStream conn dispatch control stream getWork initialState = do
             sendResetFrame frameStream err
             closeReleaseStream dispatch sid
     let _prio           = sendPriorityFrame frameStream
-    let _waitPushPromise = Just $ \ppHandler ->
-            let loop = do
-                    ev <- _waitEvent
-                    case ev of
-                        StreamPushPromiseEvent _ ppSid ppHeaders -> do
-                            let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
-                            newStream <- newDispatchStreamIO ppSid
-                            ppCont <- initializeStream conn
-                                                       dispatch
-                                                       control
-                                                       newStream
-                                                       mkStreamActions
-                                                       ReservedRemote
-                            ppCont
-                        _ ->
-                            loop
-            in loop
+    let _handlePushPromise ppSid ppHeaders ppHandler = do
+            let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
+            newStream <- newDispatchStreamIO ppSid
+            ppCont <- initializeStream conn
+                                       dispatch
+                                       control
+                                       newStream
+                                       mkStreamActions
+                                       ReservedRemote
+            ppCont
 
     let streamActions = getWork $ Http2Stream{..}
 
