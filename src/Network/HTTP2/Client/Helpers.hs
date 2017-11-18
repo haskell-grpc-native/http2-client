@@ -57,10 +57,10 @@ ping conn timeout msg = do
 -- | Result containing the unpacked headers and all frames received in on a
 -- stream. See 'StreamResponse' and 'fromStreamResult' to get a higher-level
 -- utility.
-type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString])
+type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString], Maybe HPACK.HeaderList)
 
 -- | An HTTP2 response, once fully received, is made of headers and a payload.
-type StreamResponse = (HPACK.HeaderList, ByteString)
+type StreamResponse = (HPACK.HeaderList, ByteString, Maybe HPACK.HeaderList)
 
 -- | Uploads a whole HTTP body at a time.
 --
@@ -123,8 +123,9 @@ waitStream :: Http2Stream
 waitStream stream streamFlowControl ppHandler = do
     ev <- _waitEvent stream
     case ev of
-        StreamHeadersEvent _ hdrs ->
-            (,) <$> pure (Right hdrs) <*> (reverse <$> waitDataFrames [])
+        StreamHeadersEvent _ hdrs -> do
+            (dfrms,trls) <- waitDataFrames []
+            return (Right hdrs, reverse dfrms, trls)
         StreamPushPromiseEvent _ ppSid ppHdrs -> do
             _handlePushPromise stream ppSid ppHdrs ppHandler
             waitStream stream streamFlowControl ppHandler
@@ -136,7 +137,7 @@ waitStream stream streamFlowControl ppHandler = do
         case ev of
             StreamDataEvent fh x
                 | HTTP2.testEndStream (HTTP2.flags fh) ->
-                    return ((Right x):xs)
+                    return ((Right x):xs, Nothing)
                 | otherwise                            -> do
                     _ <- _consumeCredit streamFlowControl (HTTP2.payloadLength fh)
                     _addCredit streamFlowControl (HTTP2.payloadLength fh)
@@ -145,13 +146,15 @@ waitStream stream streamFlowControl ppHandler = do
             StreamPushPromiseEvent _ ppSid ppHdrs -> do
                 _handlePushPromise stream ppSid ppHdrs ppHandler
                 waitDataFrames xs
+            StreamHeadersEvent _ hdrs ->
+                return (xs, Just hdrs)
             _ ->
                 error $ "expecting StreamDataEvent but got " ++ show ev
 
 -- | Converts a StreamResult to a StramResponse, stopping at the first error
 -- using the `Either HTTP2.ErrorCode` monad.
 fromStreamResult :: StreamResult -> Either HTTP2.ErrorCode StreamResponse
-fromStreamResult (headersE, chunksE) = do
+fromStreamResult (headersE, chunksE, trls) = do
     hdrs <- headersE
     chunks <- sequence chunksE
-    return (hdrs, mconcat chunks)
+    return (hdrs, mconcat chunks, trls)

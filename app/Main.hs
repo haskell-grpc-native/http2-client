@@ -273,22 +273,28 @@ client QueryArgs{..} = do
 data DumpType = MainFile | PushPromiseFile
 
 dump :: DumpType -> Path -> Int -> Int -> FilePath -> StreamResponse -> IO ()
-dump MainFile _ _ _ ":none" (hdrs, _) = do
+dump MainFile _ _ _ ":none" (hdrs, _, trls) = do
     timePrint hdrs
-dump MainFile _ _ _ ":stdout" (hdrs, body) = do
-    timePrint hdrs
-    ByteString.putStrLn body
-dump PushPromiseFile _ _ _ ":stdout" (hdrs, _) = do
-    timePrint hdrs
-dump MainFile _ _ _ ":stdout-pp" (hdrs, body) = do
+    timePrint trls
+dump MainFile _ _ _ ":stdout" (hdrs, body, trls) = do
     timePrint hdrs
     ByteString.putStrLn body
-dump PushPromiseFile _ _ _ ":stdout-pp" (hdrs, body) = do
+    timePrint trls
+dump PushPromiseFile _ _ _ ":stdout" (hdrs, _, trls) = do
+    timePrint hdrs
+    timePrint trls
+dump MainFile _ _ _ ":stdout-pp" (hdrs, body, trls) = do
     timePrint hdrs
     ByteString.putStrLn body
-dump _ querystring nquery nthread prefix (hdrs, body) = do
+    timePrint trls
+dump PushPromiseFile _ _ _ ":stdout-pp" (hdrs, body, trls) = do
+    timePrint hdrs
+    ByteString.putStrLn body
+    timePrint trls
+dump _ querystring nquery nthread prefix (hdrs, body, trls) = do
     timePrint hdrs
     ByteString.writeFile filepath body
+    timePrint trls
   where
     filepath = mconcat [ prefix
                        , "/" 
