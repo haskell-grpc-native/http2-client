@@ -530,7 +530,7 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
             creditDataFramesStep d inFlowControl got
         whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
             updateWindowsStep d got
-        whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
+        whenFrame (hasTypeId [FramePushPromise, FrameHeaders]) frame $ \got -> do
             let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
                     chan <- fmap _streamStateEvents <$> lookupStreamState d sId
@@ -549,8 +549,23 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
                     maybe (return ()) (flip writeChan msg) chan
             hpackLoop (dispatchHPACKFramesStep got dh)
         whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
-            closeReleaseStream d $ streamId $ fst got
+            handleRSTStep d got
         finalizeFramesStep frame d
+
+handleRSTStep
+  :: Dispatch
+  -> (FrameHeader, FramePayload)
+  -> IO ()
+handleRSTStep d (fh, payload) = do
+    let sid = streamId fh
+    case payload of
+        (RSTStreamFrame err) -> do
+            chan <- fmap _streamStateEvents <$> lookupStreamState d sid
+            let msg = StreamErrorEvent fh (HTTP2.fromErrorCodeId err)
+            maybe (return ()) (flip writeChan msg) chan
+            closeReleaseStream d sid
+        _ ->
+            error $ "expecting RSTFrame but got " ++ show payload
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
