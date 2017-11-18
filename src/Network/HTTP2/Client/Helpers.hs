@@ -27,7 +27,6 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Async (race)
-import           Control.Monad (forever)
 
 import Network.HTTP2.Client
 
