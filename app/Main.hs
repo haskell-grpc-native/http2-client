@@ -45,6 +45,7 @@ data QueryArgs = QueryArgs {
   , _verb                       :: !Verb
   , _path                       :: !Path
   , _extraHeaders               :: ![(ByteString, ByteString)]
+  , _extraTrailers              :: ![(ByteString, ByteString)]
   , _postData                   :: !(Maybe PostData)
   , _interPingDelay             :: !Int
   , _pingTimeout                :: !Int
@@ -74,6 +75,7 @@ clientArgs =
         <*> verb
         <*> path
         <*> extraHeaders
+        <*> extraTrailers
         <*> postData
         <*> milliseconds "inter-ping-delay-ms" 0
         <*> milliseconds "ping-timeout-ms" 5000
@@ -103,6 +105,7 @@ clientArgs =
     port = option auto (long "port" <> value 443)
     verb = bstrOption (long "verb" <> value "GET")
     extraHeaders = many (fmap keyval $ bstrOption (short 'H'))
+    extraTrailers = many (fmap keyval $ bstrOption (short 'T'))
     postData = optional (fmap postDataForString (strOption (short 'd')))
     concurrency = option auto (long "max-concurrency" <> value 100)
     allowPush = flag PushEnabled PushDisabled (long "disable-server-push")
@@ -137,25 +140,41 @@ client QueryArgs{..} = do
     --
     -- Note that this implementation reads the body from files and into memory
     -- (better for testing concurrency, worse for large uploads).
-    (headersFlags, dataPostFunction) <- case _postData of
-        (Just (PostBytestring dataPayload)) ->
-            return $ (id, upload dataPayload)
-        (Just (PostFileContent filepath))   -> do
+    (headersFlags, dataPostFunction) <- case (_extraTrailers, _postData) of
+        ([], (Just (PostBytestring dataPayload))) ->
+            return $ (id, upload dataPayload HTTP2.setEndStream)
+        ([], (Just (PostFileContent filepath)))   -> do
             dataPayload <- ByteString.readFile filepath
-            return $ (id, upload dataPayload)
-        Nothing ->
+            return $ (id, upload dataPayload HTTP2.setEndStream)
+        ([], Nothing) ->
             return $ (HTTP2.setEndStream, \_ _ _ _ -> return ())
+        (_, (Just (PostBytestring dataPayload))) ->
+            return $ (id, (\c ofc s sofc -> do
+                upload dataPayload id c ofc s sofc
+                trailers s _extraTrailers HTTP2.setEndStream
+                ))
+        (_, (Just (PostFileContent filepath)))   -> do
+            dataPayload <- ByteString.readFile filepath
+            return $ (id, (\c ofc s sofc -> do
+                upload dataPayload id c ofc s sofc
+                trailers s _extraTrailers HTTP2.setEndStream
+                ))
+        (_, Nothing) ->
+            return $ (id, (\_ _ s _ -> do
+                trailers s _extraTrailers HTTP2.setEndStream
+                ))
 
     let headersPairs    = [ (":method", _verb)
                           , (":scheme", "https")
                           , (":path", _path)
                           , (":authority", ByteString.pack _host)
-                          ] <> _extraHeaders
+                          ] <> _extraHeaders <> [("Trailer", ByteString.unwords $ fmap fst _extraTrailers)]
+
 
     let ppHandler n idx _ stream ppHdrs streamFlowControl _ = void $ forkIO $ do
             let pushpath = fromMaybe "unspecified-path" (lookup ":path" ppHdrs)
             timePrint ("push stream started" :: String, pushpath)
-            ret <- fromStreamResult <$> waitStream stream streamFlowControl
+            ret <- fromStreamResult <$> waitStream stream streamFlowControl (ppHandler n idx)
             either (\e -> timePrint e) (dump PushPromiseFile pushpath n idx _downloadPrefix) ret
             timePrint ("push stream ended" :: String)
 
@@ -216,16 +235,16 @@ client QueryArgs{..} = do
       let go 0 idx = timePrint $ "done worker: " <> show idx
           go n idx = do
               _ <- (withHttp2Stream conn $ \stream ->
-                      let initStream = do
-                              _ <- async $ onPushPromise stream (ppHandler n idx)
+                      let initStream =
                               headers stream headersPairs headersFlags
                           handler streamINFlowControl streamOUTFlowControl = do
                               timePrint $ "stream started " <> show (idx, n)
-                              _ <- async $ dataPostFunction conn
-                                                            (_outgoingFlowControl conn)
-                                                            stream
-                                                            streamOUTFlowControl
-                              ret <-  fromStreamResult <$> waitStream stream streamINFlowControl
+                              _ <- async $ do
+                                  dataPostFunction conn
+                                                   (_outgoingFlowControl conn)
+                                                   stream
+                                                   streamOUTFlowControl
+                              ret <-  fromStreamResult <$> waitStream stream streamINFlowControl (ppHandler n idx)
                               either (\e -> timePrint e) (dump MainFile _path n idx _downloadPrefix) ret
                               timePrint $ "stream ended " <> show (idx, n)
                       in StreamDefinition initStream handler)
@@ -254,22 +273,28 @@ client QueryArgs{..} = do
 data DumpType = MainFile | PushPromiseFile
 
 dump :: DumpType -> Path -> Int -> Int -> FilePath -> StreamResponse -> IO ()
-dump MainFile _ _ _ ":none" (hdrs, _) = do
+dump MainFile _ _ _ ":none" (hdrs, _, trls) = do
     timePrint hdrs
-dump MainFile _ _ _ ":stdout" (hdrs, body) = do
-    timePrint hdrs
-    ByteString.putStrLn body
-dump PushPromiseFile _ _ _ ":stdout" (hdrs, _) = do
-    timePrint hdrs
-dump MainFile _ _ _ ":stdout-pp" (hdrs, body) = do
+    timePrint trls
+dump MainFile _ _ _ ":stdout" (hdrs, body, trls) = do
     timePrint hdrs
     ByteString.putStrLn body
-dump PushPromiseFile _ _ _ ":stdout-pp" (hdrs, body) = do
+    timePrint trls
+dump PushPromiseFile _ _ _ ":stdout" (hdrs, _, trls) = do
+    timePrint hdrs
+    timePrint trls
+dump MainFile _ _ _ ":stdout-pp" (hdrs, body, trls) = do
     timePrint hdrs
     ByteString.putStrLn body
-dump _ querystring nquery nthread prefix (hdrs, body) = do
+    timePrint trls
+dump PushPromiseFile _ _ _ ":stdout-pp" (hdrs, body, trls) = do
+    timePrint hdrs
+    ByteString.putStrLn body
+    timePrint trls
+dump _ querystring nquery nthread prefix (hdrs, body, trls) = do
     timePrint hdrs
     ByteString.writeFile filepath body
+    timePrint trls
   where
     filepath = mconcat [ prefix
                        , "/" 

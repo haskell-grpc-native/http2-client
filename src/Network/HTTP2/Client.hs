@@ -12,6 +12,7 @@ module Network.HTTP2.Client (
     , newHttp2Client
     , withHttp2Stream
     , headers
+    , trailers
     , sendData
     -- * Starting clients
     , Http2Client(..)
@@ -37,6 +38,7 @@ module Network.HTTP2.Client (
     , Http2ClientAsyncs(..)
     , _gtfo
     -- * Convenience re-exports
+    , StreamEvent(..)
     , module Network.HTTP2.Client.FrameConnection
     , module Network.Socket
     , module Network.TLS
@@ -46,7 +48,7 @@ import           Control.Concurrent.Async (Async, async, race, withAsync, link)
 import           Control.Exception (bracket, throwIO, SomeException, catch)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Concurrent (threadDelay)
-import           Control.Monad (forever, join, when, forM_)
+import           Control.Monad (forever, void, when, forM_)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
@@ -235,21 +237,22 @@ data Http2Stream = Http2Stream {
   -- ^ Changes the PRIORITY of this stream.
   , _rst          :: ErrorCodeId -> IO ()
   -- ^ Resets this stream with a RST frame. You should not use this stream past this call.
-  , _waitHeaders  :: IO (FrameHeader, StreamId, Either ErrorCode HeaderList)
-  -- ^ Waits for HTTP headers from the server. This function also passes the
-  -- last frame header of the PUSH-PROMISE, HEADERS, or CONTINUATION sequence of frames.
-  -- Waiting more than once per stream will hang as headers are sent only one time.
-  , _waitData     :: IO (FrameHeader, Either ErrorCode ByteString)
-  -- ^ Waits for a DATA frame chunk. A user should testEndStream on the frame
-  -- header to know when the server is done with the stream.
+  , _waitEvent    :: IO StreamEvent
+  -- ^ Waits for the next event on the stream.
   , _sendDataChunk     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
   -- ^ Sends a DATA frame chunk. You can use send empty frames with only
   -- headers modifiers to close streams. This function is oblivious to framing
   -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
   -- to chunk and send naively according to server\'s preferences. This function
   -- can be useful if you intend to handle the framing yourself.
-  , _waitPushPromise :: Maybe (PushPromiseHandler -> IO ())
+  , _handlePushPromise :: StreamId -> HeaderList -> PushPromiseHandler -> IO ()
   }
+
+-- | Sends HTTP trailers.
+--
+-- Trailers should be the last thing sent over a stream.
+trailers :: Http2Stream -> HPACK.HeaderList -> (FrameFlags -> FrameFlags) -> IO ()
+trailers stream hdrs flagmod = void $ _headers stream hdrs flagmod
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
 --
@@ -466,14 +469,12 @@ initializeStream conn dispatch control stream getWork initialState = do
     let sid = _dispatchStreamId stream
     let frameStream = makeFrameClientStream conn sid
 
-    let frames        = _dispatchStreamReadStreamFrames stream
-    let headersFrames = _dispatchStreamReadHeaders stream
-    let mPushPromises = _dispatchStreamReadPushPromises stream
+    let events        = _dispatchStreamReadEvents stream
 
     -- Builds a flow-control context.
     incomingStreamFlowControl <- newIncomingFlowControl control frameStream
     (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan mPushPromises headersFrames frames initialState)
+    registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -482,17 +483,7 @@ initializeStream conn dispatch control stream getWork initialState = do
             when (testEndStream $ flags 0) $ do
                 closeLocalStream dispatch sid
             return cst
-    let _waitHeaders  = waitHeadersWithStreamId sid headersFrames
-    let _waitData     = do
-            (fh, fp) <- waitFrameWithTypeIdForStreamId sid [FrameRSTStream, FrameData] frames
-            case fp of
-                DataFrame dat -> do
-                     _ <- _consumeCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     _addCredit incomingStreamFlowControl (HTTP2.payloadLength fh)
-                     return (fh, Right dat)
-                RSTStreamFrame err -> do
-                     return (fh, Left $ HTTP2.fromErrorCodeId err)
-                _                  -> error "waitFrameWithTypeIdForStreamId returned an unknown frame"
+    let _waitEvent    = readChan events
     let _sendDataChunk flags dat = do
             sendDataFrame frameStream flags dat
             when (testEndStream $ flags 0) $ do
@@ -501,8 +492,7 @@ initializeStream conn dispatch control stream getWork initialState = do
             sendResetFrame frameStream err
             closeReleaseStream dispatch sid
     let _prio           = sendPriorityFrame frameStream
-    let makeWaitPushPromise pushPromises = \ppHandler -> do
-            (_,ppSid,ppHeaders) <- waitPushPromiseWithParentStreamId sid pushPromises
+    let _handlePushPromise ppSid ppHeaders ppHandler = do
             let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
             newStream <- newDispatchStreamIO ppSid
             ppCont <- initializeStream conn
@@ -512,7 +502,6 @@ initializeStream conn dispatch control stream getWork initialState = do
                                        mkStreamActions
                                        ReservedRemote
             ppCont
-    let _waitPushPromise = fmap makeWaitPushPromise mPushPromises
 
     let streamActions = getWork $ Http2Stream{..}
 
@@ -538,41 +527,61 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
         whenFrame (hasStreamId 0) frame $ \got ->
             dispatchControlFramesStep windowUpdatesChan got dc
         whenFrame (hasTypeId [FrameData]) frame $ \got ->
-            creditDataFramesStep inFlowControl got
+            creditDataFramesStep d inFlowControl got
         whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
             updateWindowsStep d got
-        whenFrame (hasTypeId [FrameRSTStream, FramePushPromise, FrameHeaders]) frame $ \got -> do
+        whenFrame (hasTypeId [FramePushPromise, FrameHeaders]) frame $ \got -> do
             let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
-                    let msg = (curFh, sId, Right newHdrs)
+                    chan <- fmap _streamStateEvents <$> lookupStreamState d sId
+                    let msg = StreamHeadersEvent curFh newHdrs
                     maybe (return ()) (flip writeChan msg) chan
-                hpackLoop (FinishedWithPushPromise _ parentSid newSid mkNewHdrs) = do
+                hpackLoop (FinishedWithPushPromise curFh parentSid newSid mkNewHdrs) = do
                     newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStatePushPromisesChan <$> lookupStreamState d parentSid
-                    let msg = (parentSid, newSid, newHdrs)
-                    maybe (return ()) (flip writeChan msg) (join chan)
+                    chan <- fmap _streamStateEvents <$> lookupStreamState d parentSid
+                    let msg = StreamPushPromiseEvent curFh newSid newHdrs
+                    maybe (return ()) (flip writeChan msg) chan
                 hpackLoop (WaitContinuation act)        =
                     getNextFrame >>= act >>= hpackLoop
                 hpackLoop (FailedHeaders curFh sId err)        = do
-                    chan <- fmap _streamStateHeadersChan <$> lookupStreamState d sId
-                    let msg = (curFh, sId, Left err)
+                    chan <- fmap _streamStateEvents <$> lookupStreamState d sId
+                    let msg = StreamErrorEvent curFh err
                     maybe (return ()) (flip writeChan msg) chan
             hpackLoop (dispatchHPACKFramesStep got dh)
         whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
-            closeReleaseStream d $ streamId $ fst got
+            handleRSTStep d got
+        finalizeFramesStep frame d
+
+handleRSTStep
+  :: Dispatch
+  -> (FrameHeader, FramePayload)
+  -> IO ()
+handleRSTStep d (fh, payload) = do
+    let sid = streamId fh
+    case payload of
+        (RSTStreamFrame err) -> do
+            chan <- fmap _streamStateEvents <$> lookupStreamState d sid
+            let msg = StreamErrorEvent fh (HTTP2.fromErrorCodeId err)
+            maybe (return ()) (flip writeChan msg) chan
+            closeReleaseStream d sid
+        _ ->
+            error $ "expecting RSTFrame but got " ++ show payload
 
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
   -> Dispatch
   -> IO ()
-dispatchFramesStep frame@(fh,_) d = do
+dispatchFramesStep (fh,_) d = do
     let sid = streamId fh
     -- Remember highest streamId.
     atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
-    -- Write to the interested streams.
-    chan <- fmap _streamStateStreamFramesChan <$> lookupStreamState d sid
-    maybe (return ()) (flip writeChan frame) chan
+
+finalizeFramesStep
+  :: (FrameHeader, Either HTTP2Error FramePayload)
+  -> Dispatch
+  -> IO ()
+finalizeFramesStep (fh,_) d = do
+    let sid = streamId fh
     -- Remote-close streams that match.
     when (testEndStream $ flags fh) $ do
         closeRemoteStream d sid
@@ -617,14 +626,24 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
 -- TODO: modify the '_rst' function to wait and credit all the remaining data
 -- that could have been sent in flight
 creditDataFramesStep
-  :: IncomingFlowControl
+  :: Dispatch
+  -> IncomingFlowControl
   -> (FrameHeader, FramePayload)
   -> IO ()
-creditDataFramesStep flowControl (fh,_) = do
+creditDataFramesStep d flowControl (fh,payload) = do
     -- TODO: error if detect over-run. Current implementation credits
     -- everything back. Hence, over-run should never happen.
     _ <- _consumeCredit flowControl (HTTP2.payloadLength fh)
     _addCredit flowControl (HTTP2.payloadLength fh)
+
+    -- Write to the interested streams.
+    let sid = streamId fh
+    case payload of
+        (DataFrame dat) -> do
+            chan <- fmap _streamStateEvents <$> lookupStreamState d sid
+            maybe (return ()) (flip writeChan $ StreamDataEvent fh dat) chan
+        _ ->
+            error $ "expecting DataFrame but got " ++ show payload
 
 updateWindowsStep
   :: Dispatch
