@@ -45,7 +45,7 @@ makeFrameClientStream :: Http2FrameConnection
 makeFrameClientStream = _makeFrameClientStream
 
 data Http2FrameClientStream = Http2FrameClientStream {
-    _sendFrames :: [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
+    _sendFrames :: IO [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
   -- ^ Sends a frame to the server.
   -- The first argument is a FrameFlags modifier (e.g., to sed the
   -- end-of-stream flag).
@@ -54,11 +54,11 @@ data Http2FrameClientStream = Http2FrameClientStream {
 
 -- | Sends a frame to the server.
 sendOne :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
-sendOne client f payload = _sendFrames client [(f, payload)]
+sendOne client f payload = _sendFrames client (pure [(f, payload)])
 
 -- | Sends multiple back-to-back frames to the server.
 sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
-sendBackToBack = _sendFrames
+sendBackToBack client payloads = _sendFrames client (pure payloads)
 
 data Http2ServerStream = Http2ServerStream {
     _nextHeaderAndFrame :: IO (FrameHeader, Either HTTP2Error FramePayload)
@@ -91,7 +91,9 @@ newHttp2FrameConnection host port params = do
                     let info = encodeInfo modifyFF streamID
                     _sendRaw http2conn $
                         HTTP2.encodeFrame info frame
-                putFrames xs = writeProtect . void $ traverse (uncurry putFrame) xs
+                putFrames f = writeProtect . void $ do
+                    xs <- f
+                    traverse (uncurry putFrame) xs
              in Http2FrameClientStream putFrames streamID
 
         nextServerFrameChunk = Http2ServerStream $ do

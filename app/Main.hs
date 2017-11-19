@@ -197,9 +197,10 @@ client QueryArgs{..} = do
             _makeFrameClientStream = \sid ->
                 let frameClient = (_makeFrameClientStream frameConn) sid
                 in frameClient {
-                       _sendFrames = \xs -> do
+                       _sendFrames = \mkFrames -> do
+                           xs <- mkFrames
                            print $ (">>> "::String, _getStreamId frameClient, map snd xs)
-                           _sendFrames frameClient xs
+                           _sendFrames frameClient (pure xs)
                    }
           , _serverStream =
               let
