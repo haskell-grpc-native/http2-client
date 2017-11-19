@@ -792,13 +792,16 @@ sendHeaders
   -> (FrameFlags -> FrameFlags)
   -> IO StreamThread
 sendHeaders s enc hdrs blockSplitter flagmod = do
-    headerBlockFragments <- blockSplitter <$> _encodeHeaders enc hdrs
-    let framers           = (HeadersFrame Nothing) : repeat ContinuationFrame
-    let frames            = zipWith ($) framers headerBlockFragments
-    let modifiersReversed = (HTTP2.setEndHeader . flagmod) : repeat id
-    let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
-    sendBackToBack s arrangedFrames
+    _sendFrames s mkFrames
     return CST
+  where
+    mkFrames = do
+        headerBlockFragments <- blockSplitter <$> _encodeHeaders enc hdrs
+        let framers           = (HeadersFrame Nothing) : repeat ContinuationFrame
+        let frames            = zipWith ($) framers headerBlockFragments
+        let modifiersReversed = (HTTP2.setEndHeader . flagmod) : repeat id
+        let arrangedFrames    = reverse $ zip modifiersReversed (reverse frames)
+        return arrangedFrames
 
 -- | A function able to split a header block into multiple fragments.
 type PayloadSplitter = ByteString -> [ByteString]
