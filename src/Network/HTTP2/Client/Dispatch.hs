@@ -1,13 +1,17 @@
-
+{-# LANGUAGE BangPatterns #-}
 module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
 import           Data.ByteString (ByteString)
+import qualified Data.ByteString.Internal as ByteString
+import           Foreign.Marshal.Alloc (mallocBytes, finalizerFree)
+import           Foreign.ForeignPtr (newForeignPtr)
 import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
+import qualified Network.HPACK.Token as HPACK
 import           Network.HTTP2 as HTTP2
 
 import           Network.HTTP2.Client.Channels
@@ -192,20 +196,30 @@ newDispatchControlIO
   -> IO DispatchControl
 newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
     DispatchControl <$> newIORef defaultConnectionSettings
-                    <*> hpackEncoder
+                    <*> newHpackEncoderContext encoderBufSize
                     <*> pure ackPing
                     <*> pure ackSetts
                     <*> pure onGoAway
                     <*> pure onFallback
                     <*> newIORef []
                     <*> newIORef []
-  where
-    hpackEncoder = do
-        let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
-        dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
-        return $ HpackEncoderContext
-            (HPACK.encodeHeader strategy encoderBufSize dt)
+
+newHpackEncoderContext :: Size -> IO HpackEncoderContext
+newHpackEncoderContext encoderBufSize = do
+    let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
+    dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
+    buf <- mallocBytes encoderBufSize
+    ptr <- newForeignPtr finalizerFree buf
+    return $ HpackEncoderContext
+            (encoder strategy dt buf ptr)
             (\n -> HPACK.setLimitForEncoding n dt)
+  where
+    encoder strategy dt buf ptr hdrs = do
+        let hdrs' = fmap (\(k,v) -> let !t = HPACK.toToken k in (t,v)) hdrs
+        remainder <- HPACK.encodeTokenHeader buf encoderBufSize strategy True dt hdrs'
+        case remainder of
+            ([],len) -> pure $ ByteString.fromForeignPtr ptr 0 len
+            (_,_)  -> throwIO HPACK.BufferOverrun
 
 readSettings :: DispatchControl -> IO ConnectionSettings
 readSettings = readIORef . _dispatchControlConnectionSettings
