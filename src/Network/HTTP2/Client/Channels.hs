@@ -21,11 +21,8 @@ whenFrame
   -> (FrameHeader, Either e FramePayload)
   -> ((FrameHeader, FramePayload) -> IO ())
   -> IO ()
-whenFrame test (fHead, fPayload) handle = do
-    dat <- either throwIO pure fPayload
-    if test fHead dat
-    then handle (fHead, dat)
-    else pure ()
+whenFrame test frame handle = do
+    whenFrameElse test frame handle (const $ pure ())
 
 whenFrameElse
   :: Exception e
