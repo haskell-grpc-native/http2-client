@@ -122,9 +122,12 @@ waitStream :: Http2Stream
 waitStream stream streamFlowControl ppHandler = do
     ev <- _waitEvent stream
     case ev of
-        StreamHeadersEvent _ hdrs -> do
-            (dfrms,trls) <- waitDataFrames []
-            return (Right hdrs, reverse dfrms, trls)
+        StreamHeadersEvent fH hdrs
+            | HTTP2.testEndStream (HTTP2.flags fH) -> do
+                return (Right hdrs, [], Nothing)
+            | otherwise -> do
+                (dfrms,trls) <- waitDataFrames []
+                return (Right hdrs, reverse dfrms, trls)
         StreamPushPromiseEvent _ ppSid ppHdrs -> do
             _handlePushPromise stream ppSid ppHdrs ppHandler
             waitStream stream streamFlowControl ppHandler
