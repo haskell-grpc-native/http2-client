@@ -262,7 +262,7 @@ client QueryArgs{..} = do
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing
         , TLS.clientUseMaxFragmentLength = Nothing
-        , TLS.clientServerIdentification = ("127.0.0.1", "")
+        , TLS.clientServerIdentification = (_host, ByteString.pack $ show _port)
         , TLS.clientUseServerNameIndication = True
         , TLS.clientShared               = def
         , TLS.clientHooks                = def { TLS.onServerCertificate = \_ _ _ _ -> return []
