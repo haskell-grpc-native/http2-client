@@ -8,8 +8,8 @@ module Network.HTTP2.Client.RawConnection (
     ) where
 
 import           Control.Monad (forever)
-import           Control.Concurrent.Async (Async, async, link)
-import           Control.Concurrent.STM (atomically, retry)
+import           Control.Concurrent.Async (Async, async, cancel, pollSTM)
+import           Control.Concurrent.STM (atomically, retry, throwSTM)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -59,8 +59,7 @@ plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
     let putRaw = sendMany skt
     (a,getRaw) <- startReadWorker (recv skt)
-    link a
-    let doClose = close skt
+    let doClose = close skt >> cancel a
     return $ RawHttp2Connection putRaw getRaw doClose
 
 tlsRaw :: Socket -> TLS.ClientParams -> IO RawHttp2Connection
@@ -72,8 +71,7 @@ tlsRaw skt params = do
     -- Define raw byte-stream handlers.
     let putRaw        = TLS.sendData tlsContext . fromChunks
     (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
-    link a
-    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext
+    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext >> cancel a
 
     return $ RawHttp2Connection putRaw getRaw doClose
   where
@@ -89,15 +87,22 @@ startReadWorker
 startReadWorker get = do
     buf <- newTVarIO ""
     a <- async $ readWorkerLoop buf get
-    return $ (a, getRawWorker buf)
+    return $ (a, getRawWorker a buf)
 
 readWorkerLoop :: TVar ByteString -> (Int -> IO ByteString) -> IO ()
 readWorkerLoop buf next = forever $ do
     dat <- next 4096
     atomically $ modifyTVar' buf (\bs -> (bs <> dat))
 
-getRawWorker :: TVar ByteString -> Int -> IO ByteString
-getRawWorker buf amount = atomically $ do
+getRawWorker :: Async () -> TVar ByteString -> Int -> IO ByteString
+getRawWorker a buf amount = atomically $ do
+    -- Verifies if the STM is alive, if dead, we re-throw the original
+    -- exception.
+    asyncStatus <- pollSTM a
+    case asyncStatus of
+        (Just (Left e)) -> throwSTM e
+        _               -> return ()
+    -- Read data consume, if there's enough, retry otherwise.
     dat <- readTVar buf
     if amount > ByteString.length dat
     then retry
