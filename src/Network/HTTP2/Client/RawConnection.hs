@@ -7,7 +7,10 @@ module Network.HTTP2.Client.RawConnection (
     , newRawHttp2Connection
     ) where
 
-import           Data.IORef (newIORef, readIORef, writeIORef)
+import           Control.Monad (forever)
+import           Control.Concurrent.Async (Async, async, link)
+import           Control.Concurrent (threadDelay)
+import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString.Lazy (fromChunks)
@@ -52,22 +55,12 @@ newRawHttp2Connection host port mparams = do
 
     return conn
 
-
 plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
     let putRaw = sendMany skt
-    remainder <- newIORef ""
-    let getRaw amount = do
-            -- TODO: improve re-writing of remainders by storing chunks instead of concatening chunks
-            buf <- readIORef remainder
-            if amount > ByteString.length buf
-            then do
-               dat <- recv skt 4096
-               writeIORef remainder $ buf <> dat
-               getRaw amount
-            else do
-               writeIORef remainder $ ByteString.drop amount buf
-               return $ ByteString.take amount buf
+    inputData <- newIORef ""
+    (a,getRaw) <- startReadWorker (recv skt)
+    link a
     let doClose = close skt
     return $ RawHttp2Connection putRaw getRaw doClose
 
@@ -79,18 +72,9 @@ tlsRaw skt params = do
 
     -- Define raw byte-stream handlers.
     let putRaw        = TLS.sendData tlsContext . fromChunks
-    remainder <- newIORef ""
-    let getRaw amount = do
-            -- TODO: improve re-writing of remainders by storing chunks instead of concatening chunks
-            buf <- readIORef remainder
-            if amount > ByteString.length buf
-            then do
-               dat <- TLS.recvData tlsContext
-               writeIORef remainder $ buf <> dat
-               getRaw amount
-            else do
-               writeIORef remainder $ ByteString.drop amount buf
-               return $ ByteString.take amount buf
+    inputData <- newIORef ""
+    (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
+    link a
     let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext
 
     return $ RawHttp2Connection putRaw getRaw doClose
@@ -100,3 +84,28 @@ tlsRaw skt params = do
             TLS.onSuggestALPN = return $ Just [ "h2", "h2-17" ]
           }
       }
+
+startReadWorker
+  :: (Int -> IO ByteString)
+  -> IO (Async (), (Int -> IO ByteString))
+startReadWorker get = do
+    ioref <- newIORef ""
+    a <- async $ readWorker ioref get
+    return $ (a, getRawWorker ioref)
+
+readWorker :: IORef ByteString -> (Int -> IO ByteString) -> IO ()
+readWorker ioref next = forever $ do
+    dat <- next 4096
+    atomicModifyIORef' ioref (\bs -> (bs <> dat, ()))
+
+getRawWorker :: IORef ByteString -> Int -> IO ByteString
+getRawWorker inputData amount = do
+    curLength <- ByteString.length <$> readIORef inputData
+    if amount > curLength
+    then do
+        threadDelay 1000 -- TODO: replace with a STM wait
+        getRawWorker inputData amount
+    else do
+        atomicModifyIORef'
+            inputData
+            (\bs -> let (g,r) = ByteString.splitAt amount bs in (r,g))
