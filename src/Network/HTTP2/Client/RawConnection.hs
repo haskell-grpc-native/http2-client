@@ -9,7 +9,7 @@ module Network.HTTP2.Client.RawConnection (
 
 import           Control.Monad (forever)
 import           Control.Concurrent.Async (Async, async, cancel, pollSTM)
-import           Control.Concurrent.STM (atomically, retry, throwSTM)
+import           Control.Concurrent.STM (STM, atomically, retry, throwSTM)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -60,7 +60,7 @@ plainTextRaw skt = do
     let putRaw = sendMany skt
     (a,getRaw) <- startReadWorker (recv skt)
     let doClose = close skt >> cancel a
-    return $ RawHttp2Connection putRaw getRaw doClose
+    return $ RawHttp2Connection putRaw (atomically . getRaw) doClose
 
 tlsRaw :: Socket -> TLS.ClientParams -> IO RawHttp2Connection
 tlsRaw skt params = do
@@ -73,7 +73,7 @@ tlsRaw skt params = do
     (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
     let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext >> cancel a
 
-    return $ RawHttp2Connection putRaw getRaw doClose
+    return $ RawHttp2Connection putRaw (atomically . getRaw) doClose
   where
     modifyParams prms = prms {
         TLS.clientHooks = (TLS.clientHooks prms) {
@@ -83,7 +83,7 @@ tlsRaw skt params = do
 
 startReadWorker
   :: (Int -> IO ByteString)
-  -> IO (Async (), (Int -> IO ByteString))
+  -> IO (Async (), (Int -> STM ByteString))
 startReadWorker get = do
     buf <- newTVarIO ""
     a <- async $ readWorkerLoop buf get
@@ -94,8 +94,8 @@ readWorkerLoop buf next = forever $ do
     dat <- next 4096
     atomically $ modifyTVar' buf (\bs -> (bs <> dat))
 
-getRawWorker :: Async () -> TVar ByteString -> Int -> IO ByteString
-getRawWorker a buf amount = atomically $ do
+getRawWorker :: Async () -> TVar ByteString -> Int -> STM ByteString
+getRawWorker a buf amount = do
     -- Verifies if the STM is alive, if dead, we re-throw the original
     -- exception.
     asyncStatus <- pollSTM a
