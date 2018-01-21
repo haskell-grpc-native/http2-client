@@ -9,8 +9,8 @@ module Network.HTTP2.Client.RawConnection (
 
 import           Control.Monad (forever)
 import           Control.Concurrent.Async (Async, async, link)
-import           Control.Concurrent (threadDelay)
-import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import           Control.Concurrent.STM (atomically, retry)
+import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString.Lazy (fromChunks)
@@ -58,7 +58,6 @@ newRawHttp2Connection host port mparams = do
 plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
     let putRaw = sendMany skt
-    inputData <- newIORef ""
     (a,getRaw) <- startReadWorker (recv skt)
     link a
     let doClose = close skt
@@ -72,7 +71,6 @@ tlsRaw skt params = do
 
     -- Define raw byte-stream handlers.
     let putRaw        = TLS.sendData tlsContext . fromChunks
-    inputData <- newIORef ""
     (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
     link a
     let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext
@@ -89,23 +87,20 @@ startReadWorker
   :: (Int -> IO ByteString)
   -> IO (Async (), (Int -> IO ByteString))
 startReadWorker get = do
-    ioref <- newIORef ""
-    a <- async $ readWorker ioref get
-    return $ (a, getRawWorker ioref)
+    buf <- newTVarIO ""
+    a <- async $ readWorkerLoop buf get
+    return $ (a, getRawWorker buf)
 
-readWorker :: IORef ByteString -> (Int -> IO ByteString) -> IO ()
-readWorker ioref next = forever $ do
+readWorkerLoop :: TVar ByteString -> (Int -> IO ByteString) -> IO ()
+readWorkerLoop buf next = forever $ do
     dat <- next 4096
-    atomicModifyIORef' ioref (\bs -> (bs <> dat, ()))
+    atomically $ modifyTVar' buf (\bs -> (bs <> dat))
 
-getRawWorker :: IORef ByteString -> Int -> IO ByteString
-getRawWorker inputData amount = do
-    curLength <- ByteString.length <$> readIORef inputData
-    if amount > curLength
-    then do
-        threadDelay 1000 -- TODO: replace with a STM wait
-        getRawWorker inputData amount
+getRawWorker :: TVar ByteString -> Int -> IO ByteString
+getRawWorker buf amount = atomically $ do
+    dat <- readTVar buf
+    if amount > ByteString.length dat
+    then retry
     else do
-        atomicModifyIORef'
-            inputData
-            (\bs -> let (g,r) = ByteString.splitAt amount bs in (r,g))
+        writeTVar buf (ByteString.drop amount dat)
+        return $ ByteString.take amount dat
