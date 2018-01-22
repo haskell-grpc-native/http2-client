@@ -7,7 +7,10 @@ module Network.HTTP2.Client.RawConnection (
     , newRawHttp2Connection
     ) where
 
-import           Data.IORef (newIORef, readIORef, writeIORef)
+import           Control.Monad (forever)
+import           Control.Concurrent.Async (Async, async, cancel, pollSTM)
+import           Control.Concurrent.STM (STM, atomically, retry, throwSTM)
+import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString.Lazy (fromChunks)
@@ -52,24 +55,12 @@ newRawHttp2Connection host port mparams = do
 
     return conn
 
-
 plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
     let putRaw = sendMany skt
-    remainder <- newIORef ""
-    let getRaw amount = do
-            -- TODO: improve re-writing of remainders by storing chunks instead of concatening chunks
-            buf <- readIORef remainder
-            if amount > ByteString.length buf
-            then do
-               dat <- recv skt 4096
-               writeIORef remainder $ buf <> dat
-               getRaw amount
-            else do
-               writeIORef remainder $ ByteString.drop amount buf
-               return $ ByteString.take amount buf
-    let doClose = close skt
-    return $ RawHttp2Connection putRaw getRaw doClose
+    (a,getRaw) <- startReadWorker (recv skt)
+    let doClose = close skt >> cancel a
+    return $ RawHttp2Connection putRaw (atomically . getRaw) doClose
 
 tlsRaw :: Socket -> TLS.ClientParams -> IO RawHttp2Connection
 tlsRaw skt params = do
@@ -79,24 +70,42 @@ tlsRaw skt params = do
 
     -- Define raw byte-stream handlers.
     let putRaw        = TLS.sendData tlsContext . fromChunks
-    remainder <- newIORef ""
-    let getRaw amount = do
-            -- TODO: improve re-writing of remainders by storing chunks instead of concatening chunks
-            buf <- readIORef remainder
-            if amount > ByteString.length buf
-            then do
-               dat <- TLS.recvData tlsContext
-               writeIORef remainder $ buf <> dat
-               getRaw amount
-            else do
-               writeIORef remainder $ ByteString.drop amount buf
-               return $ ByteString.take amount buf
-    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext
+    (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
+    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext >> cancel a
 
-    return $ RawHttp2Connection putRaw getRaw doClose
+    return $ RawHttp2Connection putRaw (atomically . getRaw) doClose
   where
     modifyParams prms = prms {
         TLS.clientHooks = (TLS.clientHooks prms) {
             TLS.onSuggestALPN = return $ Just [ "h2", "h2-17" ]
           }
       }
+
+startReadWorker
+  :: (Int -> IO ByteString)
+  -> IO (Async (), (Int -> STM ByteString))
+startReadWorker get = do
+    buf <- newTVarIO ""
+    a <- async $ readWorkerLoop buf get
+    return $ (a, getRawWorker a buf)
+
+readWorkerLoop :: TVar ByteString -> (Int -> IO ByteString) -> IO ()
+readWorkerLoop buf next = forever $ do
+    dat <- next 4096
+    atomically $ modifyTVar' buf (\bs -> (bs <> dat))
+
+getRawWorker :: Async () -> TVar ByteString -> Int -> STM ByteString
+getRawWorker a buf amount = do
+    -- Verifies if the STM is alive, if dead, we re-throw the original
+    -- exception.
+    asyncStatus <- pollSTM a
+    case asyncStatus of
+        (Just (Left e)) -> throwSTM e
+        _               -> return ()
+    -- Read data consume, if there's enough, retry otherwise.
+    dat <- readTVar buf
+    if amount > ByteString.length dat
+    then retry
+    else do
+        writeTVar buf (ByteString.drop amount dat)
+        return $ ByteString.take amount dat
