@@ -7,7 +7,7 @@ module Network.HTTP2.Client.RawConnection (
     , newRawHttp2Connection
     ) where
 
-import           Control.Monad (forever)
+import           Control.Monad (forever, when)
 import           Control.Concurrent.Async (Async, async, cancel, pollSTM)
 import           Control.Concurrent.STM (STM, atomically, retry, throwSTM)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
@@ -57,10 +57,10 @@ newRawHttp2Connection host port mparams = do
 
 plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
-    let putRaw = sendMany skt
+    (b,putRaw) <- startWriteWorker (sendMany skt)
     (a,getRaw) <- startReadWorker (recv skt)
-    let doClose = close skt >> cancel a
-    return $ RawHttp2Connection putRaw (atomically . getRaw) doClose
+    let doClose = close skt >> cancel a >> cancel b
+    return $ RawHttp2Connection (atomically . putRaw) (atomically . getRaw) doClose
 
 tlsRaw :: Socket -> TLS.ClientParams -> IO RawHttp2Connection
 tlsRaw skt params = do
@@ -68,18 +68,32 @@ tlsRaw skt params = do
     tlsContext <- TLS.contextNew skt (modifyParams params)
     TLS.handshake tlsContext
 
-    -- Define raw byte-stream handlers.
-    let putRaw        = TLS.sendData tlsContext . fromChunks
+    (b,putRaw) <- startWriteWorker (TLS.sendData tlsContext . fromChunks)
     (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
-    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext >> cancel a
+    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext >> cancel a >> cancel b
 
-    return $ RawHttp2Connection putRaw (atomically . getRaw) doClose
+    return $ RawHttp2Connection (atomically . putRaw) (atomically . getRaw) doClose
   where
     modifyParams prms = prms {
         TLS.clientHooks = (TLS.clientHooks prms) {
             TLS.onSuggestALPN = return $ Just [ "h2", "h2-17" ]
           }
       }
+
+startWriteWorker
+  :: ([ByteString] -> IO ())
+  -> IO (Async (), [ByteString] -> STM ())
+startWriteWorker sendChunks = do
+    outQ <- newTVarIO []
+    let putRaw chunks = modifyTVar' outQ (\xs -> xs ++ chunks)
+    b <- async $ forever $ do
+            xs <- atomically $ do
+                chunks <- readTVar outQ
+                when (null chunks) retry
+                writeTVar outQ []
+                return chunks
+            sendChunks xs
+    return (b, putRaw)
 
 startReadWorker
   :: (Int -> IO ByteString)

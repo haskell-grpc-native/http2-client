@@ -15,6 +15,7 @@ module Network.HTTP2.Client.FrameConnection (
     , closeConnection
     ) where
 
+import           Control.DeepSeq (deepseq)
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
 import           Control.Monad (void)
@@ -92,7 +93,10 @@ newHttp2FrameConnection host port params = do
                     in HTTP2.encodeFrame info frame
                 putFrames f = writeProtect . void $ do
                     xs <- f
-                    _sendRaw http2conn $ fmap (uncurry putFrame) xs
+                    let ys = fmap (uncurry putFrame) xs
+                    -- Force evaluation of frames serialization whilst
+                    -- write-protected to avoid out-of-order errrors.
+                    deepseq ys (_sendRaw http2conn ys)
              in Http2FrameClientStream putFrames streamID
 
         nextServerFrameChunk = Http2ServerStream $ do
