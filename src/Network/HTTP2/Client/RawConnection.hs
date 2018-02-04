@@ -59,7 +59,7 @@ plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
     (b,putRaw) <- startWriteWorker (sendMany skt)
     (a,getRaw) <- startReadWorker (recv skt)
-    let doClose = close skt >> cancel a >> cancel b
+    let doClose = cancel a >> cancel b >> close skt
     return $ RawHttp2Connection (atomically . putRaw) (atomically . getRaw) doClose
 
 tlsRaw :: Socket -> TLS.ClientParams -> IO RawHttp2Connection
@@ -70,7 +70,7 @@ tlsRaw skt params = do
 
     (b,putRaw) <- startWriteWorker (TLS.sendData tlsContext . fromChunks)
     (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
-    let doClose       = TLS.bye tlsContext >> TLS.contextClose tlsContext >> cancel a >> cancel b
+    let doClose       = cancel a >> cancel b >> TLS.bye tlsContext >> TLS.contextClose tlsContext
 
     return $ RawHttp2Connection (atomically . putRaw) (atomically . getRaw) doClose
   where

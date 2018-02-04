@@ -46,7 +46,7 @@ module Network.HTTP2.Client (
 
 import           Control.Concurrent.Async (Async, async, race, withAsync, link)
 import           Control.Exception (bracket, throwIO, SomeException, catch)
-import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
+import           Control.Concurrent.MVar (newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar)
 import           Control.Concurrent (threadDelay)
 import           Control.Monad (forever, void, when, forM_)
 import           Data.ByteString (ByteString)
@@ -177,7 +177,8 @@ data Http2Client = Http2Client {
   , _asyncs         :: !Http2ClientAsyncs
   -- ^ Asynchronous operations threads.
   , _close           :: IO ()
-  -- ^ Closes the network connection.
+  -- ^ Immediately stop processing incoming frames and closes the network
+  -- connection.
   }
 
 data InitHttp2Client = InitHttp2Client {
@@ -189,6 +190,9 @@ data InitHttp2Client = InitHttp2Client {
   , _initOutgoingFlowControl :: OutgoingFlowControl
   , _initPaylodSplitter      :: IO PayloadSplitter
   , _initClose               :: IO ()
+  -- ^ Immediately closes the connection.
+  , _initStop                :: IO Bool
+  -- ^ Stops receiving frames.
   }
 
 -- | Set of Async threads running an Http2Client.
@@ -308,8 +312,9 @@ headers = _headers
 --
 -- This function is slightly safer than 'startHttp2Client' because it uses
 -- 'Control.Concurrent.Async.withAsync' instead of
--- 'Control.Concurrent.Async.async' however, this with-pattern takes the
--- control of the thread and can be annoying at times.
+-- 'Control.Concurrent.Async.async'; plus this function calls 'linkAsyncs' to
+-- make sure that a network error kills the controlling thread. However, this
+-- with-pattern takes the control of the thread and can be annoying at times.
 runHttp2Client
   :: Http2FrameConnection
   -- ^ A frame connection.
@@ -332,17 +337,20 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
     withAsync incomingLoop $ \aIncoming -> do
         settsIO <- _initSettings initClient initSettings
         withAsync settsIO $ \aSettings -> do
-            mainHandler $ Http2Client {
+            let client = Http2Client {
               _settings            = _initSettings initClient
             , _ping                = _initPing initClient
             , _goaway              = _initGoaway initClient
-            , _close               = _initClose initClient
+            , _close               =
+                _initStop initClient >> _initClose initClient
             , _startStream         = _initStartStream initClient
             , _incomingFlowControl = _initIncomingFlowControl initClient
             , _outgoingFlowControl = _initOutgoingFlowControl initClient
             , _payloadSplitter     = _initPaylodSplitter initClient
             , _asyncs              = Http2ClientAsyncs aSettings aIncoming
             }
+            linkAsyncs client
+            mainHandler client
 
 -- | Starts a new Http2Client around a frame connection.
 --
@@ -372,7 +380,8 @@ newHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
         _settings            = _initSettings initClient
       , _ping                = _initPing initClient
       , _goaway              = _initGoaway initClient
-      , _close               = _initClose initClient
+      , _close               =
+          _initStop initClient >> _initClose initClient
       , _startStream         = _initStartStream initClient
       , _incomingFlowControl = _initIncomingFlowControl initClient
       , _outgoingFlowControl = _initOutgoingFlowControl initClient
@@ -404,7 +413,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
     (_initOutgoingFlowControl,windowUpdatesChan) <- newOutgoingFlowControl dispatchControl 0
 
     dispatchHPACK <- newDispatchHPACKIO decoderBufSize
-    let incomingLoop = dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
+    (incomingLoop,endIncomingLoop) <- dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
 
     {- Setup for client-initiated streams. -}
     conccurentStreams <- newIORef 0
@@ -454,7 +463,10 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
 
     let _initPaylodSplitter = settingsPayloadSplitter <$> readSettings dispatchControl
 
+    let _initStop = endIncomingLoop
+
     let _initClose = closeConnection conn
+
     return (incomingLoop, InitHttp2Client{..})
 
 initializeStream
@@ -518,39 +530,43 @@ dispatchLoop
   -> Chan (FrameHeader, FramePayload)
   -> IncomingFlowControl
   -> DispatchHPACK
-  -> IO ()
+  -> IO (IO (), IO Bool)
 dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
     let getNextFrame = next conn
-    delayException . forever $ do
-        frame <- getNextFrame
-        dispatchFramesStep frame d
-        whenFrame (hasStreamId 0) frame $ \got ->
-            dispatchControlFramesStep windowUpdatesChan got dc
-        whenFrame (hasTypeId [FrameData]) frame $ \got ->
-            creditDataFramesStep d inFlowControl got
-        whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
-            updateWindowsStep d got
-        whenFrame (hasTypeId [FramePushPromise, FrameHeaders]) frame $ \got -> do
-            let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
-                    newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStateEvents <$> lookupStreamState d sId
-                    let msg = StreamHeadersEvent curFh newHdrs
-                    maybe (return ()) (flip writeChan msg) chan
-                hpackLoop (FinishedWithPushPromise curFh parentSid newSid mkNewHdrs) = do
-                    newHdrs <- mkNewHdrs
-                    chan <- fmap _streamStateEvents <$> lookupStreamState d parentSid
-                    let msg = StreamPushPromiseEvent curFh newSid newHdrs
-                    maybe (return ()) (flip writeChan msg) chan
-                hpackLoop (WaitContinuation act)        =
-                    getNextFrame >>= act >>= hpackLoop
-                hpackLoop (FailedHeaders curFh sId err)        = do
-                    chan <- fmap _streamStateEvents <$> lookupStreamState d sId
-                    let msg = StreamErrorEvent curFh err
-                    maybe (return ()) (flip writeChan msg) chan
-            hpackLoop (dispatchHPACKFramesStep got dh)
-        whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
-            handleRSTStep d got
-        finalizeFramesStep frame d
+    let go = delayException . forever $ do
+            frame <- getNextFrame
+            dispatchFramesStep frame d
+            whenFrame (hasStreamId 0) frame $ \got ->
+                dispatchControlFramesStep windowUpdatesChan got dc
+            whenFrame (hasTypeId [FrameData]) frame $ \got ->
+                creditDataFramesStep d inFlowControl got
+            whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
+                updateWindowsStep d got
+            whenFrame (hasTypeId [FramePushPromise, FrameHeaders]) frame $ \got -> do
+                let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
+                        newHdrs <- mkNewHdrs
+                        chan <- fmap _streamStateEvents <$> lookupStreamState d sId
+                        let msg = StreamHeadersEvent curFh newHdrs
+                        maybe (return ()) (flip writeChan msg) chan
+                    hpackLoop (FinishedWithPushPromise curFh parentSid newSid mkNewHdrs) = do
+                        newHdrs <- mkNewHdrs
+                        chan <- fmap _streamStateEvents <$> lookupStreamState d parentSid
+                        let msg = StreamPushPromiseEvent curFh newSid newHdrs
+                        maybe (return ()) (flip writeChan msg) chan
+                    hpackLoop (WaitContinuation act)        =
+                        getNextFrame >>= act >>= hpackLoop
+                    hpackLoop (FailedHeaders curFh sId err)        = do
+                        chan <- fmap _streamStateEvents <$> lookupStreamState d sId
+                        let msg = StreamErrorEvent curFh err
+                        maybe (return ()) (flip writeChan msg) chan
+                hpackLoop (dispatchHPACKFramesStep got dh)
+            whenFrame (hasTypeId [FrameRSTStream]) frame $ \got -> do
+                handleRSTStep d got
+            finalizeFramesStep frame d
+    end <- newEmptyMVar
+    let run = void $ race go (takeMVar end)
+    let stop = tryPutMVar end ()
+    return (run, stop)
 
 handleRSTStep
   :: Dispatch
