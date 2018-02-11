@@ -86,14 +86,17 @@ startWriteWorker
 startWriteWorker sendChunks = do
     outQ <- newTVarIO []
     let putRaw chunks = modifyTVar' outQ (\xs -> xs ++ chunks)
-    b <- async $ forever $ do
-            xs <- atomically $ do
-                chunks <- readTVar outQ
-                when (null chunks) retry
-                writeTVar outQ []
-                return chunks
-            sendChunks xs
+    b <- async $ writeWorkerLoop outQ sendChunks
     return (b, putRaw)
+
+writeWorkerLoop :: TVar [ByteString] -> ([ByteString] -> IO ()) -> IO ()
+writeWorkerLoop outQ sendChunks = forever $ do
+    xs <- atomically $ do
+        chunks <- readTVar outQ
+        when (null chunks) retry
+        writeTVar outQ []
+        return chunks
+    sendChunks xs
 
 startReadWorker
   :: (Int -> IO ByteString)
