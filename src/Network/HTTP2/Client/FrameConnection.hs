@@ -18,7 +18,7 @@ module Network.HTTP2.Client.FrameConnection (
 import           Control.DeepSeq (deepseq)
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
-import           Control.Monad (void)
+import           Control.Monad ((>=>), void)
 import           Network.HTTP2 (FrameHeader(..), FrameFlags, FramePayload, HTTP2Error, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
@@ -69,15 +69,11 @@ data Http2ServerStream = Http2ServerStream {
 next :: Http2FrameConnection -> IO (FrameHeader, Either HTTP2Error FramePayload)
 next = _nextHeaderAndFrame . _serverStream
 
--- | Creates a new 'Http2FrameConnection' to a given host for a frame-to-frame communication.
-newHttp2FrameConnection :: HostName
-                        -> PortNumber
-                        -> Maybe TLS.ClientParams
-                        -> IO Http2FrameConnection
-newHttp2FrameConnection host port params = do
-    -- Spawns an HTTP2 connection.
-    http2conn <- newRawHttp2Connection host port params
-
+-- | Adds framing around a 'RawHttp2Connection'.
+frameHttp2RawConnection
+  :: RawHttp2Connection
+  -> IO Http2FrameConnection
+frameHttp2RawConnection http2conn = do
     -- Prepare a local mutex, this mutex should never escape the
     -- function's scope. Else it might lead to bugs (e.g.,
     -- https://ro-che.info/articles/2014-07-30-bracket ) 
@@ -111,3 +107,11 @@ newHttp2FrameConnection host port params = do
         gtfo = _close http2conn
 
     return $ Http2FrameConnection makeClientStream nextServerFrameChunk gtfo
+
+-- | Creates a new 'Http2FrameConnection' to a given host for a frame-to-frame communication.
+newHttp2FrameConnection :: HostName
+                        -> PortNumber
+                        -> Maybe TLS.ClientParams
+                        -> IO Http2FrameConnection
+newHttp2FrameConnection host port params = do
+    frameHttp2RawConnection =<< newRawHttp2Connection host port params
