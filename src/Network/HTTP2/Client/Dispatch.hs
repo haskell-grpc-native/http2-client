@@ -2,7 +2,8 @@
 module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
-import           Control.Concurrent.STM (STM, atomically, TVar, newTVarIO, readTVar, writeTVar)
+import           Control.Concurrent.STM (STM, atomically, retry, TVar, newTVarIO, readTVar, writeTVar)
+import           Control.Monad (when)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as ByteString
 import           Foreign.Marshal.Alloc (mallocBytes, finalizerFree)
@@ -224,6 +225,12 @@ newHpackEncoderContext encoderBufSize = do
 
 readSettings :: DispatchControl -> IO ConnectionSettings
 readSettings = atomically . readTVar . _dispatchControlConnectionSettings
+
+waitSettingsChange :: Eq a => DispatchControl -> a -> (ConnectionSettings -> a) -> IO a
+waitSettingsChange c prev f = atomically $ do
+    newSetts <- readTVar (_dispatchControlConnectionSettings c)
+    when (prev == f newSetts) retry
+    return (f newSetts)
 
 modifySettings :: DispatchControl -> (ConnectionSettings -> (ConnectionSettings, a)) -> IO a
 modifySettings d f = atomically $ do

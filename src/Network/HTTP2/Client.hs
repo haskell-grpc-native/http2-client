@@ -776,21 +776,11 @@ newOutgoingFlowControl control sid = do
             if got > 0
             then return got
             else do
-                amount <- race (waitSettingsChange base) (waitSomeCredit frames)
+                amount <- race (waitSettingsChange control base (initialWindowSize . _serverSettings)) (waitSomeCredit frames)
                 receive (either (const 0) id amount)
                 withdraw n
     return $ (OutgoingFlowControl receive withdraw, frames)
   where
-    -- TODO: broadcast settings changes from ConnectionSettings using a better data type
-    -- than IORef+busy loop. Currently the busy loop is fine because
-    -- SettingsInitialWindowSize is typically set at the first frame and hence
-    -- waiting one second for an update that is likely to never come is
-    -- probably not an issue. There still is an opportunity risk, however, that
-    -- an hasted client asks for X > initialWindowSize before the server has
-    -- sent its initial SETTINGS frame.
-    waitSettingsChange prev = do
-            new <- initialWindowSize . _serverSettings <$> readSettings control
-            if new == prev then threadDelay 1000000 >> waitSettingsChange prev else return ()
     waitSomeCredit frames = do
         got <- readChan frames
         case got of
