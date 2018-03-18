@@ -611,8 +611,7 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
     case payload of
         (SettingsFrame settsList)
             | not . testAck . flags $ fh -> do
-                atomicModifyIORef' _dispatchControlConnectionSettings
-                                   (\(ConnectionSettings cli srv) ->
+                modifySettings control (\(ConnectionSettings cli srv) ->
                                       (ConnectionSettings cli (HTTP2.updateSettings srv settsList), ()))
                 maybe (return ())
                       (_applySettings _dispatchControlHpackEncoder)

@@ -2,6 +2,7 @@
 module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
+import           Control.Concurrent.STM (STM, atomically, TVar, newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as ByteString
 import           Foreign.Marshal.Alloc (mallocBytes, finalizerFree)
@@ -177,7 +178,7 @@ lookupAndReleaseSetSettingsHandler dc =
     f (x:xs) = (xs, Just x)
 
 data DispatchControl = DispatchControl {
-    _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
+    _dispatchControlConnectionSettings  :: !(TVar ConnectionSettings)
   , _dispatchControlHpackEncoder        :: !HpackEncoderContext
   , _dispatchControlAckPing             :: !(ByteString -> IO ())
   , _dispatchControlAckSettings         :: !(IO ())
@@ -195,7 +196,7 @@ newDispatchControlIO
   -> FallBackFrameHandler
   -> IO DispatchControl
 newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
-    DispatchControl <$> newIORef defaultConnectionSettings
+    DispatchControl <$> newTVarIO defaultConnectionSettings
                     <*> newHpackEncoderContext encoderBufSize
                     <*> pure ackPing
                     <*> pure ackSetts
@@ -222,10 +223,15 @@ newHpackEncoderContext encoderBufSize = do
             (_,_)  -> throwIO HPACK.BufferOverrun
 
 readSettings :: DispatchControl -> IO ConnectionSettings
-readSettings = readIORef . _dispatchControlConnectionSettings
+readSettings = atomically . readTVar . _dispatchControlConnectionSettings
 
 modifySettings :: DispatchControl -> (ConnectionSettings -> (ConnectionSettings, a)) -> IO a
-modifySettings d = atomicModifyIORef' (_dispatchControlConnectionSettings d)
+modifySettings d f = atomically $ do
+    let t = _dispatchControlConnectionSettings d
+    oldVal <- readTVar t
+    let (!newVal, !res) = f oldVal
+    writeTVar t newVal
+    return res
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext {
