@@ -1,4 +1,5 @@
-First you need some imports and pragmas to make our life easier.
+First you need some imports and pragmas to make our life easier while typing
+string literals.
 
 > {-# LANGUAGE OverloadedStrings #-}
 
@@ -21,7 +22,7 @@ First, create a connection, you need to specify the host and port you want to
 connect to. Unlike HTTP, HTTP2 proposes to use TLS, hence, the port should
 almost always be 443 instead of 80.
 
->     frameConn <- newHttp2FrameConnection "www.google.com" 443 tlsParams 
+>     frameConn <- newHttp2FrameConnection "www.google.com" 443 (Just tlsParams )
 
 The 'runHttp2Client' function takes control of the current thread so that we
 never leave an internal thread leaking, even in presence of asynchronous
@@ -44,25 +45,25 @@ _updateWindow. We don't expect to receive more data for this connection so
 we're good to go, but in a long-running application we would have to query this
 function a number of time.
 
->     let fc = _incomingFlowControl conn
->     _addCredit fc 10000000
->     _ <- _updateWindow fc
+>       let fc = _incomingFlowControl conn
+>       _addCredit fc 10000000
+>       _ <- _updateWindow fc
 
 Prepare the HTTP request using, first meta-headers, then normal headers.
 
->     let requestHeaders = [ (":method", "GET")
->                          , (":scheme", "https")
->                          , (":path", "?q=http2")
->                          , (":authority", "www.google.com")
->                          ]
+>       let requestHeaders = [ (":method", "GET")
+>                            , (":scheme", "https")
+>                            , (":path", "?q=http2")
+>                            , (":authority", "www.google.com")
+>                            ]
 
 Start a new stream. A new stream opened by a client takes two steps: first we
 initialize the stream then we wait for a reply (i.e., we handle the reply).  If
 you were sending an HTTP POST you would be sending data from the client to the
 server, which requires outbound flow-control too.
 
->     _ <- withHttp2Stream conn $ \stream ->
->         let
+>       _ <- withHttp2Stream conn $ \stream ->
+>           let
 
 For a simple HTTP GET, the headers constitute the whole query. We don't plan to
 send more HTTP headers in continuation frames, hence we tell the server that
@@ -70,7 +71,7 @@ the headers are sent (so that the server can start generating a response). We
 also tell the server that we're not gonna send more data with the setEndStream
 flag.
 
->           initStream = headers stream requestHeaders (setEndHeader . setEndStream)
+>             initStream = headers stream requestHeaders (setEndHeader . setEndStream)
 
 The handler uses the high-level waitStream, which blocks and waits for the
 whole query result. The fromStreamResult coalesces every single frames from the
@@ -81,12 +82,14 @@ If you expected the server to send you some data you can use onPushPromise with
 a handler with the same type and 'waitStream' mechanism as the
 client-originated streams (however with its own flow-control context).
 
->           handler sfc _ = do
->               waitStream stream sfc >>= print . fromStreamResult
+>             resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
+>
+>             handler sfc _ = do
+>                 waitStream stream sfc resetPushPromises >>= print . fromStreamResult
 
 We've defined an initializer and a handler so far.
 
->         in 
+>           in 
 
 We need to package the initializer and the handler in a StreamDefinition
 object. Once you're done, the _startStream function will manage your stream
@@ -94,11 +97,12 @@ synchronously. If you wanted to run multiple concurrent queries then you should
 have one async per stream, and pay attention to the return value of
 _startStream.
 
->           StreamDefinition initStream handler
+>             StreamDefinition initStream handler
 
 We are done, congratz!
 
->     putStrLn "done"
+>       putStrLn "done"
+>       _goaway conn NoError "https://github.com/lucasdicioccio/http2-client example"
 
 You need to pass some TLS parameters. Here are a settings that could work with
 an SSL verification that accepts any server certificate.
