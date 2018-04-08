@@ -256,7 +256,6 @@ client QueryArgs{..} = do
 
 
       _gtfo conn HTTP2.NoError _finalMessage
-      _close conn
   where
     tlsParams = TLS.ClientParams {
           TLS.clientWantSessionResume    = Nothing

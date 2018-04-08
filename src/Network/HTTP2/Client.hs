@@ -315,6 +315,10 @@ headers = _headers
 -- 'Control.Concurrent.Async.async'; plus this function calls 'linkAsyncs' to
 -- make sure that a network error kills the controlling thread. However, this
 -- with-pattern takes the control of the thread and can be annoying at times.
+--
+-- This function tries to finalize the client with a call to `_close`, a second
+-- call to `_close` will trigger an IOException because the Handle representing
+-- the TCP connection will be closed.
 runHttp2Client
   :: Http2FrameConnection
   -- ^ A frame connection.
@@ -350,7 +354,9 @@ runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fal
             , _asyncs              = Http2ClientAsyncs aSettings aIncoming
             }
             linkAsyncs client
-            mainHandler client
+            ret <- mainHandler client
+            _close client
+            return ret
 
 -- | Starts a new Http2Client around a frame connection.
 --
