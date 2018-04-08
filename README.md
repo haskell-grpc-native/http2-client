@@ -200,11 +200,3 @@ The current implementation follows the HTTP2 standard except for the following:
   * data-consumed out of flow-control limits
   * authority of push promise https://tools.ietf.org/html/draft-ietf-httpbis-http2-17#section-10.1
   * ...
-
-### Various TODO
-
-- consider a better frame-subscription mechanism than broadcast wake-up
-  * current system of dupChan everything is prone to errors and may be costly
-    CPU/latency-wise if the concurrency is high
-- consider most performant functions for HTTP2.HPACK encoding/decoding
-  * currently using naive function 'Network.HPACK.encodeHeader'
