@@ -1,6 +1,1 @@
-resolver: lts-10.3
-packages:
-- '.'
-extra-deps: []
-flags: {}
-extra-package-dbs: []
+stack-lts-11.8.yaml
