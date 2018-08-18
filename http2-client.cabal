@@ -33,35 +33,22 @@ library
                      , tls >= 1.4 && < 2
   default-language:    Haskell2010
 
-executable http2-client-exe
-  hs-source-dirs:      app
-  main-is:             Main.hs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -O2
-  build-depends:       base
-                     , async
-                     , bytestring
-                     , data-default-class
-                     , http2
-                     , http2-client
-                     , optparse-applicative
-                     , time
-                     , tls
-  default-language:    Haskell2010
-
-executable http2-client-example-simple-get
-  hs-source-dirs:      examples
-  main-is:             SimpleGet.lhs
-  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -O2
-  build-depends:       base
-                     , async
-                     , bytestring
-                     , data-default-class
-                     , http2
-                     , http2-client
-                     , optparse-applicative
-                     , time
-                     , tls
-  default-language:    Haskell2010
+-- Commented-out to avoid distribution
+--
+--executable http2-client-example-simple-get
+--  hs-source-dirs:      examples
+--  main-is:             SimpleGet.lhs
+--  ghc-options:         -threaded -rtsopts -with-rtsopts=-N -O2
+--  build-depends:       base
+--                     , async
+--                     , bytestring
+--                     , data-default-class
+--                     , http2
+--                     , http2-client
+--                     , optparse-applicative
+--                     , time
+--                     , tls
+--  default-language:    Haskell2010
 
 test-suite http2-client-test
   type:                exitcode-stdio-1.0
