@@ -57,12 +57,12 @@ an e-mail (cf. commits) or a tweet @lucasdicioccio .
 Please see some literate Haskell documents in the `examples/` directory.  For
 a more involved usage, we currently provide a command-line example client:
 `http2-client-exe` which I use as a test client and you could use to test
-various flow-control parameters.  Read `app/Main.hs` and
-`src/Network/HTTP2/Client/Helpers.hs` to look at how a user application is
-implemented.
+various flow-control parameters. This binary lives in a separate package
+at https://github.com/lucasdicioccio/http2-client-exe .
 
-The Haddocks should have plenty implementation details, so please have a look.
-Otherwise, you can ask help by creating an Issue on the bug-tracker.
+The Haddocks, at https://hackage.haskell.org/package/http2-client, should have
+plenty implementation details, so please have a look.  Otherwise, you can ask
+help by creating an Issue on the bug-tracker.
 
 ### Opening a stream
 
