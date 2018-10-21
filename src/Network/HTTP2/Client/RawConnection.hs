@@ -5,6 +5,7 @@
 module Network.HTTP2.Client.RawConnection (
       RawHttp2Connection (..)
     , newRawHttp2Connection
+    , newRawHttp2ConnectionSocket
     ) where
 
 import           Control.Monad (forever, when)
@@ -46,7 +47,20 @@ newRawHttp2Connection host port mparams = do
     addr:_ <- getAddrInfo (Just hints) (Just host) (Just $ show port)
     skt <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
     connect skt (addrAddress addr)
+    newRawHttp2ConnectionSocket skt mparams
 
+-- | Initiates a RawHttp2Connection with a server over a connected socket.
+--
+-- The current code does not handle closing the connexion, yikes.
+-- Since 0.8.0.2
+newRawHttp2ConnectionSocket
+  :: Socket
+  -- ^ A connected socket.
+  -> Maybe TLS.ClientParams
+  -- ^ TLS parameters. The 'TLS.onSuggestALPN' hook is
+  -- overwritten to always return ["h2", "h2-17"].
+  -> IO RawHttp2Connection
+newRawHttp2ConnectionSocket skt mparams = do
     -- Prepare structure with abstract API.
     conn <- maybe (plainTextRaw skt) (tlsRaw skt) mparams
 
