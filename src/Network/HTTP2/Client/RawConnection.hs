@@ -46,6 +46,7 @@ newRawHttp2Connection host port mparams = do
     let hints = defaultHints { addrFlags = [AI_NUMERICSERV], addrSocketType = Stream }
     addr:_ <- getAddrInfo (Just hints) (Just host) (Just $ show port)
     skt <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+    setSocketOption skt NoDelay 1
     connect skt (addrAddress addr)
     newRawHttp2ConnectionSocket skt mparams
 
