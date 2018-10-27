@@ -10,7 +10,7 @@ maintainer:          lucas@dicioccio.fr
 copyright:           2017 Lucas DiCioccio
 category:            Web
 build-type:          Simple
-extra-source-files:  README.md
+extra-source-files:  README.md, ChangeLog.md
 cabal-version:       >=1.10
 
 library
