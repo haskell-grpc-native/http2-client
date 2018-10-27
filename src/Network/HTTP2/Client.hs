@@ -415,8 +415,10 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                                             goAwayHandler
                                             fallbackHandler
 
-    _initIncomingFlowControl <- newIncomingFlowControl dispatchControl controlStream
-    (_initOutgoingFlowControl,windowUpdatesChan) <- newOutgoingFlowControl dispatchControl 0
+    let baseWindowSize = return HTTP2.defaultInitialWindowSize
+    _initIncomingFlowControl <- newIncomingFlowControl dispatchControl baseWindowSize (sendWindowUpdateFrame controlStream)
+    windowUpdatesChan <- newChan
+    _initOutgoingFlowControl <- newOutgoingFlowControl dispatchControl windowUpdatesChan baseWindowSize
 
     dispatchHPACK <- newDispatchHPACKIO decoderBufSize
     (incomingLoop,endIncomingLoop) <- dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
@@ -437,12 +439,14 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             then
                 return $ Left $ TooMuchConcurrency roomNeeded
             else Right <$> do
+                windowUpdatesChan <- newChan
                 cont <- withClientStreamId $ \sid -> do
                     dispatchStream <- newDispatchStreamIO sid
                     initializeStream conn
                                      dispatch
                                      dispatchControl
                                      dispatchStream
+                                     windowUpdatesChan
                                      getWork
                                      Idle
                 v <- cont
@@ -480,19 +484,15 @@ initializeStream
   -> Dispatch
   -> DispatchControl
   -> DispatchStream
+  -> Chan (FrameHeader, FramePayload)
   -> (Http2Stream -> StreamDefinition a)
   -> StreamFSMState
   -> IO (IO a)
-initializeStream conn dispatch control stream getWork initialState = do
+initializeStream conn dispatch control stream windowUpdatesChan getWork initialState = do
     let sid = _dispatchStreamId stream
     let frameStream = makeFrameClientStream conn sid
 
     let events        = _dispatchStreamReadEvents stream
-
-    -- Builds a flow-control context.
-    incomingStreamFlowControl <- newIncomingFlowControl control frameStream
-    (outgoingStreamFlowControl, windowUpdatesChan) <- newOutgoingFlowControl control sid
-    registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
 
     -- Prepare handlers.
     let _headers headersList flags = do
@@ -513,21 +513,32 @@ initializeStream conn dispatch control stream getWork initialState = do
     let _handlePushPromise ppSid ppHeaders ppHandler = do
             let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
             newStream <- newDispatchStreamIO ppSid
+            ppWindowsUpdatesChan <- newChan
             ppCont <- initializeStream conn
                                        dispatch
                                        control
                                        newStream
+                                       ppWindowsUpdatesChan
                                        mkStreamActions
                                        ReservedRemote
             ppCont
 
     let streamActions = getWork $ Http2Stream{..}
 
-    -- Perform the 1st action, the stream won't be idle anymore.
+    -- Register handlers for receiving frames and perform the 1st action, the
+    -- stream won't be idle anymore.
+    registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
     _ <- _initStream streamActions
 
     -- Returns 2nd action.
-    return $ _handleStream streamActions incomingStreamFlowControl outgoingStreamFlowControl
+    -- We build the flow control contexts in this action outside the exclusive
+    -- lock on clientStreamIdMutex will be released.
+    return $ do
+        let baseIncomingWindowSize = initialWindowSize . _clientSettings <$> readSettings control
+        isfc <- newIncomingFlowControl control baseIncomingWindowSize (sendWindowUpdateFrame frameStream)
+        let baseOutgoingWindowSize = initialWindowSize . _serverSettings <$> readSettings control
+        osfc <- newOutgoingFlowControl control windowUpdatesChan baseOutgoingWindowSize
+        _handleStream streamActions isfc osfc
 
 dispatchLoop
   :: Http2FrameConnection
@@ -732,12 +743,12 @@ dispatchHPACKFramesStep (fh,fp) (DispatchHPACK{..}) =
 
 newIncomingFlowControl
   :: DispatchControl
-  -> Http2FrameClientStream
+  -> IO Int
+  -- ^ Action to get the base window size.
+  -> (WindowSize -> IO())
+  -- ^ Action to send the window update to the server.
   -> IO IncomingFlowControl
-newIncomingFlowControl control stream = do
-    let getBase = if _getStreamId stream == 0
-                  then return HTTP2.defaultInitialWindowSize
-                  else initialWindowSize . _clientSettings <$> readSettings control
+newIncomingFlowControl control getBase doSendUpdate = do
     creditAdded <- newIORef 0
     creditConsumed <- newIORef 0
     let _addCredit n = atomicModifyIORef' creditAdded (\c -> (c + n, ()))
@@ -756,22 +767,20 @@ newIncomingFlowControl control stream = do
 
             _addCredit (negate transferred)
             _ <- _consumeCredit (negate transferred)
-
-            when shouldUpdate (sendWindowUpdateFrame stream transferred)
+            when shouldUpdate (doSendUpdate transferred)
 
             return shouldUpdate
     return $ IncomingFlowControl _addCredit _consumeCredit _updateWindow
 
 newOutgoingFlowControl ::
      DispatchControl
-  -> StreamId
-  -> IO (OutgoingFlowControl, Chan (FrameHeader, FramePayload))
-newOutgoingFlowControl control sid = do
+  -- ^ Control dispatching reference.
+  -> Chan (FrameHeader, FramePayload)
+  -> IO Int
+  -- ^ Action to get the instantaneous base window-size.
+  -> IO OutgoingFlowControl
+newOutgoingFlowControl control frames getBase = do
     credit <- newIORef 0
-    frames <- newChan
-    let getBase = if sid == 0
-                  then return HTTP2.defaultInitialWindowSize
-                  else initialWindowSize . _serverSettings <$> readSettings control
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
     let withdraw 0 = return 0
         withdraw n = do
@@ -786,7 +795,7 @@ newOutgoingFlowControl control sid = do
                 amount <- race (waitSettingsChange base) (waitSomeCredit frames)
                 receive (either (const 0) id amount)
                 withdraw n
-    return $ (OutgoingFlowControl receive withdraw, frames)
+    return $ OutgoingFlowControl receive withdraw
   where
     -- TODO: broadcast settings changes from ConnectionSettings using a better data type
     -- than IORef+busy loop. Currently the busy loop is fine because
