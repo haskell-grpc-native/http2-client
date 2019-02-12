@@ -10,7 +10,7 @@ module Network.HTTP2.Client.RawConnection (
 
 import           Control.Monad (forever, when)
 import           Control.Concurrent.Async (Async, async, cancel, pollSTM)
-import           Control.Concurrent.STM (STM, atomically, retry, throwSTM)
+import           Control.Concurrent.STM (STM, atomically, check, orElse, retry, throwSTM)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -27,6 +27,9 @@ data RawHttp2Connection = RawHttp2Connection {
   -- ^ Function to send raw data to the server.
   , _nextRaw :: Int -> IO ByteString
   -- ^ Function to block reading a datachunk of a given size from the server.
+  -- An empty chunk when asking for a length larger than 0 means the underlying
+  -- network session is closed. A compliant HTP2 server should have sent a
+  -- GOAWAY before such an event occurs.
   , _close   :: IO ()
   }
 
@@ -117,14 +120,23 @@ startReadWorker
   :: (Int -> IO ByteString)
   -> IO (Async (), (Int -> STM ByteString))
 startReadWorker get = do
-    buf <- newTVarIO ""
-    a <- async $ readWorkerLoop buf get
-    return $ (a, getRawWorker a buf)
+    remoteClosed <- newTVarIO False
+    let onEof = atomically $ writeTVar remoteClosed True
+    let emptyByteStringOnEof = readTVar remoteClosed >>= check >> pure ""
 
-readWorkerLoop :: TVar ByteString -> (Int -> IO ByteString) -> IO ()
-readWorkerLoop buf next = forever $ do
-    dat <- next 4096
-    atomically $ modifyTVar' buf (\bs -> (bs <> dat))
+    buf <- newTVarIO ""
+    a <- async $ readWorkerLoop buf get onEof
+
+    return $ (a, \len -> getRawWorker a buf len `orElse` emptyByteStringOnEof)
+
+readWorkerLoop :: TVar ByteString -> (Int -> IO ByteString) -> IO () -> IO ()
+readWorkerLoop buf next onEof = go
+  where
+    go = do
+        dat <- next 4096
+        if ByteString.null dat
+        then onEof
+        else atomically (modifyTVar' buf (\bs -> (bs <> dat))) >> go
 
 getRawWorker :: Async () -> TVar ByteString -> Int -> STM ByteString
 getRawWorker a buf amount = do
