@@ -60,6 +60,7 @@ import           Network.TLS (ClientParams)
 
 import           Network.HTTP2.Client.Channels
 import           Network.HTTP2.Client.Dispatch
+import           Network.HTTP2.Client.Exceptions
 import           Network.HTTP2.Client.FrameConnection
 
 -- | Offers credit-based flow-control.
@@ -549,7 +550,7 @@ dispatchLoop
   -> DispatchHPACK
   -> IO (IO (), IO Bool)
 dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
-    let getNextFrame = next conn
+    let getNextFrame = runExceptT (next conn) >>= either throwIO pure
     let go = delayException . forever $ do
             frame <- getNextFrame
             dispatchFramesStep frame d

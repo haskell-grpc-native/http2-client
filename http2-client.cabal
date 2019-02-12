@@ -16,6 +16,7 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Network.HTTP2.Client
+                     , Network.HTTP2.Client.Exceptions
                      , Network.HTTP2.Client.FrameConnection
                      , Network.HTTP2.Client.Helpers
                      , Network.HTTP2.Client.RawConnection
@@ -27,6 +28,7 @@ library
                      , containers >= 0.5 && < 1
                      , deepseq >= 1.4 && < 2
                      , http2 >= 1.6 && < 2
+                     , mtl >= 2.2 && < 3
                      , network >= 2.6 && < 3
                      , stm >= 2.4 && < 3
                      , time >= 1.8 && < 2

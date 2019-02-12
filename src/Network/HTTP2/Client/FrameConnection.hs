@@ -18,12 +18,14 @@ module Network.HTTP2.Client.FrameConnection (
 import           Control.DeepSeq (deepseq)
 import           Control.Exception (bracket)
 import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
-import           Control.Monad ((>=>), void)
+import           Control.Monad ((>=>), void, when)
+import qualified Data.ByteString as ByteString
 import           Network.HTTP2 (FrameHeader(..), FrameFlags, FramePayload, HTTP2Error, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2 as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import qualified Network.TLS as TLS
 
+import           Network.HTTP2.Client.Exceptions
 import           Network.HTTP2.Client.RawConnection
 
 data Http2FrameConnection = Http2FrameConnection {
@@ -62,11 +64,11 @@ sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePay
 sendBackToBack client payloads = _sendFrames client (pure payloads)
 
 data Http2ServerStream = Http2ServerStream {
-    _nextHeaderAndFrame :: IO (FrameHeader, Either HTTP2Error FramePayload)
+    _nextHeaderAndFrame :: ClientIO (FrameHeader, Either HTTP2Error FramePayload)
   }
 
 -- | Waits for the next frame from the server.
-next :: Http2FrameConnection -> IO (FrameHeader, Either HTTP2Error FramePayload)
+next :: Http2FrameConnection -> ClientIO (FrameHeader, Either HTTP2Error FramePayload)
 next = _nextHeaderAndFrame . _serverStream
 
 -- | Adds framing around a 'RawHttp2Connection'.
@@ -96,13 +98,16 @@ frameHttp2RawConnection http2conn = do
              in Http2FrameClientStream putFrames streamID
 
         nextServerFrameChunk = Http2ServerStream $ do
-            (fTy, fh@FrameHeader{..}) <- HTTP2.decodeFrameHeader <$> _nextRaw http2conn 9
+            b9 <- lift $ _nextRaw http2conn 9
+            when (ByteString.length b9 /= 9) $ throwError $ EarlyEndOfStream
+            let (fTy, fh@FrameHeader{..}) = HTTP2.decodeFrameHeader b9
             let decoder = decodeFramePayload fTy
+            buf <- lift $ _nextRaw http2conn payloadLength
+            when (ByteString.length buf /= payloadLength) $ throwError $ EarlyEndOfStream
             -- TODO: consider splitting the iteration here to give a chance to
             -- _not_ decode the frame, or consider lazyness enough.
-            let getNextFrame = decoder fh <$> _nextRaw http2conn payloadLength
-            nf <- getNextFrame
-            return (fh, nf)
+            let nf = decoder fh buf
+            pure (fh, nf)
 
         gtfo = _close http2conn
 
