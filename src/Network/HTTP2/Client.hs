@@ -41,6 +41,7 @@ module Network.HTTP2.Client (
     -- * Convenience re-exports
     , StreamEvent(..)
     , module Network.HTTP2.Client.FrameConnection
+    , module Network.HTTP2.Client.Exceptions
     , module Network.Socket
     , module Network.TLS
     ) where
