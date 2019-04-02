@@ -9,7 +9,7 @@ module Network.HTTP2.Client.RawConnection (
     ) where
 
 import           Control.Monad (forever, when)
-import           Control.Concurrent.Async (Async, async, cancel, pollSTM)
+import           Control.Concurrent.Async.Lifted (Async, async, cancel, pollSTM)
 import           Control.Concurrent.STM (STM, atomically, check, orElse, retry, throwSTM)
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
 import           Data.ByteString (ByteString)
@@ -21,16 +21,18 @@ import           Network.Socket hiding (recv)
 import           Network.Socket.ByteString
 import qualified Network.TLS as TLS
 
+import           Network.HTTP2.Client.Exceptions
+
 -- TODO: catch connection errrors
 data RawHttp2Connection = RawHttp2Connection {
-    _sendRaw :: [ByteString] -> IO ()
+    _sendRaw :: [ByteString] -> ClientIO ()
   -- ^ Function to send raw data to the server.
-  , _nextRaw :: Int -> IO ByteString
+  , _nextRaw :: Int -> ClientIO ByteString
   -- ^ Function to block reading a datachunk of a given size from the server.
   -- An empty chunk when asking for a length larger than 0 means the underlying
   -- network session is closed. A compliant HTP2 server should have sent a
   -- GOAWAY before such an event occurs.
-  , _close   :: IO ()
+  , _close   :: ClientIO ()
   }
 
 -- | Initiates a RawHttp2Connection with a server.
@@ -43,15 +45,17 @@ newRawHttp2Connection :: HostName
                       -> Maybe TLS.ClientParams
                       -- ^ TLS parameters. The 'TLS.onSuggestALPN' hook is
                       -- overwritten to always return ["h2", "h2-17"].
-                      -> IO RawHttp2Connection
+                      -> ClientIO RawHttp2Connection
 newRawHttp2Connection host port mparams = do
     -- Connects to TCP.
     let hints = defaultHints { addrFlags = [AI_NUMERICSERV], addrSocketType = Stream }
-    addr:_ <- getAddrInfo (Just hints) (Just host) (Just $ show port)
-    skt <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-    setSocketOption skt NoDelay 1
-    connect skt (addrAddress addr)
-    newRawHttp2ConnectionSocket skt mparams
+    rSkt <- lift $ do
+        addr:_ <- getAddrInfo (Just hints) (Just host) (Just $ show port)
+        skt <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+        setSocketOption skt NoDelay 1
+        connect skt (addrAddress addr)
+        pure skt
+    newRawHttp2ConnectionSocket rSkt mparams
 
 -- | Initiates a RawHttp2Connection with a server over a connected socket.
 --
@@ -63,10 +67,10 @@ newRawHttp2ConnectionSocket
   -> Maybe TLS.ClientParams
   -- ^ TLS parameters. The 'TLS.onSuggestALPN' hook is
   -- overwritten to always return ["h2", "h2-17"].
-  -> IO RawHttp2Connection
+  -> ClientIO RawHttp2Connection
 newRawHttp2ConnectionSocket skt mparams = do
     -- Prepare structure with abstract API.
-    conn <- maybe (plainTextRaw skt) (tlsRaw skt) mparams
+    conn <- lift $ maybe (plainTextRaw skt) (tlsRaw skt) mparams
 
     -- Initializes the HTTP2 stream.
     _sendRaw conn [HTTP2.connectionPreface]
@@ -77,8 +81,8 @@ plainTextRaw :: Socket -> IO RawHttp2Connection
 plainTextRaw skt = do
     (b,putRaw) <- startWriteWorker (sendMany skt)
     (a,getRaw) <- startReadWorker (recv skt)
-    let doClose = cancel a >> cancel b >> close skt
-    return $ RawHttp2Connection (atomically . putRaw) (atomically . getRaw) doClose
+    let doClose = lift $ cancel a >> cancel b >> close skt
+    return $ RawHttp2Connection (lift . atomically . putRaw) (lift . atomically . getRaw) doClose
 
 tlsRaw :: Socket -> TLS.ClientParams -> IO RawHttp2Connection
 tlsRaw skt params = do
@@ -88,9 +92,9 @@ tlsRaw skt params = do
 
     (b,putRaw) <- startWriteWorker (TLS.sendData tlsContext . fromChunks)
     (a,getRaw) <- startReadWorker (const $ TLS.recvData tlsContext)
-    let doClose       = cancel a >> cancel b >> TLS.bye tlsContext >> TLS.contextClose tlsContext
+    let doClose       = lift $ cancel a >> cancel b >> TLS.bye tlsContext >> TLS.contextClose tlsContext
 
-    return $ RawHttp2Connection (atomically . putRaw) (atomically . getRaw) doClose
+    return $ RawHttp2Connection (lift . atomically . putRaw) (lift . atomically . getRaw) doClose
   where
     modifyParams prms = prms {
         TLS.clientHooks = (TLS.clientHooks prms) {

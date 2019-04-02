@@ -25,10 +25,11 @@ import qualified Network.HTTP2 as HTTP2
 import qualified Network.HPACK as HPACK
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import           Control.Concurrent (threadDelay)
-import           Control.Concurrent.Async (race)
+import           Control.Concurrent.Lifted (threadDelay)
+import           Control.Concurrent.Async.Lifted (race)
 
 import Network.HTTP2.Client
+import Network.HTTP2.Client.Exceptions
 
 -- | Opaque type to express an action which timed out.
 data TimedOut = TimedOut
@@ -45,12 +46,12 @@ ping :: Http2Client
      -- ^ timeout in microseconds
      -> ByteString
      -- ^ 8-bytes message to uniquely identify the reply
-     -> IO PingReply
+     -> ClientIO PingReply
 ping conn timeout msg = do
-    t0 <- getCurrentTime
+    t0 <- lift $ getCurrentTime
     waitPing <- _ping conn msg
     pingReply <- race (threadDelay timeout >> return TimedOut) waitPing
-    t1 <- getCurrentTime
+    t1 <- lift $ getCurrentTime
     return $ (t0, t1, pingReply)
 
 -- | Result containing the unpacked headers and all frames received in on a
@@ -88,7 +89,7 @@ upload :: ByteString
        -- ^ The corresponding HTTP stream.
        -> OutgoingFlowControl
        -- ^ The flow control for this stream.
-       -> IO ()
+       -> ClientIO ()
 upload "" flagmod conn _ stream _ = do
     sendData conn stream flagmod ""
 upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
@@ -98,7 +99,7 @@ upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
     got       <- _withdrawCredit connectionFlowControl gotStream
     -- Recredit the stream flow control with the excedent we cannot spend on
     -- the connection.
-    _receiveCredit streamFlowControl (gotStream - got)
+    lift $ _receiveCredit streamFlowControl (gotStream - got)
 
     let uploadChunks flagMod =
             sendData conn stream flagMod (ByteString.take got dat)
@@ -118,7 +119,7 @@ upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
 waitStream :: Http2Stream
            -> IncomingFlowControl
            -> PushPromiseHandler
-           -> IO StreamResult
+           -> ClientIO StreamResult
 waitStream stream streamFlowControl ppHandler = do
     ev <- _waitEvent stream
     case ev of
@@ -141,8 +142,8 @@ waitStream stream streamFlowControl ppHandler = do
                 | HTTP2.testEndStream (HTTP2.flags fh) ->
                     return ((Right x):xs, Nothing)
                 | otherwise                            -> do
-                    _ <- _consumeCredit streamFlowControl (HTTP2.payloadLength fh)
-                    _addCredit streamFlowControl (HTTP2.payloadLength fh)
+                    _ <- lift $ _consumeCredit streamFlowControl (HTTP2.payloadLength fh)
+                    lift $ _addCredit streamFlowControl (HTTP2.payloadLength fh)
                     _ <- _updateWindow $ streamFlowControl
                     waitDataFrames ((Right x):xs)
             StreamPushPromiseEvent _ ppSid ppHdrs -> do

@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards  #-}
 {-# LANGUAGE RankNTypes  #-}
@@ -16,8 +17,8 @@ module Network.HTTP2.Client.FrameConnection (
     ) where
 
 import           Control.DeepSeq (deepseq)
-import           Control.Exception (bracket)
-import           Control.Concurrent.MVar (newMVar, takeMVar, putMVar)
+import           Control.Exception.Lifted (bracket)
+import           Control.Concurrent.MVar.Lifted (newMVar, takeMVar, putMVar)
 import           Control.Monad ((>=>), void, when)
 import qualified Data.ByteString as ByteString
 import           Network.HTTP2 (FrameHeader(..), FrameFlags, FramePayload, HTTP2Error, encodeInfo, decodeFramePayload)
@@ -33,12 +34,12 @@ data Http2FrameConnection = Http2FrameConnection {
   -- ^ Starts a new client stream.
   , _serverStream     :: Http2ServerStream
   -- ^ Receives frames from a server.
-  , _closeConnection  :: IO ()
+  , _closeConnection  :: ClientIO ()
   -- ^ Function that will close the network connection.
   }
 
 -- | Closes the Http2FrameConnection abruptly.
-closeConnection :: Http2FrameConnection -> IO ()
+closeConnection :: Http2FrameConnection -> ClientIO ()
 closeConnection = _closeConnection
 
 -- | Creates a client stream.
@@ -48,7 +49,7 @@ makeFrameClientStream :: Http2FrameConnection
 makeFrameClientStream = _makeFrameClientStream
 
 data Http2FrameClientStream = Http2FrameClientStream {
-    _sendFrames :: IO [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
+    _sendFrames :: ClientIO [(FrameFlags -> FrameFlags, FramePayload)] -> ClientIO ()
   -- ^ Sends a frame to the server.
   -- The first argument is a FrameFlags modifier (e.g., to sed the
   -- end-of-stream flag).
@@ -56,11 +57,11 @@ data Http2FrameClientStream = Http2FrameClientStream {
   }
 
 -- | Sends a frame to the server.
-sendOne :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> IO ()
+sendOne :: Http2FrameClientStream -> (FrameFlags -> FrameFlags) -> FramePayload -> ClientIO ()
 sendOne client f payload = _sendFrames client (pure [(f, payload)])
 
 -- | Sends multiple back-to-back frames to the server.
-sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePayload)] -> IO ()
+sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePayload)] -> ClientIO ()
 sendBackToBack client payloads = _sendFrames client (pure payloads)
 
 data Http2ServerStream = Http2ServerStream {
@@ -74,7 +75,7 @@ next = _nextHeaderAndFrame . _serverStream
 -- | Adds framing around a 'RawHttp2Connection'.
 frameHttp2RawConnection
   :: RawHttp2Connection
-  -> IO Http2FrameConnection
+  -> ClientIO Http2FrameConnection
 frameHttp2RawConnection http2conn = do
     -- Prepare a local mutex, this mutex should never escape the
     -- function's scope. Else it might lead to bugs (e.g.,
@@ -98,11 +99,11 @@ frameHttp2RawConnection http2conn = do
              in Http2FrameClientStream putFrames streamID
 
         nextServerFrameChunk = Http2ServerStream $ do
-            b9 <- lift $ _nextRaw http2conn 9
+            b9 <- _nextRaw http2conn 9
             when (ByteString.length b9 /= 9) $ throwError $ EarlyEndOfStream
             let (fTy, fh@FrameHeader{..}) = HTTP2.decodeFrameHeader b9
             let decoder = decodeFramePayload fTy
-            buf <- lift $ _nextRaw http2conn payloadLength
+            buf <- _nextRaw http2conn payloadLength
             when (ByteString.length buf /= payloadLength) $ throwError $ EarlyEndOfStream
             -- TODO: consider splitting the iteration here to give a chance to
             -- _not_ decode the frame, or consider lazyness enough.
@@ -117,6 +118,6 @@ frameHttp2RawConnection http2conn = do
 newHttp2FrameConnection :: HostName
                         -> PortNumber
                         -> Maybe TLS.ClientParams
-                        -> IO Http2FrameConnection
+                        -> ClientIO Http2FrameConnection
 newHttp2FrameConnection host port params = do
     frameHttp2RawConnection =<< newRawHttp2Connection host port params

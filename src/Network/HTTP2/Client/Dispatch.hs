@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+-- TOOD: use a non-concrete IO class where IO remains and ClientIO is too strong
 module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
@@ -6,7 +7,7 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as ByteString
 import           Foreign.Marshal.Alloc (mallocBytes, finalizerFree)
 import           Foreign.ForeignPtr (newForeignPtr)
-import           Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import           Data.IORef.Lifted (IORef, atomicModifyIORef', newIORef, readIORef)
 import           Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
@@ -15,11 +16,12 @@ import qualified Network.HPACK.Token as HPACK
 import           Network.HTTP2 as HTTP2
 
 import           Network.HTTP2.Client.Channels
+import           Network.HTTP2.Client.Exceptions
 
 type DispatchChan = FramesChan HTTP2Error
 
 -- | A fallback handler for frames.
-type FallBackFrameHandler = (FrameHeader, FramePayload) -> IO ()
+type FallBackFrameHandler = (FrameHeader, FramePayload) -> ClientIO ()
 
 -- | Default FallBackFrameHandler that ignores frames.
 ignoreFallbackHandler :: FallBackFrameHandler
@@ -31,7 +33,7 @@ data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteS
 instance Exception RemoteSentGoAwayFrame
 
 -- | A Handler for exceptional circumstances.
-type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
+type GoAwayHandler = RemoteSentGoAwayFrame -> ClientIO ()
 
 -- | Default GoAwayHandler throws a 'RemoteSentGoAwayFrame' in the current
 -- thread.
@@ -44,7 +46,7 @@ type GoAwayHandler = RemoteSentGoAwayFrame -> IO ()
 -- server will likely close the connection which will lead to TCP errors as
 -- well.
 defaultGoAwayHandler :: GoAwayHandler
-defaultGoAwayHandler = throwIO
+defaultGoAwayHandler = lift . throwIO
 
 data StreamFSMState =
     Idle
@@ -179,8 +181,8 @@ lookupAndReleaseSetSettingsHandler dc =
 data DispatchControl = DispatchControl {
     _dispatchControlConnectionSettings  :: !(IORef ConnectionSettings)
   , _dispatchControlHpackEncoder        :: !HpackEncoderContext
-  , _dispatchControlAckPing             :: !(ByteString -> IO ())
-  , _dispatchControlAckSettings         :: !(IO ())
+  , _dispatchControlAckPing             :: !(ByteString -> ClientIO ())
+  , _dispatchControlAckSettings         :: !(ClientIO ())
   , _dispatchControlOnGoAway            :: !GoAwayHandler
   , _dispatchControlOnFallback          :: !FallBackFrameHandler
   , _dispatchControlPingHandlers        :: !(IORef [(ByteString, PingHandler)])
@@ -189,8 +191,8 @@ data DispatchControl = DispatchControl {
 
 newDispatchControlIO
   :: Size
-  -> (ByteString -> IO ())
-  -> (IO ())
+  -> (ByteString -> ClientIO ())
+  -> (ClientIO ())
   -> GoAwayHandler
   -> FallBackFrameHandler
   -> IO DispatchControl
@@ -211,7 +213,7 @@ newHpackEncoderContext encoderBufSize = do
     buf <- mallocBytes encoderBufSize
     ptr <- newForeignPtr finalizerFree buf
     return $ HpackEncoderContext
-            (encoder strategy dt buf ptr)
+            (\hdrs -> encoder strategy dt buf ptr hdrs)
             (\n -> HPACK.setLimitForEncoding n dt)
   where
     encoder strategy dt buf ptr hdrs = do

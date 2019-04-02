@@ -28,6 +28,8 @@ library
                      , containers >= 0.5 && < 1
                      , deepseq >= 1.4 && < 2
                      , http2 >= 1.6 && < 2
+                     , lifted-async >= 0.10 && < 0.11
+                     , lifted-base >= 0.2 && < 0.3
                      , mtl >= 2.2 && < 3
                      , network >= 2.6 && < 3
                      , stm >= 2.4 && < 3

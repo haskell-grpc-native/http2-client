@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts   #-}
 {-# LANGUAGE RecordWildCards    #-}
 {-# LANGUAGE RankNTypes         #-}
 {-# LANGUAGE OverloadedStrings  #-}
@@ -44,14 +45,15 @@ module Network.HTTP2.Client (
     , module Network.TLS
     ) where
 
-import           Control.Concurrent.Async (Async, async, race, withAsync, link)
-import           Control.Exception (bracket, throwIO, SomeException, catch)
-import           Control.Concurrent.MVar (newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar)
-import           Control.Concurrent (threadDelay)
+import           Control.Concurrent.Async.Lifted (Async, async, race, withAsync, link)
+import           Control.Exception.Lifted (bracket, throwIO, SomeException, catch)
+import           Control.Concurrent.MVar.Lifted (newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar)
+import           Control.Concurrent.Lifted (threadDelay)
 import           Control.Monad (forever, void, when, forM_)
+import           Control.Monad.IO.Class (liftIO)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import           Data.IORef (newIORef, atomicModifyIORef', readIORef)
+import           Data.IORef.Lifted (newIORef, atomicModifyIORef', readIORef)
 import           Data.Maybe (fromMaybe)
 import           Network.HPACK as HPACK
 import           Network.HTTP2 as HTTP2
@@ -79,7 +81,7 @@ data IncomingFlowControl = IncomingFlowControl {
   -- only does accounting, the IO only does mutable changes. See '_updateWindow'.
   , _consumeCredit :: WindowSize -> IO Int
   -- ^ Consumes some credit and returns the credit left.
-  , _updateWindow :: IO Bool
+  , _updateWindow :: ClientIO Bool
   -- ^ Sends a WINDOW_UPDATE frame crediting it with the whole amount credited
   -- since the last _updateWindow call. The boolean tells whether an update was
   -- actually sent or not. A reason for not sending an update is if there is no
@@ -102,7 +104,7 @@ data IncomingFlowControl = IncomingFlowControl {
 data OutgoingFlowControl = OutgoingFlowControl {
     _receiveCredit  :: WindowSize -> IO ()
   -- ^ Add credit (using a hidden mutable reference underneath).
-  , _withdrawCredit :: WindowSize -> IO WindowSize
+  , _withdrawCredit :: WindowSize -> ClientIO WindowSize
   -- ^ Wait until we can take credit from stash. The returned value correspond
   -- to the amount that could be withdrawn, which is min(current, wanted). A
   -- caller should withdraw credit to send DATA chunks and put back any unused
@@ -113,12 +115,12 @@ data OutgoingFlowControl = OutgoingFlowControl {
 --
 -- Please red the doc for this record fields and then see 'StreamStarter'.
 data StreamDefinition a = StreamDefinition {
-    _initStream   :: IO StreamThread
+    _initStream   :: ClientIO StreamThread
   -- ^ Function to initialize a new client stream. This function runs in a
   -- exclusive-access section of the code and may prevent other threads to
   -- initialize new streams. Hence, you should ensure this IO does not wait for
   -- long periods of time.
-  , _handleStream :: IncomingFlowControl -> OutgoingFlowControl -> IO a
+  , _handleStream :: IncomingFlowControl -> OutgoingFlowControl -> ClientIO a
   -- ^ Function to operate with the stream. IncomingFlowControl currently is
   -- credited on your behalf as soon as a DATA frame arrives (and before you
   -- handle it with '_waitData'). However we do not send WINDOW_UPDATE with
@@ -140,7 +142,7 @@ data StreamDefinition a = StreamDefinition {
 -- implementation of the critical region, meanwhile, the 'StreamDefinition'
 -- delimits this critical region.
 type StreamStarter a =
-     (Http2Stream -> StreamDefinition a) -> IO (Either TooMuchConcurrency a)
+     (Http2Stream -> StreamDefinition a) -> ClientIO (Either TooMuchConcurrency a)
 
 -- | Whether or not the client library believes the server will reject the new
 -- stream. The Int content corresponds to the number of streams that should end
@@ -152,18 +154,18 @@ newtype TooMuchConcurrency = TooMuchConcurrency { _getStreamRoomNeeded :: Int }
 
 -- | Record holding functions one can call while in an HTTP2 client session.
 data Http2Client = Http2Client {
-    _ping             :: ByteString -> IO (IO (FrameHeader, FramePayload))
+    _ping             :: ByteString -> ClientIO (ClientIO (FrameHeader, FramePayload))
   -- ^ Send a PING, the payload size must be exactly eight bytes.
   -- Returns an IO to wait for a ping reply. No timeout is provided. Only the
   -- first call to this IO will return if a reply is received. Hence we
   -- recommend wrapping this IO in an Async (e.g., with @race (threadDelay
   -- timeout)@.)
-  , _settings         :: SettingsList -> IO (IO (FrameHeader, FramePayload))
+  , _settings         :: SettingsList -> ClientIO (ClientIO (FrameHeader, FramePayload))
   -- ^ Sends a SETTINGS. Returns an IO to wait for a settings reply. No timeout
   -- is provided. Only the first call to this IO will return if a reply is
   -- received. Hence we recommend wrapping this IO in an Async (e.g., with
   -- @race (threadDelay timeout)@.)
-  , _goaway           :: ErrorCodeId -> ByteString -> IO ()
+  , _goaway           :: ErrorCodeId -> ByteString -> ClientIO ()
   -- ^ Sends a GOAWAY.
   , _startStream      :: forall a. StreamStarter a
   -- ^ Spawns new streams. See 'StreamStarter'.
@@ -177,22 +179,22 @@ data Http2Client = Http2Client {
   -- ^ Returns a function to split a payload.
   , _asyncs         :: !Http2ClientAsyncs
   -- ^ Asynchronous operations threads.
-  , _close           :: IO ()
+  , _close           :: ClientIO ()
   -- ^ Immediately stop processing incoming frames and closes the network
   -- connection.
   }
 
 data InitHttp2Client = InitHttp2Client {
-    _initPing                :: ByteString -> IO (IO (FrameHeader, FramePayload))
-  , _initSettings            :: SettingsList -> IO (IO (FrameHeader, FramePayload))
-  , _initGoaway              :: ErrorCodeId -> ByteString -> IO ()
+    _initPing                :: ByteString -> ClientIO (ClientIO (FrameHeader, FramePayload))
+  , _initSettings            :: SettingsList -> ClientIO (ClientIO (FrameHeader, FramePayload))
+  , _initGoaway              :: ErrorCodeId -> ByteString -> ClientIO ()
   , _initStartStream         :: forall a. StreamStarter a
   , _initIncomingFlowControl :: IncomingFlowControl
   , _initOutgoingFlowControl :: OutgoingFlowControl
   , _initPaylodSplitter      :: IO PayloadSplitter
-  , _initClose               :: IO ()
+  , _initClose               :: ClientIO ()
   -- ^ Immediately closes the connection.
-  , _initStop                :: IO Bool
+  , _initStop                :: ClientIO Bool
   -- ^ Stops receiving frames.
   }
 
@@ -202,9 +204,9 @@ data InitHttp2Client = InitHttp2Client {
 -- If you modify this structure to add more Async, please also modify
 -- 'linkAsyncs' accordingly.
 data Http2ClientAsyncs = Http2ClientAsyncs {
-    _waitSettingsAsync   :: Async (FrameHeader, FramePayload)
+    _waitSettingsAsync   :: Async (Either ClientError (FrameHeader, FramePayload))
   -- ^ Async waiting for the initial settings ACK.
-  , _incomingFramesAsync :: Async ()
+  , _incomingFramesAsync :: Async (Either ClientError ())
   -- ^ Async responsible for ingesting all frames, increasing the
   -- maximum-received streamID and starting the frame dispatch. See
   -- 'dispatchFrames'.
@@ -212,7 +214,7 @@ data Http2ClientAsyncs = Http2ClientAsyncs {
 
 -- | Links all client's asyncs to current thread using:
 -- @ link someUnderlyingAsync @ .
-linkAsyncs :: Http2Client -> IO ()
+linkAsyncs :: Http2Client -> ClientIO ()
 linkAsyncs client =
     let Http2ClientAsyncs{..} = _asyncs client in do
             link _waitSettingsAsync
@@ -221,7 +223,7 @@ linkAsyncs client =
 -- | Synonym of '_goaway'.
 --
 -- https://github.com/http2/http2-spec/pull/366
-_gtfo :: Http2Client -> ErrorCodeId -> ByteString -> IO ()
+_gtfo :: Http2Client -> ErrorCodeId -> ByteString -> ClientIO ()
 _gtfo = _goaway
 
 -- | Opaque proof that a client stream was initialized.
@@ -234,29 +236,29 @@ data StreamThread = CST
 data Http2Stream = Http2Stream {
     _headers      :: HPACK.HeaderList
                   -> (FrameFlags -> FrameFlags)
-                  -> IO StreamThread
+                  -> ClientIO StreamThread
   -- ^ Starts the stream with HTTP headers. Flags modifier can use
   -- 'setEndStream' if no data is required passed the last block of headers.
   -- Usually, this is the only call needed to build an '_initStream'.
-  , _prio         :: Priority -> IO ()
+  , _prio         :: Priority -> ClientIO ()
   -- ^ Changes the PRIORITY of this stream.
-  , _rst          :: ErrorCodeId -> IO ()
+  , _rst          :: ErrorCodeId -> ClientIO ()
   -- ^ Resets this stream with a RST frame. You should not use this stream past this call.
-  , _waitEvent    :: IO StreamEvent
+  , _waitEvent    :: ClientIO StreamEvent
   -- ^ Waits for the next event on the stream.
-  , _sendDataChunk     :: (FrameFlags -> FrameFlags) -> ByteString -> IO ()
+  , _sendDataChunk     :: (FrameFlags -> FrameFlags) -> ByteString -> ClientIO ()
   -- ^ Sends a DATA frame chunk. You can use send empty frames with only
   -- headers modifiers to close streams. This function is oblivious to framing
   -- and hence does not respect the RFC if sending large blocks. Use 'sendData'
   -- to chunk and send naively according to server\'s preferences. This function
   -- can be useful if you intend to handle the framing yourself.
-  , _handlePushPromise :: StreamId -> HeaderList -> PushPromiseHandler -> IO ()
+  , _handlePushPromise :: StreamId -> HeaderList -> PushPromiseHandler -> ClientIO ()
   }
 
 -- | Sends HTTP trailers.
 --
 -- Trailers should be the last thing sent over a stream.
-trailers :: Http2Stream -> HPACK.HeaderList -> (FrameFlags -> FrameFlags) -> IO ()
+trailers :: Http2Stream -> HPACK.HeaderList -> (FrameFlags -> FrameFlags) -> ClientIO ()
 trailers stream hdrs flagmod = void $ _headers stream hdrs flagmod
 
 -- | Handler upon receiving a PUSH_PROMISE from the server.
@@ -269,7 +271,7 @@ trailers stream hdrs flagmod = void $ _headers stream hdrs flagmod
 -- client-initiated stream. Longer term we may move passing this handler to the
 -- '_startStream' instead of 'newHttp2Client' (as it is for now).
 type PushPromiseHandler =
-    StreamId -> Http2Stream -> HeaderList -> IncomingFlowControl -> OutgoingFlowControl -> IO ()
+    StreamId -> Http2Stream -> HeaderList -> IncomingFlowControl -> OutgoingFlowControl -> ClientIO ()
 
 -- | Starts a new stream (i.e., one HTTP request + server-pushes).
 --
@@ -306,7 +308,7 @@ type FlagSetter = FrameFlags -> FrameFlags
 -- Note that we currently enforce the 'HTTP2.setEndHeader' but this design
 -- choice may change in the future. Hence, we recommend you use
 -- 'HTTP2.setEndHeader' as well.
-headers :: Http2Stream -> HeaderList -> FlagSetter -> IO StreamThread
+headers :: Http2Stream -> HeaderList -> FlagSetter -> ClientIO StreamThread
 headers = _headers
 
 -- | Starts a new Http2Client around a frame connection.
@@ -334,9 +336,9 @@ runHttp2Client
   -> FallBackFrameHandler
   -- ^ Actions to run when a control frame is not yet handled in http2-client
   -- lib (e.g., PRIORITY frames).
-  -> (Http2Client -> IO a)
+  -> (Http2Client -> ClientIO a)
   -- ^ Actions to run on the client.
-  -> IO a
+  -> ClientIO a
 runHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler mainHandler = do
     (incomingLoop, initClient) <- initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
     withAsync incomingLoop $ \aIncoming -> do
@@ -377,7 +379,7 @@ newHttp2Client
   -> FallBackFrameHandler
   -- ^ Actions to run when a control frame is not yet handled in http2-client
   -- lib (e.g., PRIORITY frames).
-  -> IO Http2Client
+  -> ClientIO Http2Client
 newHttp2Client conn encoderBufSize decoderBufSize initSettings goAwayHandler fallbackHandler = do
     (incomingLoop, initClient) <- initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
     aIncoming <- async incomingLoop
@@ -402,26 +404,26 @@ initHttp2Client
   -> Int
   -> GoAwayHandler
   -> FallBackFrameHandler
-  -> IO (IO (), InitHttp2Client)
+  -> ClientIO (ClientIO (), InitHttp2Client)
 initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler = do
     let controlStream = makeFrameClientStream conn 0
     let ackPing = sendPingFrame controlStream HTTP2.setAck
     let ackSettings = sendSettingsFrame controlStream HTTP2.setAck []
 
     {- Setup for initial thread receiving server frames. -}
-    dispatch  <- newDispatchIO
-    dispatchControl <- newDispatchControlIO encoderBufSize
-                                            ackPing
-                                            ackSettings
-                                            goAwayHandler
-                                            fallbackHandler
+    dispatch  <- lift $ newDispatchIO
+    dispatchControl <- lift $ newDispatchControlIO encoderBufSize
+                                                   ackPing
+                                                   ackSettings
+                                                   goAwayHandler
+                                                   fallbackHandler
 
     let baseWindowSize = return HTTP2.defaultInitialWindowSize
-    _initIncomingFlowControl <- newIncomingFlowControl dispatchControl baseWindowSize (sendWindowUpdateFrame controlStream)
+    _initIncomingFlowControl <- lift $ newIncomingFlowControl dispatchControl baseWindowSize (sendWindowUpdateFrame controlStream)
     windowUpdatesChan <- newChan
-    _initOutgoingFlowControl <- newOutgoingFlowControl dispatchControl windowUpdatesChan baseWindowSize
+    _initOutgoingFlowControl <- lift $ newOutgoingFlowControl dispatchControl windowUpdatesChan baseWindowSize
 
-    dispatchHPACK <- newDispatchHPACKIO decoderBufSize
+    dispatchHPACK <- lift $ newDispatchHPACKIO decoderBufSize
     (incomingLoop,endIncomingLoop) <- dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
 
     {- Setup for client-initiated streams. -}
@@ -433,7 +435,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
 
     let _initStartStream getWork = do
-            maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
+            maxConcurrency <- lift $ fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
             roomNeeded <- atomicModifyIORef' conccurentStreams
                 (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
             if roomNeeded > 0
@@ -442,7 +444,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             else Right <$> do
                 windowUpdatesChan <- newChan
                 cont <- withClientStreamId $ \sid -> do
-                    dispatchStream <- newDispatchStreamIO sid
+                    dispatchStream <- lift $ newDispatchStreamIO sid
                     initializeStream conn
                                      dispatch
                                      dispatchControl
@@ -455,21 +457,21 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                 pure v
 
     let _initPing dat = do
-            handler <- registerPingHandler dispatchControl dat
+            handler <- lift $ registerPingHandler dispatchControl dat
             sendPingFrame controlStream id dat
-            return $ waitPingReply handler
+            return $ lift $ waitPingReply handler
 
     let _initSettings settslist = do
-            handler <- registerSetSettingsHandler dispatchControl
+            handler <- lift $ registerSetSettingsHandler dispatchControl
             sendSettingsFrame controlStream id settslist
             return $ do
-                ret <- waitSetSettingsReply handler
-                modifySettings dispatchControl
+                ret <- lift $ waitSetSettingsReply handler
+                lift $ modifySettings dispatchControl
                     (\(ConnectionSettings cli srv) ->
                         (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
                 return ret
     let _initGoaway err errStr = do
-            sId <- readMaxReceivedStreamIdIO dispatch
+            sId <- lift $ readMaxReceivedStreamIdIO dispatch
             sendGTFOFrame controlStream sId err errStr
 
     let _initPaylodSplitter = settingsPayloadSplitter <$> readSettings dispatchControl
@@ -488,7 +490,7 @@ initializeStream
   -> Chan (FrameHeader, FramePayload)
   -> (Http2Stream -> StreamDefinition a)
   -> StreamFSMState
-  -> IO (IO a)
+  -> ClientIO (ClientIO a)
 initializeStream conn dispatch control stream windowUpdatesChan getWork initialState = do
     let sid = _dispatchStreamId stream
     let frameStream = makeFrameClientStream conn sid
@@ -497,23 +499,23 @@ initializeStream conn dispatch control stream windowUpdatesChan getWork initialS
 
     -- Prepare handlers.
     let _headers headersList flags = do
-            splitter <- settingsPayloadSplitter <$> readSettings control
+            splitter <- lift $ settingsPayloadSplitter <$> readSettings control
             cst <- sendHeaders frameStream (_dispatchControlHpackEncoder control) headersList splitter flags
             when (testEndStream $ flags 0) $ do
-                closeLocalStream dispatch sid
+                lift $ closeLocalStream dispatch sid
             return cst
     let _waitEvent    = readChan events
     let _sendDataChunk flags dat = do
             sendDataFrame frameStream flags dat
             when (testEndStream $ flags 0) $ do
-                closeLocalStream dispatch sid
+                lift $ closeLocalStream dispatch sid
     let _rst = \err -> do
             sendResetFrame frameStream err
-            closeReleaseStream dispatch sid
+            lift $ closeReleaseStream dispatch sid
     let _prio           = sendPriorityFrame frameStream
     let _handlePushPromise ppSid ppHeaders ppHandler = do
             let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
-            newStream <- newDispatchStreamIO ppSid
+            newStream <- lift $ newDispatchStreamIO ppSid
             ppWindowsUpdatesChan <- newChan
             ppCont <- initializeStream conn
                                        dispatch
@@ -528,7 +530,7 @@ initializeStream conn dispatch control stream windowUpdatesChan getWork initialS
 
     -- Register handlers for receiving frames and perform the 1st action, the
     -- stream won't be idle anymore.
-    registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
+    lift $ registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
     _ <- _initStream streamActions
 
     -- Returns 2nd action.
@@ -536,9 +538,9 @@ initializeStream conn dispatch control stream windowUpdatesChan getWork initialS
     -- lock on clientStreamIdMutex will be released.
     return $ do
         let baseIncomingWindowSize = initialWindowSize . _clientSettings <$> readSettings control
-        isfc <- newIncomingFlowControl control baseIncomingWindowSize (sendWindowUpdateFrame frameStream)
+        isfc <- lift $ newIncomingFlowControl control baseIncomingWindowSize (sendWindowUpdateFrame frameStream)
         let baseOutgoingWindowSize = initialWindowSize . _serverSettings <$> readSettings control
-        osfc <- newOutgoingFlowControl control windowUpdatesChan baseOutgoingWindowSize
+        osfc <- lift $ newOutgoingFlowControl control windowUpdatesChan baseOutgoingWindowSize
         _handleStream streamActions isfc osfc
 
 dispatchLoop
@@ -548,9 +550,9 @@ dispatchLoop
   -> Chan (FrameHeader, FramePayload)
   -> IncomingFlowControl
   -> DispatchHPACK
-  -> IO (IO (), IO Bool)
+  -> ClientIO (ClientIO (), ClientIO Bool)
 dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
-    let getNextFrame = runExceptT (next conn) >>= either throwIO pure
+    let getNextFrame = next conn
     let go = delayException . forever $ do
             frame <- getNextFrame
             dispatchFramesStep frame d
@@ -561,19 +563,19 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
             whenFrame (hasTypeId [FrameWindowUpdate]) frame $ \got -> do
                 updateWindowsStep d got
             whenFrame (hasTypeId [FramePushPromise, FrameHeaders]) frame $ \got -> do
-                let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = do
+                let hpackLoop (FinishedWithHeaders curFh sId mkNewHdrs) = lift $ do
                         newHdrs <- mkNewHdrs
                         chan <- fmap _streamStateEvents <$> lookupStreamState d sId
                         let msg = StreamHeadersEvent curFh newHdrs
                         maybe (return ()) (flip writeChan msg) chan
-                    hpackLoop (FinishedWithPushPromise curFh parentSid newSid mkNewHdrs) = do
+                    hpackLoop (FinishedWithPushPromise curFh parentSid newSid mkNewHdrs) = lift $ do
                         newHdrs <- mkNewHdrs
                         chan <- fmap _streamStateEvents <$> lookupStreamState d parentSid
                         let msg = StreamPushPromiseEvent curFh newSid newHdrs
                         maybe (return ()) (flip writeChan msg) chan
                     hpackLoop (WaitContinuation act)        =
                         getNextFrame >>= act >>= hpackLoop
-                    hpackLoop (FailedHeaders curFh sId err)        = do
+                    hpackLoop (FailedHeaders curFh sId err)        = lift $ do
                         chan <- fmap _streamStateEvents <$> lookupStreamState d sId
                         let msg = StreamErrorEvent curFh err
                         maybe (return ()) (flip writeChan msg) chan
@@ -589,11 +591,11 @@ dispatchLoop conn d dc windowUpdatesChan inFlowControl dh = do
 handleRSTStep
   :: Dispatch
   -> (FrameHeader, FramePayload)
-  -> IO ()
+  -> ClientIO ()
 handleRSTStep d (fh, payload) = do
     let sid = streamId fh
     case payload of
-        (RSTStreamFrame err) -> do
+        (RSTStreamFrame err) -> lift $ do
             chan <- fmap _streamStateEvents <$> lookupStreamState d sid
             let msg = StreamErrorEvent fh (HTTP2.fromErrorCodeId err)
             maybe (return ()) (flip writeChan msg) chan
@@ -604,7 +606,7 @@ handleRSTStep d (fh, payload) = do
 dispatchFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
   -> Dispatch
-  -> IO ()
+  -> ClientIO ()
 dispatchFramesStep (fh,_) d = do
     let sid = streamId fh
     -- Remember highest streamId.
@@ -613,18 +615,18 @@ dispatchFramesStep (fh,_) d = do
 finalizeFramesStep
   :: (FrameHeader, Either HTTP2Error FramePayload)
   -> Dispatch
-  -> IO ()
+  -> ClientIO ()
 finalizeFramesStep (fh,_) d = do
     let sid = streamId fh
     -- Remote-close streams that match.
     when (testEndStream $ flags fh) $ do
-        closeRemoteStream d sid
+        lift $ closeRemoteStream d sid
 
 dispatchControlFramesStep
   :: Chan (FrameHeader, FramePayload)
   -> (FrameHeader, FramePayload)
   -> DispatchControl
-  -> IO ()
+  -> ClientIO ()
 dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(DispatchControl{..}) = do
     case payload of
         (SettingsFrame settsList)
@@ -632,17 +634,17 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
                 atomicModifyIORef' _dispatchControlConnectionSettings
                                    (\(ConnectionSettings cli srv) ->
                                       (ConnectionSettings cli (HTTP2.updateSettings srv settsList), ()))
-                maybe (return ())
+                lift $ maybe (return ())
                       (_applySettings _dispatchControlHpackEncoder)
                       (lookup SettingsHeaderTableSize settsList)
                 _dispatchControlAckSettings
-            | otherwise                 -> do
+            | otherwise                 -> lift $ do
                 handler <- lookupAndReleaseSetSettingsHandler control
                 maybe (return ()) (notifySetSettingsHandler controlFrame) handler
         (PingFrame pingMsg)
             | not . testAck . flags $ fh ->
                 _dispatchControlAckPing pingMsg
-            | otherwise                 -> do
+            | otherwise                 -> lift $ do
                 handler <- lookupAndReleasePingHandler control pingMsg
                 maybe (return ()) (notifyPingHandler controlFrame) handler
         (WindowUpdateFrame _ )  ->
@@ -663,18 +665,18 @@ creditDataFramesStep
   :: Dispatch
   -> IncomingFlowControl
   -> (FrameHeader, FramePayload)
-  -> IO ()
+  -> ClientIO ()
 creditDataFramesStep d flowControl (fh,payload) = do
     -- TODO: error if detect over-run. Current implementation credits
     -- everything back. Hence, over-run should never happen.
-    _ <- _consumeCredit flowControl (HTTP2.payloadLength fh)
-    _addCredit flowControl (HTTP2.payloadLength fh)
+    _ <- lift $ _consumeCredit flowControl (HTTP2.payloadLength fh)
+    lift $ _addCredit flowControl (HTTP2.payloadLength fh)
 
     -- Write to the interested streams.
     let sid = streamId fh
     case payload of
         (DataFrame dat) -> do
-            chan <- fmap _streamStateEvents <$> lookupStreamState d sid
+            chan <- lift $ fmap _streamStateEvents <$> lookupStreamState d sid
             maybe (return ()) (flip writeChan $ StreamDataEvent fh dat) chan
         _ ->
             error $ "expecting DataFrame but got " ++ show payload
@@ -682,10 +684,10 @@ creditDataFramesStep d flowControl (fh,payload) = do
 updateWindowsStep
   :: Dispatch
   -> (FrameHeader, FramePayload)
-  -> IO ()
+  -> ClientIO ()
 updateWindowsStep d got@(fh,_) = do
     let sid = HTTP2.streamId fh
-    chan <- fmap _streamStateWindowUpdatesChan <$> lookupStreamState d sid
+    chan <- lift $ fmap _streamStateWindowUpdatesChan <$> lookupStreamState d sid
     maybe (return ()) (flip writeChan got) chan --TODO: refer to RFC for erroring on idle/closed streams
 
 data HPACKLoopDecision =
@@ -693,7 +695,7 @@ data HPACKLoopDecision =
   | OpenPushPromise !StreamId !StreamId
 
 data HPACKStepResult =
-    WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> IO HPACKStepResult)
+    WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> ClientIO HPACKStepResult)
   | FailedHeaders !FrameHeader !StreamId ErrorCode
   | FinishedWithHeaders !FrameHeader !StreamId (IO HeaderList)
   | FinishedWithPushPromise !FrameHeader !StreamId !StreamId (IO HeaderList)
@@ -746,7 +748,7 @@ newIncomingFlowControl
   :: DispatchControl
   -> IO Int
   -- ^ Action to get the base window size.
-  -> (WindowSize -> IO())
+  -> (WindowSize -> ClientIO ())
   -- ^ Action to send the window update to the server.
   -> IO IncomingFlowControl
 newIncomingFlowControl control getBase doSendUpdate = do
@@ -759,7 +761,7 @@ newIncomingFlowControl control getBase doSendUpdate = do
             extra <- readIORef creditAdded
             return $ base + extra - conso
     let _updateWindow = do
-            base <- initialWindowSize . _clientSettings <$> readSettings control
+            base <- lift $ initialWindowSize . _clientSettings <$> readSettings control
             added <- readIORef creditAdded
             consumed <- readIORef creditConsumed
 
@@ -767,7 +769,7 @@ newIncomingFlowControl control getBase doSendUpdate = do
             let shouldUpdate = transferred > 0
 
             _addCredit (negate transferred)
-            _ <- _consumeCredit (negate transferred)
+            _ <- lift $ _consumeCredit (negate transferred)
             when shouldUpdate (doSendUpdate transferred)
 
             return shouldUpdate
@@ -785,7 +787,7 @@ newOutgoingFlowControl control frames getBase = do
     let receive n = atomicModifyIORef' credit (\c -> (c + n, ()))
     let withdraw 0 = return 0
         withdraw n = do
-            base <- getBase
+            base <- lift getBase
             got <- atomicModifyIORef' credit (\c ->
                     if base + c >= n
                     then (c - n, n)
@@ -793,7 +795,7 @@ newOutgoingFlowControl control frames getBase = do
             if got > 0
             then return got
             else do
-                amount <- race (waitSettingsChange base) (waitSomeCredit frames)
+                amount <- lift $ race (waitSettingsChange base) (waitSomeCredit frames)
                 receive (either (const 0) id amount)
                 withdraw n
     return $ OutgoingFlowControl receive withdraw
@@ -822,9 +824,9 @@ sendHeaders
   -> HeaderList
   -> PayloadSplitter
   -> (FrameFlags -> FrameFlags)
-  -> IO StreamThread
+  -> ClientIO StreamThread
 sendHeaders s enc hdrs blockSplitter flagmod = do
-    _sendFrames s mkFrames
+    _sendFrames s (lift mkFrames)
     return CST
   where
     mkFrames = do
@@ -874,9 +876,9 @@ fixedSizeChunks len bstr =
 -- streams, although no priority queue exists in `http2-client` so far).
 --
 -- Please refer to '_sendDataChunk' and '_withdrawCredit' as well.
-sendData :: Http2Client -> Http2Stream -> FlagSetter -> ByteString -> IO ()
+sendData :: Http2Client -> Http2Stream -> FlagSetter -> ByteString -> ClientIO ()
 sendData conn stream flagmod dat = do
-    splitter <- _payloadSplitter conn
+    splitter <- lift  $ _payloadSplitter conn
     let chunks = splitter dat
     let pairs  = reverse $ zip (flagmod : repeat id) (reverse chunks)
     when (null chunks) $ _sendDataChunk stream flagmod ""
@@ -884,17 +886,17 @@ sendData conn stream flagmod dat = do
 
 sendDataFrame
   :: Http2FrameClientStream
-  -> (FrameFlags -> FrameFlags) -> ByteString -> IO ()
+  -> (FrameFlags -> FrameFlags) -> ByteString -> ClientIO ()
 sendDataFrame s flagmod dat = do
     sendOne s flagmod (DataFrame dat)
 
-sendResetFrame :: Http2FrameClientStream -> ErrorCodeId -> IO ()
+sendResetFrame :: Http2FrameClientStream -> ErrorCodeId -> ClientIO ()
 sendResetFrame s err = do
     sendOne s id (RSTStreamFrame err)
 
 sendGTFOFrame
   :: Http2FrameClientStream
-     -> StreamId -> ErrorCodeId -> ByteString -> IO ()
+     -> StreamId -> ErrorCodeId -> ByteString -> ClientIO ()
 sendGTFOFrame s lastStreamId err errStr = do
     sendOne s id (GoAwayFrame lastStreamId err errStr)
 
@@ -905,7 +907,7 @@ sendPingFrame
   :: Http2FrameClientStream
   -> (FrameFlags -> FrameFlags)
   -> ByteString
-  -> IO ()
+  -> ClientIO ()
 sendPingFrame s flags dat
   | _getStreamId s /= 0        =
         rfcError "PING frames are not associated with any individual stream."
@@ -914,7 +916,7 @@ sendPingFrame s flags dat
   | otherwise                  = sendOne s flags (PingFrame dat)
 
 sendWindowUpdateFrame
-  :: Http2FrameClientStream -> WindowSize -> IO ()
+  :: Http2FrameClientStream -> WindowSize -> ClientIO ()
 sendWindowUpdateFrame s amount = do
     let payload = WindowUpdateFrame amount
     sendOne s id payload
@@ -922,7 +924,7 @@ sendWindowUpdateFrame s amount = do
 
 sendSettingsFrame
   :: Http2FrameClientStream
-     -> (FrameFlags -> FrameFlags) -> SettingsList -> IO ()
+     -> (FrameFlags -> FrameFlags) -> SettingsList -> ClientIO ()
 sendSettingsFrame s flags setts
   | _getStreamId s /= 0        =
         rfcError "The stream identifier for a SETTINGS frame MUST be zero (0x0)."
@@ -931,7 +933,7 @@ sendSettingsFrame s flags setts
     sendOne s flags payload
     return ()
 
-sendPriorityFrame :: Http2FrameClientStream -> Priority -> IO ()
+sendPriorityFrame :: Http2FrameClientStream -> Priority -> ClientIO ()
 sendPriorityFrame s p = do
     let payload = PriorityFrame p
     sendOne s id payload
@@ -950,9 +952,9 @@ sendPriorityFrame s p = do
 -- and future design will be to inline the various loop-processes for
 -- dispatchFrames and GoAwayHandlers in a same thread (e.g., using
 -- pipe/conduit to retain composability).
-delayException :: IO a -> IO a
+delayException :: ClientIO a -> ClientIO a
 delayException act = act `catch` slowdown
   where
-    slowdown :: SomeException -> IO a
+    slowdown :: SomeException -> ClientIO a
     slowdown e = threadDelay 50000 >> throwIO e
 
