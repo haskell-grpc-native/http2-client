@@ -412,19 +412,19 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
     let ackSettings = sendSettingsFrame controlStream HTTP2.setAck []
 
     {- Setup for initial thread receiving server frames. -}
-    dispatch  <- lift $ newDispatchIO
-    dispatchControl <- lift $ newDispatchControlIO encoderBufSize
-                                                   ackPing
-                                                   ackSettings
-                                                   goAwayHandler
-                                                   fallbackHandler
+    dispatch  <- newDispatchIO
+    dispatchControl <- newDispatchControlIO encoderBufSize
+                                            ackPing
+                                            ackSettings
+                                            goAwayHandler
+                                            fallbackHandler
 
     let baseWindowSize = return HTTP2.defaultInitialWindowSize
     _initIncomingFlowControl <- lift $ newIncomingFlowControl dispatchControl baseWindowSize (sendWindowUpdateFrame controlStream)
     windowUpdatesChan <- newChan
     _initOutgoingFlowControl <- lift $ newOutgoingFlowControl dispatchControl windowUpdatesChan baseWindowSize
 
-    dispatchHPACK <- lift $ newDispatchHPACKIO decoderBufSize
+    dispatchHPACK <- newDispatchHPACKIO decoderBufSize
     (incomingLoop,endIncomingLoop) <- dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
 
     {- Setup for client-initiated streams. -}
@@ -436,7 +436,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             (\k -> h (2 * k + 1)) -- Note: client StreamIds MUST be odd
 
     let _initStartStream getWork = do
-            maxConcurrency <- lift $ fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
+            maxConcurrency <- fromMaybe 100 . maxConcurrentStreams . _serverSettings <$> readSettings dispatchControl
             roomNeeded <- atomicModifyIORef' conccurentStreams
                 (\n -> if n < maxConcurrency then (n + 1, 0) else (n, 1 + n - maxConcurrency))
             if roomNeeded > 0
@@ -445,7 +445,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             else Right <$> do
                 windowUpdatesChan <- newChan
                 cont <- withClientStreamId $ \sid -> do
-                    dispatchStream <- lift $ newDispatchStreamIO sid
+                    dispatchStream <- newDispatchStreamIO sid
                     initializeStream conn
                                      dispatch
                                      dispatchControl
@@ -467,7 +467,7 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
             sendSettingsFrame controlStream id settslist
             return $ do
                 ret <- lift $ waitSetSettingsReply handler
-                lift $ modifySettings dispatchControl
+                modifySettings dispatchControl
                     (\(ConnectionSettings cli srv) ->
                         (ConnectionSettings (HTTP2.updateSettings cli settslist) srv, ()))
                 return ret
@@ -500,23 +500,23 @@ initializeStream conn dispatch control stream windowUpdatesChan getWork initialS
 
     -- Prepare handlers.
     let _headers headersList flags = do
-            splitter <- lift $ settingsPayloadSplitter <$> readSettings control
+            splitter <- settingsPayloadSplitter <$> readSettings control
             cst <- sendHeaders frameStream (_dispatchControlHpackEncoder control) headersList splitter flags
             when (testEndStream $ flags 0) $ do
-                lift $ closeLocalStream dispatch sid
+                closeLocalStream dispatch sid
             return cst
     let _waitEvent    = readChan events
     let _sendDataChunk flags dat = do
             sendDataFrame frameStream flags dat
             when (testEndStream $ flags 0) $ do
-                lift $ closeLocalStream dispatch sid
+                closeLocalStream dispatch sid
     let _rst = \err -> do
             sendResetFrame frameStream err
-            lift $ closeReleaseStream dispatch sid
+            closeReleaseStream dispatch sid
     let _prio           = sendPriorityFrame frameStream
     let _handlePushPromise ppSid ppHeaders ppHandler = do
             let mkStreamActions s = StreamDefinition (return CST) (ppHandler sid s ppHeaders)
-            newStream <- lift $ newDispatchStreamIO ppSid
+            newStream <- newDispatchStreamIO ppSid
             ppWindowsUpdatesChan <- newChan
             ppCont <- initializeStream conn
                                        dispatch
@@ -531,7 +531,7 @@ initializeStream conn dispatch control stream windowUpdatesChan getWork initialS
 
     -- Register handlers for receiving frames and perform the 1st action, the
     -- stream won't be idle anymore.
-    lift $ registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
+    registerStream dispatch sid (StreamState windowUpdatesChan events initialState)
     _ <- _initStream streamActions
 
     -- Returns 2nd action.
@@ -621,7 +621,7 @@ finalizeFramesStep (fh,_) d = do
     let sid = streamId fh
     -- Remote-close streams that match.
     when (testEndStream $ flags fh) $ do
-        lift $ closeRemoteStream d sid
+        closeRemoteStream d sid
 
 dispatchControlFramesStep
   :: Chan (FrameHeader, FramePayload)
@@ -639,13 +639,13 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
                       (_applySettings _dispatchControlHpackEncoder)
                       (lookup SettingsHeaderTableSize settsList)
                 _dispatchControlAckSettings
-            | otherwise                 -> lift $ do
+            | otherwise                 -> do
                 handler <- lookupAndReleaseSetSettingsHandler control
                 maybe (return ()) (notifySetSettingsHandler controlFrame) handler
         (PingFrame pingMsg)
             | not . testAck . flags $ fh ->
                 _dispatchControlAckPing pingMsg
-            | otherwise                 -> lift $ do
+            | otherwise                 -> do
                 handler <- lookupAndReleasePingHandler control pingMsg
                 maybe (return ()) (notifyPingHandler controlFrame) handler
         (WindowUpdateFrame _ )  ->
@@ -677,7 +677,7 @@ creditDataFramesStep d flowControl (fh,payload) = do
     let sid = streamId fh
     case payload of
         (DataFrame dat) -> do
-            chan <- lift $ fmap _streamStateEvents <$> lookupStreamState d sid
+            chan <- fmap _streamStateEvents <$> lookupStreamState d sid
             maybe (return ()) (flip writeChan $ StreamDataEvent fh dat) chan
         _ ->
             error $ "expecting DataFrame but got " ++ show payload
@@ -688,7 +688,7 @@ updateWindowsStep
   -> ClientIO ()
 updateWindowsStep d got@(fh,_) = do
     let sid = HTTP2.streamId fh
-    chan <- lift $ fmap _streamStateWindowUpdatesChan <$> lookupStreamState d sid
+    chan <- fmap _streamStateWindowUpdatesChan <$> lookupStreamState d sid
     maybe (return ()) (flip writeChan got) chan --TODO: refer to RFC for erroring on idle/closed streams
 
 data HPACKLoopDecision =
@@ -762,7 +762,7 @@ newIncomingFlowControl control getBase doSendUpdate = do
             extra <- readIORef creditAdded
             return $ base + extra - conso
     let _updateWindow = do
-            base <- lift $ initialWindowSize . _clientSettings <$> readSettings control
+            base <- initialWindowSize . _clientSettings <$> readSettings control
             added <- readIORef creditAdded
             consumed <- readIORef creditConsumed
 
@@ -796,7 +796,7 @@ newOutgoingFlowControl control frames getBase = do
             if got > 0
             then return got
             else do
-                amount <- lift $ race (waitSettingsChange base) (waitSomeCredit frames)
+                amount <- race (waitSettingsChange base) (waitSomeCredit frames)
                 receive (either (const 0) id amount)
                 withdraw n
     return $ OutgoingFlowControl receive withdraw

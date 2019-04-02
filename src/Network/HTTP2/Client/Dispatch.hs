@@ -1,8 +1,9 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE BangPatterns #-}
--- TOOD: use a non-concrete IO class where IO remains and ClientIO is too strong
 module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
+import           Control.Monad.Base (MonadBase, liftBase)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as ByteString
 import           Foreign.Marshal.Alloc (mallocBytes, finalizerFree)
@@ -74,22 +75,22 @@ data Dispatch = Dispatch {
   , _dispatchCurrentStreams :: !(IORef (IntMap StreamState))
   }
 
-newDispatchIO :: IO Dispatch
+newDispatchIO :: MonadBase IO m => m Dispatch
 newDispatchIO = Dispatch <$> newIORef 0 <*> newIORef (IntMap.empty)
 
-readMaxReceivedStreamIdIO :: Dispatch -> IO StreamId
+readMaxReceivedStreamIdIO :: MonadBase IO m => Dispatch -> m StreamId
 readMaxReceivedStreamIdIO = readIORef . _dispatchMaxStreamId
 
-registerStream :: Dispatch -> StreamId -> StreamState -> IO ()
+registerStream :: MonadBase IO m => Dispatch -> StreamId -> StreamState -> m ()
 registerStream d sid st =
     atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
       let v = (IntMap.insert sid st xs) in (v, ())
 
-lookupStreamState :: Dispatch -> StreamId -> IO (Maybe StreamState)
+lookupStreamState :: MonadBase IO m => Dispatch -> StreamId -> m (Maybe StreamState)
 lookupStreamState d sid =
     IntMap.lookup sid <$> readIORef (_dispatchCurrentStreams d)
 
-closeLocalStream :: Dispatch -> StreamId -> IO ()
+closeLocalStream :: MonadBase IO m => Dispatch -> StreamId -> m ()
 closeLocalStream d sid =
     atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
       let (_,v) = IntMap.updateLookupWithKey f sid xs in (v, ())
@@ -100,7 +101,7 @@ closeLocalStream d sid =
         Closed           -> Nothing
         _ -> Just $ st { _streamStateFSMState = HalfClosedLocal }
 
-closeRemoteStream :: Dispatch -> StreamId -> IO ()
+closeRemoteStream :: MonadBase IO m => Dispatch -> StreamId -> m ()
 closeRemoteStream d sid =
     atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
       let (_,v) = IntMap.updateLookupWithKey f sid xs in (v, ())
@@ -111,7 +112,7 @@ closeRemoteStream d sid =
         Closed           -> Nothing
         _ -> Just $ st { _streamStateFSMState = HalfClosedRemote }
 
-closeReleaseStream :: Dispatch -> StreamId -> IO ()
+closeReleaseStream :: MonadBase IO m => Dispatch -> StreamId -> m ()
 closeReleaseStream d sid =
     atomicModifyIORef' (_dispatchCurrentStreams d) $ \xs ->
       let v = (IntMap.delete sid xs) in (v, ())
@@ -128,24 +129,24 @@ defaultConnectionSettings =
 
 data PingHandler = PingHandler !(Chan (FrameHeader, FramePayload))
 
-newPingHandler :: IO PingHandler
+newPingHandler :: MonadBase IO m => m PingHandler
 newPingHandler = PingHandler <$> newChan
 
-notifyPingHandler :: (FrameHeader, FramePayload) -> PingHandler -> IO ()
+notifyPingHandler :: MonadBase IO m => (FrameHeader, FramePayload) -> PingHandler -> m ()
 notifyPingHandler dat (PingHandler c) = writeChan c dat
 
-waitPingReply :: PingHandler -> IO (FrameHeader, FramePayload)
+waitPingReply :: MonadBase IO m => PingHandler -> m (FrameHeader, FramePayload)
 waitPingReply (PingHandler c) = readChan c
 
 data SetSettingsHandler = SetSettingsHandler !(Chan (FrameHeader, FramePayload))
 
-newSetSettingsHandler :: IO SetSettingsHandler
+newSetSettingsHandler :: MonadBase IO m => m SetSettingsHandler
 newSetSettingsHandler = SetSettingsHandler <$> newChan
 
-notifySetSettingsHandler :: (FrameHeader, FramePayload) -> SetSettingsHandler -> IO ()
+notifySetSettingsHandler :: MonadBase IO m => (FrameHeader, FramePayload) -> SetSettingsHandler -> m ()
 notifySetSettingsHandler dat (SetSettingsHandler c) = writeChan c dat
 
-waitSetSettingsReply :: SetSettingsHandler -> IO (FrameHeader, FramePayload)
+waitSetSettingsReply :: MonadBase IO m => SetSettingsHandler -> m (FrameHeader, FramePayload)
 waitSetSettingsReply (SetSettingsHandler c) = readChan c
 
 registerPingHandler :: DispatchControl -> ByteString -> IO PingHandler
@@ -155,7 +156,7 @@ registerPingHandler dc dat = do
         ((dat,handler):xs, ()))
     return handler
 
-lookupAndReleasePingHandler :: DispatchControl -> ByteString -> IO (Maybe PingHandler)
+lookupAndReleasePingHandler :: MonadBase IO m => DispatchControl -> ByteString -> m (Maybe PingHandler)
 lookupAndReleasePingHandler dc dat =
     atomicModifyIORef' (_dispatchControlPingHandlers dc) f
   where
@@ -164,14 +165,14 @@ lookupAndReleasePingHandler dc dat =
     -- storing the handlers).
     f xs = (filter (\x -> dat /= fst x) xs, lookup dat xs)
 
-registerSetSettingsHandler :: DispatchControl -> IO SetSettingsHandler
+registerSetSettingsHandler :: MonadBase IO m => DispatchControl -> m SetSettingsHandler
 registerSetSettingsHandler dc = do
     handler <- newSetSettingsHandler
     atomicModifyIORef' (_dispatchControlSetSettingsHandlers dc) (\xs ->
         (handler:xs, ()))
     return handler
 
-lookupAndReleaseSetSettingsHandler :: DispatchControl -> IO (Maybe SetSettingsHandler)
+lookupAndReleaseSetSettingsHandler :: MonadBase IO m => DispatchControl -> m (Maybe SetSettingsHandler)
 lookupAndReleaseSetSettingsHandler dc =
     atomicModifyIORef' (_dispatchControlSetSettingsHandlers dc) f
   where
@@ -190,12 +191,13 @@ data DispatchControl = DispatchControl {
   }
 
 newDispatchControlIO
-  :: Size
+  :: MonadBase IO m
+  => Size
   -> (ByteString -> ClientIO ())
   -> (ClientIO ())
   -> GoAwayHandler
   -> FallBackFrameHandler
-  -> IO DispatchControl
+  -> m DispatchControl
 newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
     DispatchControl <$> newIORef defaultConnectionSettings
                     <*> newHpackEncoderContext encoderBufSize
@@ -206,8 +208,8 @@ newDispatchControlIO encoderBufSize ackPing ackSetts onGoAway onFallback =
                     <*> newIORef []
                     <*> newIORef []
 
-newHpackEncoderContext :: Size -> IO HpackEncoderContext
-newHpackEncoderContext encoderBufSize = do
+newHpackEncoderContext :: MonadBase IO m => Size -> m HpackEncoderContext
+newHpackEncoderContext encoderBufSize = liftBase $ do
     let strategy = (HPACK.defaultEncodeStrategy { HPACK.useHuffman = True })
     dt <- HPACK.newDynamicTableForEncoding HPACK.defaultDynamicTableSize
     buf <- mallocBytes encoderBufSize
@@ -223,10 +225,10 @@ newHpackEncoderContext encoderBufSize = do
             ([],len) -> pure $ ByteString.fromForeignPtr ptr 0 len
             (_,_)  -> throwIO HPACK.BufferOverrun
 
-readSettings :: DispatchControl -> IO ConnectionSettings
+readSettings :: MonadBase IO m => DispatchControl -> m ConnectionSettings
 readSettings = readIORef . _dispatchControlConnectionSettings
 
-modifySettings :: DispatchControl -> (ConnectionSettings -> (ConnectionSettings, a)) -> IO a
+modifySettings :: MonadBase IO m => DispatchControl -> (ConnectionSettings -> (ConnectionSettings, a)) -> m a
 modifySettings d = atomicModifyIORef' (_dispatchControlConnectionSettings d)
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
@@ -239,8 +241,8 @@ data DispatchHPACK = DispatchHPACK {
     _dispatchHPACKDynamicTable          :: !DynamicTable
   }
 
-newDispatchHPACKIO :: Size -> IO DispatchHPACK
-newDispatchHPACKIO decoderBufSize =
+newDispatchHPACKIO :: MonadBase IO m => Size -> m DispatchHPACK
+newDispatchHPACKIO decoderBufSize = liftBase $
     DispatchHPACK <$> newDecoder
   where
     newDecoder = newDynamicTableForDecoding
@@ -252,7 +254,7 @@ data DispatchStream = DispatchStream {
   , _dispatchStreamReadEvents :: !(Chan StreamEvent)
   }
 
-newDispatchStreamIO :: StreamId -> IO DispatchStream
-newDispatchStreamIO sid =
+newDispatchStreamIO :: MonadBase IO m => StreamId -> m DispatchStream
+newDispatchStreamIO sid = liftBase $
     DispatchStream <$> pure sid
                    <*> newChan
