@@ -419,10 +419,11 @@ initHttp2Client conn encoderBufSize decoderBufSize goAwayHandler fallbackHandler
                                             goAwayHandler
                                             fallbackHandler
 
-    let baseWindowSize = return HTTP2.defaultInitialWindowSize
-    _initIncomingFlowControl <- lift $ newIncomingFlowControl dispatchControl baseWindowSize (sendWindowUpdateFrame controlStream)
+    let baseIncomingWindowSize = initialWindowSize . _clientSettings <$> readSettings dispatchControl
+        baseOutgoingWindowSize = initialWindowSize . _serverSettings <$> readSettings dispatchControl
+    _initIncomingFlowControl <- lift $ newIncomingFlowControl dispatchControl baseIncomingWindowSize (sendWindowUpdateFrame controlStream)
     windowUpdatesChan <- newChan
-    _initOutgoingFlowControl <- lift $ newOutgoingFlowControl dispatchControl windowUpdatesChan baseWindowSize
+    _initOutgoingFlowControl <- lift $ newOutgoingFlowControl dispatchControl windowUpdatesChan baseOutgoingWindowSize
 
     dispatchHPACK <- newDispatchHPACKIO decoderBufSize
     (incomingLoop,endIncomingLoop) <- dispatchLoop conn dispatch dispatchControl windowUpdatesChan _initIncomingFlowControl dispatchHPACK
