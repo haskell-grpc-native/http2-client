@@ -2,6 +2,8 @@
 
 ## Unreleased changes
 
+- Export frameHttp2RawConnection to convert an RawHttp2Connection into an Http2FrameConnection.
+
 ## v0.9.0.0
 
 - introduce ClientIO as an error-carrying IO-monad for performing http2-calls
