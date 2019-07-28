@@ -5,6 +5,7 @@
 module Network.HTTP2.Client.RawConnection (
       RawHttp2Connection (..)
     , newRawHttp2Connection
+    , newRawHttp2ConnectionUnix
     , newRawHttp2ConnectionSocket
     ) where
 
@@ -54,6 +55,22 @@ newRawHttp2Connection host port mparams = do
         skt <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
         setSocketOption skt NoDelay 1
         connect skt (addrAddress addr)
+        pure skt
+    newRawHttp2ConnectionSocket rSkt mparams
+
+-- | Initiates a RawHttp2Connection with a unix domain socket.
+--
+-- The current code does not handle closing the connexion, yikes.
+newRawHttp2ConnectionUnix :: String
+                          -- ^ Path to the socket.
+                          -> Maybe TLS.ClientParams
+                          -- ^ TLS parameters. The 'TLS.onSuggestALPN' hook is
+                          -- overwritten to always return ["h2", "h2-17"].
+                          -> ClientIO RawHttp2Connection
+newRawHttp2ConnectionUnix path mparams = do
+    rSkt <- lift $ do
+        skt <- socket AF_UNIX Stream 0
+        connect skt $ SockAddrUnix path
         pure skt
     newRawHttp2ConnectionSocket rSkt mparams
 

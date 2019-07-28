@@ -3,6 +3,7 @@
 ## Unreleased changes
 
 - Export frameHttp2RawConnection to convert an RawHttp2Connection into an Http2FrameConnection.
+- Add newRawHttp2ConnectionUnix to create a RawHttp2Connection from a unix domain socket.
 
 ## v0.9.0.0
 
