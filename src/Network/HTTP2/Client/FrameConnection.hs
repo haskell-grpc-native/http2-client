@@ -6,6 +6,7 @@
 module Network.HTTP2.Client.FrameConnection (
       Http2FrameConnection(..)
     , newHttp2FrameConnection
+    , frameHttp2RawConnection
     -- * Interact at the Frame level.
     , Http2ServerStream(..)
     , Http2FrameClientStream(..)
@@ -79,14 +80,14 @@ frameHttp2RawConnection
 frameHttp2RawConnection http2conn = do
     -- Prepare a local mutex, this mutex should never escape the
     -- function's scope. Else it might lead to bugs (e.g.,
-    -- https://ro-che.info/articles/2014-07-30-bracket ) 
-    writerMutex <- newMVar () 
+    -- https://ro-che.info/articles/2014-07-30-bracket )
+    writerMutex <- newMVar ()
 
     let writeProtect io =
             bracket (takeMVar writerMutex) (putMVar writerMutex) (const io)
 
     -- Define handlers.
-    let makeClientStream streamID = 
+    let makeClientStream streamID =
             let putFrame modifyFF frame =
                     let info = encodeInfo modifyFF streamID
                     in HTTP2.encodeFrame info frame
