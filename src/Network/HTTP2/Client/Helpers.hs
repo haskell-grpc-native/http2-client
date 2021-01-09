@@ -116,11 +116,12 @@ upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
 -- This function is fine if you don't want to consume results in chunks.  See
 -- 'fromStreamResult' to collect the complicated 'StreamResult' into a simpler
 -- 'StramResponse'.
-waitStream :: Http2Stream
+waitStream :: Http2Client
+           -> Http2Stream
            -> IncomingFlowControl
            -> PushPromiseHandler
            -> ClientIO StreamResult
-waitStream stream streamFlowControl ppHandler = do
+waitStream conn stream streamFlowControl ppHandler = do
     ev <- _waitEvent stream
     case ev of
         StreamHeadersEvent fH hdrs
@@ -131,10 +132,11 @@ waitStream stream streamFlowControl ppHandler = do
                 return (Right hdrs, reverse dfrms, trls)
         StreamPushPromiseEvent _ ppSid ppHdrs -> do
             _handlePushPromise stream ppSid ppHdrs ppHandler
-            waitStream stream streamFlowControl ppHandler
+            waitStream conn stream streamFlowControl ppHandler
         _ ->
             error $ "expecting StreamHeadersEvent but got " ++ show ev
   where
+    connFlowControl = _incomingFlowControl conn
     waitDataFrames xs = do
         ev <- _waitEvent stream
         case ev of
@@ -142,9 +144,13 @@ waitStream stream streamFlowControl ppHandler = do
                 | HTTP2.testEndStream (HTTP2.flags fh) ->
                     return ((Right x):xs, Nothing)
                 | otherwise                            -> do
-                    _ <- lift $ _consumeCredit streamFlowControl (HTTP2.payloadLength fh)
-                    lift $ _addCredit streamFlowControl (HTTP2.payloadLength fh)
+                    let size = HTTP2.payloadLength fh
+                    _ <- lift $ _consumeCredit streamFlowControl size
+                    lift $ _addCredit streamFlowControl size
                     _ <- _updateWindow $ streamFlowControl
+                    _ <- lift $ _consumeCredit connFlowControl size
+                    lift $ _addCredit connFlowControl size
+                    _ <- _updateWindow $ connFlowControl
                     waitDataFrames ((Right x):xs)
             StreamPushPromiseEvent _ ppSid ppHdrs -> do
                 _handlePushPromise stream ppSid ppHdrs ppHandler

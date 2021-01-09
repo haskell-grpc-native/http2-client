@@ -85,7 +85,7 @@ client-originated streams (however with its own flow-control context).
 >             resetPushPromises _ pps _ _ _ = _rst pps RefusedStream
 >
 >             handler sfc _ = do
->                 waitStream stream sfc resetPushPromises >>= print . fromStreamResult
+>                 waitStream conn stream sfc resetPushPromises >>= print . fromStreamResult
 
 We've defined an initializer and a handler so far.
 
