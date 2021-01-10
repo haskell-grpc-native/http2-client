@@ -148,8 +148,6 @@ waitStream conn stream streamFlowControl ppHandler = do
                     _ <- lift $ _consumeCredit streamFlowControl size
                     lift $ _addCredit streamFlowControl size
                     _ <- _updateWindow $ streamFlowControl
-                    _ <- lift $ _consumeCredit connFlowControl size
-                    lift $ _addCredit connFlowControl size
                     _ <- _updateWindow $ connFlowControl
                     waitDataFrames ((Right x):xs)
             StreamPushPromiseEvent _ ppSid ppHdrs -> do
