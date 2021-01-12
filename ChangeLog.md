@@ -2,6 +2,9 @@
 
 ## Unreleased changes
 
+- Change `waitStream` so that it automatically credits the connection. This
+  is a breaking change due to function signature change.
+
 ## v0.10.0.0
 
 - Export frameHttp2RawConnection to convert an RawHttp2Connection into an Http2FrameConnection.

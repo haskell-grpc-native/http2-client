@@ -115,10 +115,13 @@ upload dat flagmod conn connectionFlowControl stream streamFlowControl = do
 --
 -- This function is fine if you don't want to consume results in chunks.  See
 -- 'fromStreamResult' to collect the complicated 'StreamResult' into a simpler
--- 'StramResponse'.
+-- 'StreamResponse'.
 waitStream :: Http2Client
+           -- ^The connection.
            -> Http2Stream
+           -- ^The stream to wait on. This stream must be part of the connection.
            -> IncomingFlowControl
+           -- ^Incoming flow control for the __stream__.
            -> PushPromiseHandler
            -> ClientIO StreamResult
 waitStream conn stream streamFlowControl ppHandler = do
@@ -148,6 +151,14 @@ waitStream conn stream streamFlowControl ppHandler = do
                     _ <- lift $ _consumeCredit streamFlowControl size
                     lift $ _addCredit streamFlowControl size
                     _ <- _updateWindow $ streamFlowControl
+                    -- We also send a WINDOW_UPDATE for the connection in order
+                    -- to not rely on external updateWindow calls. This reduces
+                    -- latency and makes the function less error-prone to use.
+                    -- Note that the main loop (dispatchLoop) already credits
+                    -- the connection for received data frames, but it does not
+                    -- send the WINDOW_UPDATE frames.. That is why we only send
+                    -- those frames here, and we do not credit the connection
+                    --  as we do the stream in the preceding lines.
                     _ <- _updateWindow $ connFlowControl
                     waitDataFrames ((Right x):xs)
             StreamPushPromiseEvent _ ppSid ppHdrs -> do
