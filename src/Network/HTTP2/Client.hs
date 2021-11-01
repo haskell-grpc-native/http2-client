@@ -283,7 +283,7 @@ type PushPromiseHandler =
 --
 -- Please refer to 'StreamStarter' and 'StreamDefinition' for more.
 withHttp2Stream :: Http2Client -> StreamStarter a
-withHttp2Stream = _startStream
+withHttp2Stream c s = _startStream c s
 
 -- | Type synonym for functions that modify flags.
 --
