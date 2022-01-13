@@ -1,0 +1,7 @@
+resolver: nightly-2022-01-10
+packages:
+  - "."
+extra-deps:
+  - http2-2.0.6
+flags: {}
+extra-package-dbs: []
