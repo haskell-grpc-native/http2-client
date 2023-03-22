@@ -4,10 +4,12 @@ module Network.HTTP2.Client.Exceptions (
   , ClientError(..)
   , runClientIO
   , module Control.Monad.Except
+  , module Control.Monad.Trans
   ) where
 
+import           Control.Monad.Trans (lift)
 import           Control.Exception (Exception)
-import           Control.Monad.Except (ExceptT, runExceptT, throwError, lift)
+import           Control.Monad.Except (ExceptT, runExceptT, throwError)
 
 type ClientIO = ExceptT ClientError IO
 
