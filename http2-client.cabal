@@ -22,7 +22,7 @@ library
                      , Network.HTTP2.Client.RawConnection
   other-modules:       Network.HTTP2.Client.Channels
                      , Network.HTTP2.Client.Dispatch
-  build-depends:       base >= 4.7 && < 4.17
+  build-depends:       base >= 4.7 && < 4.19
                      , async >= 2.1 && < 2.3
                      , bytestring >= 0.10 && < 0.12
                      , containers >= 0.5 && < 0.7
@@ -33,8 +33,8 @@ library
                      , mtl >= 2.2 && < 2.4
                      , network >= 2.6 && < 3.2
                      , stm >= 2.4 && < 2.6
-                     , time >= 1.8 && < 1.12
-                     , tls >= 1.4 && < 1.6
+                     , time >= 1.8 && < 1.13
+                     , tls >= 1.4 && < 1.9
                      , transformers-base >= 0.4 && < 0.5
   default-language:    Haskell2010
 
