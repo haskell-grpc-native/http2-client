@@ -22,7 +22,8 @@ import           Control.Exception.Lifted (bracket)
 import           Control.Concurrent.MVar.Lifted (newMVar, takeMVar, putMVar)
 import           Control.Monad ((>=>), void, when)
 import qualified Data.ByteString as ByteString
-import           Network.HTTP2.Frame (FrameHeader(..), FrameFlags, FramePayload, HTTP2Error, encodeInfo, decodeFramePayload)
+import           Network.HTTP2.Client (HTTP2Error)
+import           Network.HTTP2.Frame (FrameHeader(..), FrameFlags, FramePayload, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2.Frame as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import qualified Network.TLS as TLS
