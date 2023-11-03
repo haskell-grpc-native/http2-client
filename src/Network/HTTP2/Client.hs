@@ -599,7 +599,7 @@ handleRSTStep d (fh, payload) = do
     case payload of
         (RSTStreamFrame err) -> lift $ do
             chan <- fmap _streamStateEvents <$> lookupStreamState d sid
-            let msg = StreamErrorEvent fh (HTTP2.fromErrorCodeId err)
+            let msg = StreamErrorEvent fh (HTTP2.fromErrorCode err)
             maybe (return ()) (flip writeChan msg) chan
             closeReleaseStream d sid
         _ ->
