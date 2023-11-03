@@ -599,7 +599,7 @@ handleRSTStep d (fh, payload) = do
     case payload of
         (RSTStreamFrame err) -> lift $ do
             chan <- fmap _streamStateEvents <$> lookupStreamState d sid
-            let msg = StreamErrorEvent fh (HTTP2.fromErrorCode err)
+            let msg = StreamErrorEvent fh err
             maybe (return ()) (flip writeChan msg) chan
             closeReleaseStream d sid
         _ ->
@@ -743,7 +743,7 @@ dispatchHPACKFramesStep (fh,fp) (DispatchHPACK{..}) =
             OpenPushPromise parentSid newSid ->
                 FinishedWithPushPromise curFh parentSid newSid (decodeHeader _dispatchHPACKDynamicTable buffer)
     go curFh _ (Left err) =
-        FailedHeaders curFh sid (HTTP2.fromErrorCode err)
+        FailedHeaders curFh sid err
 
 
 newIncomingFlowControl
