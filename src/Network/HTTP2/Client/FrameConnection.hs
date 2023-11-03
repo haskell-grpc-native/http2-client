@@ -2,7 +2,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE PackageImports #-}
 
 module Network.HTTP2.Client.FrameConnection (
       Http2FrameConnection(..)
@@ -23,8 +22,7 @@ import           Control.Exception.Lifted (bracket)
 import           Control.Concurrent.MVar.Lifted (newMVar, takeMVar, putMVar)
 import           Control.Monad ((>=>), void, when)
 import qualified Data.ByteString as ByteString
-import           "http2" Network.HTTP2.Client (HTTP2Error)
-import           Network.HTTP2.Frame (FrameHeader(..), FrameFlags, FramePayload, encodeInfo, decodeFramePayload)
+import           Network.HTTP2.Frame (FrameHeader(..), FrameFlags, FramePayload, FrameDecodeError, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2.Frame as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import qualified Network.TLS as TLS
@@ -68,11 +66,11 @@ sendBackToBack :: Http2FrameClientStream -> [(FrameFlags -> FrameFlags, FramePay
 sendBackToBack client payloads = _sendFrames client (pure payloads)
 
 data Http2ServerStream = Http2ServerStream {
-    _nextHeaderAndFrame :: ClientIO (FrameHeader, Either HTTP2Error FramePayload)
+    _nextHeaderAndFrame :: ClientIO (FrameHeader, Either FrameDecodeError FramePayload)
   }
 
 -- | Waits for the next frame from the server.
-next :: Http2FrameConnection -> ClientIO (FrameHeader, Either HTTP2Error FramePayload)
+next :: Http2FrameConnection -> ClientIO (FrameHeader, Either FrameDecodeError FramePayload)
 next = _nextHeaderAndFrame . _serverStream
 
 -- | Adds framing around a 'RawHttp2Connection'.

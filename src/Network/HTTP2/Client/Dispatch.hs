@@ -1,6 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE PackageImports #-}
 module Network.HTTP2.Client.Dispatch where
 
 import           Control.Exception (throwIO)
@@ -16,12 +15,11 @@ import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import qualified Network.HPACK.Token as HPACK
 import           Network.HTTP2.Frame as HTTP2
-import           "http2" Network.HTTP2.Client (HTTP2Error)
 
 import           Network.HTTP2.Client.Channels
 import           Network.HTTP2.Client.Exceptions
 
-type DispatchChan = FramesChan HTTP2Error
+type DispatchChan = FramesChan FrameDecodeError
 
 -- | A fallback handler for frames.
 type FallBackFrameHandler = (FrameHeader, FramePayload) -> ClientIO ()

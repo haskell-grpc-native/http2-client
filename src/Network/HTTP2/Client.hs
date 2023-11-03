@@ -606,7 +606,7 @@ handleRSTStep d (fh, payload) = do
             error $ "expecting RSTFrame but got " ++ show payload
 
 dispatchFramesStep
-  :: (FrameHeader, Either HTTP2Error FramePayload)
+  :: (FrameHeader, Either FrameDecodeError FramePayload)
   -> Dispatch
   -> ClientIO ()
 dispatchFramesStep (fh,_) d = do
@@ -615,7 +615,7 @@ dispatchFramesStep (fh,_) d = do
     atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
 
 finalizeFramesStep
-  :: (FrameHeader, Either HTTP2Error FramePayload)
+  :: (FrameHeader, Either FrameDecodeError FramePayload)
   -> Dispatch
   -> ClientIO ()
 finalizeFramesStep (fh,_) d = do
@@ -697,7 +697,7 @@ data HPACKLoopDecision =
   | OpenPushPromise !StreamId !StreamId
 
 data HPACKStepResult =
-    WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> ClientIO HPACKStepResult)
+    WaitContinuation !((FrameHeader, Either FrameDecodeError FramePayload) -> ClientIO HPACKStepResult)
   | FailedHeaders !FrameHeader !StreamId ErrorCode
   | FinishedWithHeaders !FrameHeader !StreamId (IO HeaderList)
   | FinishedWithPushPromise !FrameHeader !StreamId !StreamId (IO HeaderList)
