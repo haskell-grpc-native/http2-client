@@ -1,7 +1,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards  #-}
-{-# LANGUAGE RankNTypes  #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE PackageImports #-}
 
 module Network.HTTP2.Client.FrameConnection (
       Http2FrameConnection(..)
@@ -22,7 +23,7 @@ import           Control.Exception.Lifted (bracket)
 import           Control.Concurrent.MVar.Lifted (newMVar, takeMVar, putMVar)
 import           Control.Monad ((>=>), void, when)
 import qualified Data.ByteString as ByteString
-import           Network.HTTP2.Client (HTTP2Error)
+import           "http2" Network.HTTP2.Client (HTTP2Error)
 import           Network.HTTP2.Frame (FrameHeader(..), FrameFlags, FramePayload, encodeInfo, decodeFramePayload)
 import qualified Network.HTTP2.Frame as HTTP2
 import           Network.Socket (HostName, PortNumber)
