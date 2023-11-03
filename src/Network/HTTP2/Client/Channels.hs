@@ -11,7 +11,7 @@ module Network.HTTP2.Client.Channels (
 
 import           Control.Concurrent.Chan.Lifted (Chan, readChan, newChan, writeChan)
 import           Control.Exception.Lifted (Exception, throwIO)
-import           Network.HTTP2.Frame (StreamId, FrameHeader, FramePayload, FrameTypeId, framePayloadToFrameTypeId, streamId)
+import           Network.HTTP2.Frame (StreamId, FrameHeader, FramePayload, FrameType, framePayloadToFrameType, streamId)
 
 import           Network.HTTP2.Client.Exceptions
 
@@ -42,5 +42,5 @@ whenFrameElse test (fHead, fPayload) handleTrue handleFalse = do
 hasStreamId :: StreamId -> FrameHeader -> FramePayload -> Bool
 hasStreamId sid h _ = streamId h == sid
 
-hasTypeId :: [FrameTypeId] -> FrameHeader -> FramePayload -> Bool
-hasTypeId tids _ p = framePayloadToFrameTypeId p `elem` tids
+hasTypeId :: [FrameType] -> FrameHeader -> FramePayload -> Bool
+hasTypeId tids _ p = framePayloadToFrameType p `elem` tids
