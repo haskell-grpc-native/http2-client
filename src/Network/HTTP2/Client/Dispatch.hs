@@ -14,7 +14,7 @@ import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import qualified Network.HPACK.Token as HPACK
-import           Network.HTTP2 as HTTP2
+import           Network.HTTP2.Frame as HTTP2
 
 import           Network.HTTP2.Client.Channels
 import           Network.HTTP2.Client.Exceptions
