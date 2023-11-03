@@ -29,7 +29,7 @@ ignoreFallbackHandler :: FallBackFrameHandler
 ignoreFallbackHandler = const $ pure ()
 
 -- | An exception thrown when the server sends a GoAwayFrame.
-data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteString
+data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCode !ByteString
   deriving Show
 instance Exception RemoteSentGoAwayFrame
 
