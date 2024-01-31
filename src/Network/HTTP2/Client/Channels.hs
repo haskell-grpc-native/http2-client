@@ -11,9 +11,11 @@ module Network.HTTP2.Client.Channels (
 
 import           Control.Concurrent.Chan.Lifted (Chan, readChan, newChan, writeChan)
 import           Control.Exception.Lifted (Exception, throwIO)
-import           Network.HTTP2.Frame (StreamId, FrameHeader, FramePayload, FrameType, framePayloadToFrameType, streamId)
+import           Network.HTTP2.Frame (StreamId, FrameHeader, FramePayload, FrameType, FrameDecodeError, framePayloadToFrameType, streamId)
 
 import           Network.HTTP2.Client.Exceptions
+
+instance Exception FrameDecodeError
 
 type FramesChan e = Chan (FrameHeader, Either e FramePayload)
 
