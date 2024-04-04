@@ -21,7 +21,7 @@ module Network.HTTP2.Client.Helpers (
   ) where
 
 import           Data.Time.Clock (UTCTime, getCurrentTime)
-import qualified Network.HTTP2 as HTTP2
+import qualified Network.HTTP2.Frame as HTTP2
 import qualified Network.HPACK as HPACK
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString

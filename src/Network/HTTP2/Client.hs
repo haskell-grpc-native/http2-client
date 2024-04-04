@@ -57,7 +57,7 @@ import qualified Data.ByteString as ByteString
 import           Data.IORef.Lifted (newIORef, atomicModifyIORef', readIORef)
 import           Data.Maybe (fromMaybe)
 import           Network.HPACK as HPACK
-import           Network.HTTP2 as HTTP2
+import           Network.HTTP2.Frame as HTTP2
 import           Network.Socket (HostName, PortNumber)
 import           Network.TLS (ClientParams)
 
@@ -166,7 +166,7 @@ data Http2Client = Http2Client {
   -- is provided. Only the first call to this IO will return if a reply is
   -- received. Hence we recommend wrapping this IO in an Async (e.g., with
   -- @race (threadDelay timeout)@.)
-  , _goaway           :: ErrorCodeId -> ByteString -> ClientIO ()
+  , _goaway           :: ErrorCode -> ByteString -> ClientIO ()
   -- ^ Sends a GOAWAY.
   , _startStream      :: forall a. StreamStarter a
   -- ^ Spawns new streams. See 'StreamStarter'.
@@ -188,7 +188,7 @@ data Http2Client = Http2Client {
 data InitHttp2Client = InitHttp2Client {
     _initPing                :: ByteString -> ClientIO (ClientIO (FrameHeader, FramePayload))
   , _initSettings            :: SettingsList -> ClientIO (ClientIO (FrameHeader, FramePayload))
-  , _initGoaway              :: ErrorCodeId -> ByteString -> ClientIO ()
+  , _initGoaway              :: ErrorCode -> ByteString -> ClientIO ()
   , _initStartStream         :: forall a. StreamStarter a
   , _initIncomingFlowControl :: IncomingFlowControl
   , _initOutgoingFlowControl :: OutgoingFlowControl
@@ -224,7 +224,7 @@ linkAsyncs client =
 -- | Synonym of '_goaway'.
 --
 -- https://github.com/http2/http2-spec/pull/366
-_gtfo :: Http2Client -> ErrorCodeId -> ByteString -> ClientIO ()
+_gtfo :: Http2Client -> ErrorCode -> ByteString -> ClientIO ()
 _gtfo = _goaway
 
 -- | Opaque proof that a client stream was initialized.
@@ -243,7 +243,7 @@ data Http2Stream = Http2Stream {
   -- Usually, this is the only call needed to build an '_initStream'.
   , _prio         :: Priority -> ClientIO ()
   -- ^ Changes the PRIORITY of this stream.
-  , _rst          :: ErrorCodeId -> ClientIO ()
+  , _rst          :: ErrorCode -> ClientIO ()
   -- ^ Resets this stream with a RST frame. You should not use this stream past this call.
   , _waitEvent    :: ClientIO StreamEvent
   -- ^ Waits for the next event on the stream.
@@ -599,14 +599,14 @@ handleRSTStep d (fh, payload) = do
     case payload of
         (RSTStreamFrame err) -> lift $ do
             chan <- fmap _streamStateEvents <$> lookupStreamState d sid
-            let msg = StreamErrorEvent fh (HTTP2.fromErrorCodeId err)
+            let msg = StreamErrorEvent fh err
             maybe (return ()) (flip writeChan msg) chan
             closeReleaseStream d sid
         _ ->
             error $ "expecting RSTFrame but got " ++ show payload
 
 dispatchFramesStep
-  :: (FrameHeader, Either HTTP2Error FramePayload)
+  :: (FrameHeader, Either FrameDecodeError FramePayload)
   -> Dispatch
   -> ClientIO ()
 dispatchFramesStep (fh,_) d = do
@@ -615,7 +615,7 @@ dispatchFramesStep (fh,_) d = do
     atomicModifyIORef' (_dispatchMaxStreamId d) (\n -> (max n sid, ()))
 
 finalizeFramesStep
-  :: (FrameHeader, Either HTTP2Error FramePayload)
+  :: (FrameHeader, Either FrameDecodeError FramePayload)
   -> Dispatch
   -> ClientIO ()
 finalizeFramesStep (fh,_) d = do
@@ -697,7 +697,7 @@ data HPACKLoopDecision =
   | OpenPushPromise !StreamId !StreamId
 
 data HPACKStepResult =
-    WaitContinuation !((FrameHeader, Either HTTP2Error FramePayload) -> ClientIO HPACKStepResult)
+    WaitContinuation !((FrameHeader, Either FrameDecodeError FramePayload) -> ClientIO HPACKStepResult)
   | FailedHeaders !FrameHeader !StreamId ErrorCode
   | FinishedWithHeaders !FrameHeader !StreamId (IO HeaderList)
   | FinishedWithPushPromise !FrameHeader !StreamId !StreamId (IO HeaderList)
@@ -721,7 +721,7 @@ dispatchHPACKFramesStep (fh,fp) (DispatchHPACK{..}) =
     sid :: StreamId
     sid = HTTP2.streamId fh
 
-    go :: FrameHeader -> HPACKLoopDecision -> Either ErrorCodeId ByteString -> HPACKStepResult
+    go :: FrameHeader -> HPACKLoopDecision -> Either ErrorCode ByteString -> HPACKStepResult
     go curFh decision (Right buffer) =
         if not $ HTTP2.testEndHeader (HTTP2.flags curFh)
         then WaitContinuation $ \frame -> do
@@ -743,7 +743,7 @@ dispatchHPACKFramesStep (fh,fp) (DispatchHPACK{..}) =
             OpenPushPromise parentSid newSid ->
                 FinishedWithPushPromise curFh parentSid newSid (decodeHeader _dispatchHPACKDynamicTable buffer)
     go curFh _ (Left err) =
-        FailedHeaders curFh sid (HTTP2.fromErrorCodeId err)
+        FailedHeaders curFh sid err
 
 
 newIncomingFlowControl
@@ -892,13 +892,13 @@ sendDataFrame
 sendDataFrame s flagmod dat = do
     sendOne s flagmod (DataFrame dat)
 
-sendResetFrame :: Http2FrameClientStream -> ErrorCodeId -> ClientIO ()
+sendResetFrame :: Http2FrameClientStream -> ErrorCode -> ClientIO ()
 sendResetFrame s err = do
     sendOne s id (RSTStreamFrame err)
 
 sendGTFOFrame
   :: Http2FrameClientStream
-     -> StreamId -> ErrorCodeId -> ByteString -> ClientIO ()
+     -> StreamId -> ErrorCode -> ByteString -> ClientIO ()
 sendGTFOFrame s lastStreamId err errStr = do
     sendOne s id (GoAwayFrame lastStreamId err errStr)
 

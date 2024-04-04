@@ -14,12 +14,12 @@ import qualified Data.IntMap as IntMap
 import           GHC.Exception (Exception)
 import           Network.HPACK as HPACK
 import qualified Network.HPACK.Token as HPACK
-import           Network.HTTP2 as HTTP2
+import           Network.HTTP2.Frame as HTTP2
 
 import           Network.HTTP2.Client.Channels
 import           Network.HTTP2.Client.Exceptions
 
-type DispatchChan = FramesChan HTTP2Error
+type DispatchChan = FramesChan FrameDecodeError
 
 -- | A fallback handler for frames.
 type FallBackFrameHandler = (FrameHeader, FramePayload) -> ClientIO ()
@@ -29,7 +29,7 @@ ignoreFallbackHandler :: FallBackFrameHandler
 ignoreFallbackHandler = const $ pure ()
 
 -- | An exception thrown when the server sends a GoAwayFrame.
-data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCodeId !ByteString
+data RemoteSentGoAwayFrame = RemoteSentGoAwayFrame !StreamId !ErrorCode !ByteString
   deriving Show
 instance Exception RemoteSentGoAwayFrame
 
