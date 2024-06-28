@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PackageImports #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 
@@ -61,8 +62,10 @@ import Control.Concurrent.MVar.Lifted (newEmptyMVar, newMVar, putMVar, takeMVar,
 import Control.Exception.Lifted (SomeException, bracket, catch, throwIO)
 import Control.Monad (forM_, forever, void, when)
 import Control.Monad.IO.Class (liftIO)
+import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import qualified Data.CaseInsensitive as CI
 import Data.Foldable (foldl')
 import Data.IORef.Lifted (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (fromMaybe)
@@ -78,7 +81,12 @@ import Network.HTTP2.Client.FrameConnection
 
 #if MIN_VERSION_http2(5,0,0)
 import "http2" Network.HTTP2.Client (Settings, maxFrameSize, initialWindowSize, maxConcurrentStreams, headerTableSize, enablePush, maxHeaderListSize)
+#if !MIN_VERSION_http2(5,2,0)
+pattern SettingsTokenHeaderTableSize :: SettingsKey
+pattern SettingsTokenHeaderTableSize = SettingsHeaderTableSize
 #endif
+#endif
+
 
 {- | Offers credit-based flow-control.
 
@@ -260,7 +268,7 @@ data StreamThread = CST
 -- | Record holding functions one can call while in an HTTP2 client stream.
 data Http2Stream = Http2Stream
     { _headers ::
-        HPACK.HeaderList ->
+        HeaderList ->
         (FrameFlags -> FrameFlags) ->
         ClientIO StreamThread
     -- ^ Starts the stream with HTTP headers. Flags modifier can use
@@ -285,7 +293,7 @@ data Http2Stream = Http2Stream
 
 Trailers should be the last thing sent over a stream.
 -}
-trailers :: Http2Stream -> HPACK.HeaderList -> (FrameFlags -> FrameFlags) -> ClientIO ()
+trailers :: Http2Stream -> HeaderList -> (FrameFlags -> FrameFlags) -> ClientIO ()
 trailers stream hdrs flagmod = void $ _headers stream hdrs flagmod
 
 {- | Handler upon receiving a PUSH_PROMISE from the server.
@@ -687,7 +695,7 @@ dispatchControlFramesStep windowUpdatesChan controlFrame@(fh, payload) control@(
                     maybe
                         (return ())
                         (_applySettings _dispatchControlHpackEncoder)
-                        (lookup SettingsHeaderTableSize settsList)
+                        (lookup SettingsTokenHeaderTableSize settsList)
                 _dispatchControlAckSettings
             | otherwise -> do
                 handler <- lookupAndReleaseSetSettingsHandler control
@@ -756,7 +764,7 @@ dispatchHPACKFramesStep ::
     DispatchHPACK ->
     HPACKStepResult
 dispatchHPACKFramesStep (fh, fp) (DispatchHPACK{..}) =
-    let (decision, pattern) = case fp of
+    let (decision, pattern') = case fp of
             PushPromiseFrame ppSid hbf -> do
                 (OpenPushPromise sid ppSid, Right hbf)
             HeadersFrame _ hbf ->
@@ -766,10 +774,18 @@ dispatchHPACKFramesStep (fh, fp) (DispatchHPACK{..}) =
                 (ForwardHeader sid, Left err)
             _ ->
                 error "wrong TypeId"
-     in go fh decision pattern
+     in go fh decision pattern'
   where
     sid :: StreamId
     sid = HTTP2.streamId fh
+
+#if MIN_VERSION_http2(5,2,0)
+    compat :: [Header] -> HeaderList
+    compat = fmap $ first CI.original
+#else
+    compat :: HeaderList -> HeaderList
+    compat = id
+#endif
 
     go :: FrameHeader -> HPACKLoopDecision -> Either ErrorCode ByteString -> HPACKStepResult
     go curFh decision (Right buffer) =
@@ -794,9 +810,9 @@ dispatchHPACKFramesStep (fh, fp) (DispatchHPACK{..}) =
                     )
             else case decision of
                 ForwardHeader sId ->
-                    FinishedWithHeaders curFh sId (decodeHeader _dispatchHPACKDynamicTable buffer)
+                    FinishedWithHeaders curFh sId $ fmap compat $ decodeHeader _dispatchHPACKDynamicTable buffer
                 OpenPushPromise parentSid newSid ->
-                    FinishedWithPushPromise curFh parentSid newSid (decodeHeader _dispatchHPACKDynamicTable buffer)
+                    FinishedWithPushPromise curFh parentSid newSid $ fmap compat $ decodeHeader _dispatchHPACKDynamicTable buffer
     go curFh _ (Left err) =
         FailedHeaders curFh sid err
 
@@ -1032,13 +1048,13 @@ compat_updateSettings :: Settings -> SettingsList -> Settings
 #if MIN_VERSION_http2(5,0,0)
 compat_updateSettings settings kvs = foldl' update settings kvs
   where
-    update def (SettingsHeaderTableSize,x)      = def { headerTableSize = x }
+    update def (SettingsTokenHeaderTableSize,x) = def { headerTableSize = x }
     -- fixme: x should be 0 or 1
     update def (SettingsEnablePush,x)           = def { enablePush = x > 0 }
     update def (SettingsMaxConcurrentStreams,x) = def { maxConcurrentStreams = Just x }
     update def (SettingsInitialWindowSize,x)    = def { initialWindowSize = x }
     update def (SettingsMaxFrameSize,x)         = def { maxFrameSize = x }
-    update def (SettingsMaxHeaderListSize,x)   = def { maxHeaderListSize = Just x }
+    update def (SettingsMaxHeaderListSize,x)    = def { maxHeaderListSize = Just x }
     update def _                                = def
 
 #else
