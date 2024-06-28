@@ -9,6 +9,7 @@ import Control.Exception (throwIO)
 import Control.Monad.Base (MonadBase, liftBase)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as ByteString
+import qualified Data.CaseInsensitive as CI
 import Data.IORef.Lifted (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
@@ -17,13 +18,15 @@ import Foreign.Marshal.Alloc (finalizerFree, mallocBytes)
 import GHC.Exception (Exception)
 import Network.HPACK as HPACK
 import qualified Network.HPACK.Token as HPACK
+import Network.HTTP2.Client.Channels
+import Network.HTTP2.Client.Exceptions
 import Network.HTTP2.Frame as HTTP2
 #if MIN_VERSION_http2(5,0,0)
 import "http2" Network.HTTP2.Client (Settings, defaultSettings)
+#if MIN_VERSION_http2(5,2,0)
+type HeaderList = [(ByteString, ByteString)]
 #endif
-
-import Network.HTTP2.Client.Channels
-import Network.HTTP2.Client.Exceptions
+#endif
 
 type DispatchChan = FramesChan FrameDecodeError
 
