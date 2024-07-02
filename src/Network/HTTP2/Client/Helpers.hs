@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | A toolbox with high-level functions to interact with an established HTTP2
@@ -11,7 +12,7 @@ module Network.HTTP2.Client.Helpers (
   -- * Sending and receiving HTTP body
     upload
   , waitStream
-  , fromStreamResult 
+  , fromStreamResult
   , StreamResult
   , StreamResponse
   -- * Diagnostics
@@ -23,12 +24,16 @@ module Network.HTTP2.Client.Helpers (
 import           Data.Time.Clock (UTCTime, getCurrentTime)
 import qualified Network.HTTP2.Frame as HTTP2
 import qualified Network.HPACK as HPACK
+#if !MIN_VERSION_http2(5,2,0)
+import           Network.HPACK as HPACK (HeaderList)
+#endif
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import           Control.Concurrent.Lifted (threadDelay)
 import           Control.Concurrent.Async.Lifted (race)
 
 import Network.HTTP2.Client
+import Network.HTTP2.Client.Dispatch
 import Network.HTTP2.Client.Exceptions
 
 -- | Opaque type to express an action which timed out.
@@ -57,10 +62,10 @@ ping conn timeout msg = do
 -- | Result containing the unpacked headers and all frames received in on a
 -- stream. See 'StreamResponse' and 'fromStreamResult' to get a higher-level
 -- utility.
-type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString], Maybe HPACK.HeaderList)
+type StreamResult = (Either HTTP2.ErrorCode HeaderList, [Either HTTP2.ErrorCode ByteString], Maybe HeaderList)
 
 -- | An HTTP2 response, once fully received, is made of headers and a payload.
-type StreamResponse = (HPACK.HeaderList, ByteString, Maybe HPACK.HeaderList)
+type StreamResponse = (HeaderList, ByteString, Maybe HeaderList)
 
 -- | Uploads a whole HTTP body at a time.
 --
