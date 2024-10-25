@@ -9,6 +9,7 @@ import Control.Exception (throwIO)
 import Control.Monad.Base (MonadBase, liftBase)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Internal as ByteString
+import qualified Data.CaseInsensitive as CI
 import Data.IORef.Lifted (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
@@ -66,8 +67,8 @@ data StreamFSMState
     | Closed
 
 data StreamEvent
-    = StreamHeadersEvent !FrameHeader !HeaderList
-    | StreamPushPromiseEvent !FrameHeader !StreamId !HeaderList
+    = StreamHeadersEvent !FrameHeader ![Header]
+    | StreamPushPromiseEvent !FrameHeader !StreamId ![Header]
     | StreamDataEvent !FrameHeader ByteString
     | StreamErrorEvent !FrameHeader ErrorCode
     deriving (Show)
@@ -235,7 +236,7 @@ newHpackEncoderContext encoderBufSize = liftBase $ do
             (\n -> HPACK.setLimitForEncoding n dt)
   where
     encoder strategy dt buf ptr hdrs = do
-        let hdrs' = fmap (\(k, v) -> let !t = HPACK.toToken k in (t, v)) hdrs
+        let hdrs' = fmap (\(k, v) -> let !t = HPACK.toToken (CI.original k) in (t, v)) hdrs
         remainder <- HPACK.encodeTokenHeader buf encoderBufSize strategy True dt hdrs'
         case remainder of
             ([], len) -> pure $ ByteString.fromForeignPtr ptr 0 len
@@ -249,7 +250,7 @@ modifySettings d = atomicModifyIORef' (_dispatchControlConnectionSettings d)
 
 -- | Helper to carry around the HPACK encoder for outgoing header blocks..
 data HpackEncoderContext = HpackEncoderContext
-    { _encodeHeaders :: HeaderList -> IO HeaderBlockFragment
+    { _encodeHeaders :: [Header] -> IO HeaderBlockFragment
     , _applySettings :: Size -> IO ()
     }
 

@@ -57,10 +57,10 @@ ping conn timeout msg = do
 -- | Result containing the unpacked headers and all frames received in on a
 -- stream. See 'StreamResponse' and 'fromStreamResult' to get a higher-level
 -- utility.
-type StreamResult = (Either HTTP2.ErrorCode HPACK.HeaderList, [Either HTTP2.ErrorCode ByteString], Maybe HPACK.HeaderList)
+type StreamResult = (Either HTTP2.ErrorCode [HPACK.Header], [Either HTTP2.ErrorCode ByteString], Maybe [HPACK.Header])
 
 -- | An HTTP2 response, once fully received, is made of headers and a payload.
-type StreamResponse = (HPACK.HeaderList, ByteString, Maybe HPACK.HeaderList)
+type StreamResponse = ([HPACK.Header], ByteString, Maybe [HPACK.Header])
 
 -- | Uploads a whole HTTP body at a time.
 --
